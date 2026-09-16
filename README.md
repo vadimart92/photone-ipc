@@ -235,7 +235,7 @@ dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]
 
-# the same cross-process measurements next to a named pipe and a TCP loopback socket (~30 s)
+# the same cross-process measurements next to a named pipe and a TCP loopback socket, plus light-workload and protocol-only rows (~2.5 min)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --compare [--cores 2,4]
 
 # BenchmarkDotNet microbenchmarks (a few minutes)

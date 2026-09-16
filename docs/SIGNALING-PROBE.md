@@ -30,3 +30,40 @@ All numbers are round trips (two wake-ups). One-way wake latency is roughly half
 - The lever that actually moves latency is *where the waiter waits*: a dedicated waiter thread that spins (`pause`) for a configurable budget before sleeping turns the 12 us wake into 0.05 us for any traffic gap shorter than the budget. Cost: one busy core per waiting reader while spinning. Expose the budget per reader (`ReaderOptions.SpinTime` already exists).
 - Candidates still worth measuring: (a) keyed events (`NtCreateKeyedEvent` / `NtReleaseKeyedEvent` / `NtWaitForKeyedEvent`) - one kernel object for all 32 slots instead of 33 events, same wake path; (b) `UMWAIT` / `TPAUSE` (WAITPKG, Alder Lake+) via a tiny native helper to spin at low power while staying in C0; (c) a "burst-aware" adaptive spin budget (spin longer when the last N wakes came within the budget).
 - Not candidates: `NtAlertThreadByThreadId` (process-local), `WaitOnAddress` (process-local), ALPC / pipes (slower than events).
+
+## Status after phase 1 (2026-09-16, evening)
+
+What the ring buffer already does with these findings:
+
+- Spin first, kernel later: readers poll `WriteCursor` for `SpinTime` (20 us default, `Timeout.InfiniteTimeSpan` = never block) and only then
+  publish their slot bit and wait on their event; the writer spins on free space the same way before waiting on the space event.
+- No syscall when nobody is blocked: `Commit` reads `WaitersMask` (a line that stays shared in the writer's cache) and calls `SetEvent`
+  only for a reader whose `WaitFor` is now satisfied; `Advance` calls `SetEvent` only when the writer has published `WriterWaiting` and this
+  advance is the one that crosses the writer's target. The `CrossProcess_NoSyscallWhenNobodyWaits` test asserts 0 signals and 0 kernel
+  waits on both sides for 1 M commits with a spinning reader.
+- Measured with the library (`--quick`, `--compare`): 0.14 us round trip spinning, 20-25 us round trip when every wait is a kernel wait,
+  23-32 ns of protocol per bucket cross-process, 9-13 GB/s streaming with a light consumer (memory-bandwidth bound).
+
+Tried and not adopted:
+
+- Direct `NtSetEvent` / `NtWaitForMultipleObjects` instead of the kernel32 wrappers inside `NamedEventBackend`. All 275 tests pass with it,
+  but the blocking round trip stayed at 20-26 us in four runs before and four after: the expected ~0.5 us per wake is far below this
+  laptop's run-to-run noise (+-25 %). Not worth depending on ntdll exports for an unmeasurable gain; revisit on a quiet desktop with the
+  same harness if the kernel path ever becomes the focus.
+
+What is left, ranked by expected effect on real latency:
+
+1. Adaptive spin budget (bursty traffic): lengthen the spin while recent waits were satisfied by spinning, shrink it after quiet periods, so
+   a stream with gaps under ~100 us keeps the 0.14 us latency without pinning a core forever. Medium effort, no layout change
+   (`ReaderOptions.SpinTime` becomes a policy instead of a constant).
+2. A dedicated waiter thread that spins for the reader (`await Wait` users): today the async path suspends through an event + waiter thread +
+   thread-pool continuation (21-33 us); letting that waiter thread spin for a configurable budget before it sleeps gives async consumers the
+   spinning latency. Small effort on top of the existing waiter thread.
+3. `UMWAIT`/`TPAUSE` (WAITPKG) for low-power spinning: not available on this CPU (Kaby Lake R); needs Alder Lake or newer and dynamically
+   emitted machine code (no .NET intrinsic). Later.
+4. Keyed events (one kernel object instead of 33 per buffer): faster `Open` (saves ~0.3 ms) and fewer handles, but the same wake path;
+   only worth it if many buffers are opened per process.
+5. Layout v2 with 128-byte reader slots (adjacent-line prefetcher): multi-reader configurations only.
+
+Not candidates (measured): `NtAlertThreadByThreadId` (process-local), `WaitOnAddress` (process-local), `SignalObjectAndWait` (no gain),
+named pipes and TCP loopback as a wake mechanism (25-60 us round trips, plus copies).
