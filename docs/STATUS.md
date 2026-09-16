@@ -78,7 +78,7 @@ InitializationTimeout, PreferredBaseAddress, PreFault }`, `ReaderOptions { SpinT
 | 3.9 KiB buckets | 7.9 GB/s | 7.5 GB/s |
 | 62.5 KiB buckets | 9.9 GB/s | 7.1 GB/s |
 
-BenchmarkDotNet protocol cost (GetBucket + Commit + TryRead + Advance, one thread): see README (about 20 ns per bucket, independent of the bucket size).
+BenchmarkDotNet (one thread): protocol cost per bucket (GetBucket + Commit + TryRead + Advance) 20-23 ns independent of the bucket size; fill + vectorised sum 86 ns / 1.3 us / 17.9 us for 256 / 4096 / 65536 floats; a bucket that wraps through the mirror costs 2-8 % more; writer-only commit with a spinning reader thread 11-17 ns; 0 B allocated in all twelve.
 
 ## Known limitations (v1)
 

@@ -158,21 +158,26 @@ Throughput runs push 2 GiB of `float` through a 64 MiB ring; the writer fills ev
 16000 floats) do not divide the ring, so buckets regularly wrap through the mirror. The `max` column in the ping-pong rows is scheduler
 noise; the p99.9 column is the honest tail. The whole harness takes ~7 s.
 
-BenchmarkDotNet hot path (`Photone.Ipc.Benchmarks.exe --filter '*'`, one thread writes and reads a bucket of `float`, `MemoryDiagnoser`):
+BenchmarkDotNet hot path (`Photone.Ipc.Benchmarks.exe --filter '*'`, one thread writes and reads a bucket of `float`, `MemoryDiagnoser`;
+the drain thread of `Write_SpinningReaderThread` exists only while that benchmark runs):
 
 | Method | BucketElements | Mean | Allocated | Note |
 |---|---:|---:|---:|---|
-| `WriteRead_Protocol` | 256 | 21.7 ns | 0 B | GetBucket + Commit + TryRead + Advance, payload untouched |
-| `WriteRead_FillAndSum` | 256 | 72.2 ns | 0 B | + `Span.Fill` by the writer and a vectorised sum by the reader (1 KiB) |
-| `Write_SpinningReaderThread` | 256 | 17.4 ns | 0 B | writer only; a second thread drains (cross-core cursor traffic) |
-| `WriteRead_Protocol` | 4096 | 21.7 ns | 0 B | |
-| `WriteRead_FillAndSum` | 4096 | 1.12 µs | 0 B | 16 KiB filled + summed = ~29 GB/s through L1/L2 |
-| `Write_SpinningReaderThread` | 4096 | 18.5 ns | 0 B | |
-| `WriteRead_Protocol` | 65536 | 22.4 ns | 0 B | the protocol cost does not depend on the bucket size |
-| `WriteRead_FillAndSum` | 65536 | 18.5 µs | 0 B | 256 KiB filled + summed = ~28 GB/s |
-| `Write_SpinningReaderThread` | 65536 | 19.2 ns | 0 B | |
+| `WriteRead_Protocol` | 256 | 21.3 ns | 0 B | GetBucket + Commit + TryRead + Advance, payload untouched |
+| `WriteRead_FillAndSum` | 256 | 86.1 ns | 0 B | + `Span.Fill` by the writer and a vectorised sum by the reader (1 KiB) |
+| `WriteRead_FillAndSum_OddBucket` | 256 | 91.8 ns | 0 B | 257 elements: buckets regularly wrap through the mirror (+7 %) |
+| `Write_SpinningReaderThread` | 256 | 10.9 ns | 0 B | writer only; a second thread drains (cross-core cursor traffic) |
+| `WriteRead_Protocol` | 4096 | 19.9 ns | 0 B | |
+| `WriteRead_FillAndSum` | 4096 | 1.30 µs | 0 B | 16 KiB filled + summed = ~25 GB/s through L1/L2 |
+| `WriteRead_FillAndSum_OddBucket` | 4096 | 1.41 µs | 0 B | 4097 elements, wrapping (+8 %) |
+| `Write_SpinningReaderThread` | 4096 | 13.3 ns | 0 B | |
+| `WriteRead_Protocol` | 65536 | 23.3 ns | 0 B | the protocol cost does not depend on the bucket size |
+| `WriteRead_FillAndSum` | 65536 | 17.9 µs | 0 B | 256 KiB filled + summed = ~29 GB/s |
+| `WriteRead_FillAndSum_OddBucket` | 65536 | 18.3 µs | 0 B | 65537 elements, wrapping (+2 %) |
+| `Write_SpinningReaderThread` | 65536 | 17.0 ns | 0 B | |
 
-(BenchmarkDotNet v0.15.8, .NET 10.0.12, RyuJIT x86-64-v3, 4 min run. `MemoryDiagnoser` reports `-` = 0 B for all nine.)
+(BenchmarkDotNet v0.15.8, .NET 10.0.12, RyuJIT x86-64-v3. `MemoryDiagnoser` reports `-` = 0 B for all twelve. The wrap-around cost
+is the double mapping's own overhead: a span that crosses the data/mirror boundary touches two TLB entries and two page sets, nothing else.)
 
 Zero bytes are allocated per operation in every benchmark; the test suite additionally asserts 0 B across 1 M `GetBucket/Commit/Wait/TryRead/Advance`
 and across suspended-then-completed async waits.
