@@ -82,7 +82,10 @@ BenchmarkDotNet (one thread): protocol cost per bucket (GetBucket + Commit + Try
 
 Compared with the alternatives (`--compare`, same session): ping-pong RTT p50 ring buffer 0.14 us spinning / 21 us blocking, named pipe 25 us,
 TCP loopback 59 us; throughput at 3.9 KiB buckets ring buffer 7.8 GB/s, named pipe 1.4 GB/s, TCP loopback 0.2 GB/s; at 62.5 KiB buckets
-7.1 / 4.0 / 1.2 GB/s. Details and the reading of these numbers are in the README.
+7.1 / 4.0 / 1.2 GB/s. With the workload taken out (producer touches one int per bucket, consumer counts the ones in one vector pass) the ring
+buffer reaches 12.6 / 8.6 / 10.9 GB/s at 3.9 KiB / 62.5 KiB / 1000 KiB buckets (the laptop's single-core memory read bandwidth) against
+1.1 / 3.7 / 3.6 GB/s for the pipe and 0.17 / 1.5 / 2.3 GB/s for TCP; the protocol alone costs 23-32 ns per bucket cross-process.
+Details and the reading of these numbers are in the README.
 
 ## Known limitations (v1)
 

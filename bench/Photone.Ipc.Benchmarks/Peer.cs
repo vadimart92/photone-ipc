@@ -18,6 +18,7 @@ internal static class Peer
             {
                 "echo" => Echo(args),
                 "drain" => Drain(args),
+                "drain1" => Drain1(args),
                 "pipe-echo" => Transports.PipeEcho(args),
                 "tcp-echo" => Transports.TcpEcho(args),
                 "pipe-drain" => Transports.PipeDrain(args),
@@ -181,6 +182,108 @@ internal static class Peer
         }
 
         return (bad, sum);
+    }
+
+    /// <summary>
+    /// <c>drain1 &lt;name&gt; &lt;bucketElements&gt; &lt;buckets&gt; &lt;mode&gt; &lt;core&gt; &lt;work&gt;</c>: consumes <c>buckets</c> chunks of <c>bucketElements</c> ints.
+    /// <c>count1</c>: counts the elements equal to 1 and validates the count (the producer writes one every 16 elements);
+    /// <c>touch1</c>: counts the ones without validation (the producer touched a single element per bucket);
+    /// <c>none</c>: advances without reading the payload (pure protocol cost).
+    /// </summary>
+    private static int Drain1(ReadOnlySpan<string> a)
+    {
+        string name = a[1];
+        int n = int.Parse(a[2], CultureInfo.InvariantCulture);
+        long buckets = long.Parse(a[3], CultureInfo.InvariantCulture);
+        WakeMode mode = WakeModes.Parse(a[4]);
+        int core = int.Parse(a[5], CultureInfo.InvariantCulture);
+        Transports.Work work = Transports.ParseWork(a[6]);
+        Affinity.Pin(core, highest: false);
+
+        using RingBuffer<int> buffer = RingBuffer<int>.Open(name);
+        using RingReader<int> reader = buffer.CreateReader(WakeModes.Reader(mode));
+        Print(Inv($"ready atCreator={buffer.IsMappedAtCreatorAddress}"));
+
+        (long bad, long ones) = DrainLoop1(reader, n, buckets, work);
+        if (bad < 0)
+        {
+            Print(Inv($"eof status={reader.Status}"));
+            return 3;
+        }
+
+        Counters c = reader.Counters;
+        Print(Inv($"done bad={bad} ones={ones} kernelWaits={c.KernelWaits} signals={c.Signals} spinSuccesses={c.SpinSuccesses}"));
+        return bad == 0 ? 0 : 4;
+    }
+
+    internal static (long Bad, long Ones) DrainLoop1(RingReader<int> reader, int n, long buckets, Transports.Work work)
+    {
+        long expected = OnesPerBucket(n);
+        long bad = 0;
+        long ones = 0;
+        for (long i = 0; i < buckets; i++)
+        {
+            if (!reader.WaitSync(n))
+            {
+                return (-1, ones);
+            }
+
+            reader.TryRead(n, out Chunk<int> chunk);
+            if (work != Transports.Work.None)
+            {
+                long c = CountOnes(chunk.Span);
+                if (work == Transports.Work.Count1 && c != expected)
+                {
+                    bad++;
+                }
+
+                ones += c;
+            }
+
+            reader.Advance(n);
+        }
+
+        return (bad, ones);
+    }
+
+    /// <summary>The producer pattern for the count-1 rows: every element is <c>i + 2</c> (never 1), then every 16th element is set to 1.</summary>
+    internal static void FillPattern(Span<int> span, long i)
+    {
+        span.Fill(unchecked((int)i + 2));
+        for (int j = 0; j < span.Length; j += 16)
+        {
+            span[j] = 1;
+        }
+    }
+
+    internal static long OnesPerBucket(int n) => (n + 15) / 16;
+
+    /// <summary>Counts the elements equal to 1 (vectorised: one compare and one subtract per <see cref="Vector{T}.Count"/> ints).</summary>
+    internal static long CountOnes(ReadOnlySpan<int> span)
+    {
+        Vector<int> ones = Vector<int>.One;
+        Vector<int> acc = Vector<int>.Zero;
+        int i = 0;
+        for (; i <= span.Length - Vector<int>.Count; i += Vector<int>.Count)
+        {
+            acc -= Vector.Equals(new Vector<int>(span.Slice(i, Vector<int>.Count)), ones);   // Equals yields -1 per matching lane
+        }
+
+        long count = 0;
+        for (int k = 0; k < Vector<int>.Count; k++)
+        {
+            count += acc[k];
+        }
+
+        for (; i < span.Length; i++)
+        {
+            if (span[i] == 1)
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     internal static float Sum(ReadOnlySpan<float> span)

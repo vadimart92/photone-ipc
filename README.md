@@ -199,6 +199,21 @@ per bucket instead of the transport). Representative run; a second run agreed wi
 | throughput, 3.9 KiB buckets | **7.8 GB/s** | | | 1.38 GB/s | 0.19 GB/s |
 | throughput, 62.5 KiB buckets | **7.1 GB/s** | | | 4.02 GB/s | 1.16 GB/s |
 
+The transport itself, with the workload taken out. `int` buckets; the producer touches one element per bucket (pipe and socket write the same
+prepared buffer every time), the consumer makes one vectorised pass counting the elements equal to 1; and, for the ring buffer only, a
+"protocol only" row where nobody touches the payload at all (commit + advance across the two processes). Best of 3 per row:
+
+| bucket | ring buffer, touch1 + count1 | ring buffer, protocol only | named pipe, touch1 + count1 | TCP loopback, touch1 + count1 |
+|---|---:|---:|---:|---:|
+| 3.9 KiB (1000 ints) | **12.6 GB/s** | 31 M commits/s = 32 ns/commit | 1.13 GB/s | 0.17 GB/s |
+| 62.5 KiB (16000 ints) | **8.6 GB/s** | 43 M commits/s = 23 ns/commit | 3.66 GB/s | 1.48 GB/s |
+| 1000 KiB (256000 ints) | **10.9 GB/s** | 34 M commits/s = 30 ns/commit | 3.63 GB/s | 2.34 GB/s |
+
+With the producer's fill removed the ring buffer runs at 9-13 GB/s, which is the single-core memory read bandwidth of this laptop (the
+consumer streams 2 GiB out of a 64 MiB ring that does not fit in cache): the library itself costs 23-32 ns per bucket regardless of the
+bucket size, i.e. two cache-line hand-offs (write cursor one way, read cursor the other) and nothing else. The pipe and the socket copy
+every byte twice (user to kernel, kernel to user), which caps them at 1-4 GB/s no matter how little the endpoints do with the data.
+
 Reading it:
 
 - With a spinning reader the ring buffer answers in 140 ns, about 170x faster than a named pipe and 400x faster than TCP loopback. That is the

@@ -96,8 +96,30 @@ internal static class QuickHarness
         foreach (int bucketElements in new[] { 1000, 16000 })
         {
             rows.Add(CrossProcessThroughput(bucketElements));
-            rows.Add(TransportThroughput("named pipe", bucketElements, static (n, buckets, core) => Transports.PipeThroughput(n, buckets, core)));
-            rows.Add(TransportThroughput("tcp loopback", bucketElements, static (n, buckets, core) => Transports.TcpThroughput(n, buckets, core)));
+            rows.Add(TransportThroughput("named pipe", bucketElements, Transports.Work.Sum, static (n, buckets, core, w) => Transports.PipeThroughput(n, buckets, core, w)));
+            rows.Add(TransportThroughput("tcp loopback", bucketElements, Transports.Work.Sum, static (n, buckets, core, w) => Transports.TcpThroughput(n, buckets, core, w)));
+        }
+
+        // a lighter consumer: int buckets, the reader only counts the elements equal to 1 (one vector compare per 8 ints)
+        foreach (int bucketElements in new[] { 1000, 16000, 256000 })
+        {
+            rows.Add(Best(3, () => CrossProcessThroughputInt(bucketElements, Transports.Work.Count1)));
+            rows.Add(Best(3, () => TransportThroughput("named pipe", bucketElements, Transports.Work.Count1, static (n, buckets, core, w) => Transports.PipeThroughput(n, buckets, core, w))));
+            rows.Add(Best(3, () => TransportThroughput("tcp loopback", bucketElements, Transports.Work.Count1, static (n, buckets, core, w) => Transports.TcpThroughput(n, buckets, core, w))));
+        }
+
+        // the transport itself: the producer touches one int per bucket, the consumer makes one vector pass (count the ones)
+        foreach (int bucketElements in new[] { 1000, 16000, 256000 })
+        {
+            rows.Add(Best(3, () => CrossProcessThroughputInt(bucketElements, Transports.Work.Touch1)));
+            rows.Add(Best(3, () => TransportThroughput("named pipe", bucketElements, Transports.Work.Touch1, static (n, buckets, core, w) => Transports.PipeThroughput(n, buckets, core, w))));
+            rows.Add(Best(3, () => TransportThroughput("tcp loopback", bucketElements, Transports.Work.Touch1, static (n, buckets, core, w) => Transports.TcpThroughput(n, buckets, core, w))));
+        }
+
+        // pure protocol: nobody touches the payload (ring buffer only)
+        foreach (int bucketElements in new[] { 1000, 16000, 256000 })
+        {
+            rows.Add(Best(3, () => CrossProcessThroughputInt(bucketElements, Transports.Work.None)));
         }
 
         Console.WriteLine();
@@ -106,6 +128,33 @@ internal static class QuickHarness
         Console.WriteLine(Inv($"total comparison time {total.Elapsed.TotalSeconds:F1} s"));
         return 0;
     }
+
+    /// <summary>Runs a throughput row <paramref name="times"/> times and keeps the fastest (the laptop's clocks and thermals make single runs vary by 30 %).</summary>
+    private static Row Best(int times, Func<Row> run)
+    {
+        Row? best = null;
+        double bestGbps = -1;
+        for (int i = 0; i < times; i++)
+        {
+            Row r = run();
+            double gbps = double.Parse(r.Result[..r.Result.IndexOf(' ', StringComparison.Ordinal)], CultureInfo.InvariantCulture);
+            if (gbps > bestGbps)
+            {
+                bestGbps = gbps;
+                best = r;
+            }
+        }
+
+        return best! with { Rounds = best.Rounds + Inv($" x{times}") };
+    }
+
+    private static string WorkLabel(Transports.Work work) => work switch
+    {
+        Transports.Work.Count1 => "int, fill+count1",
+        Transports.Work.Touch1 => "int, touch1+count1",
+        Transports.Work.None => "int, protocol only",
+        _ => "fill+sum",
+    };
 
     private static void ParseCores(ReadOnlySpan<string> args)
     {
@@ -131,14 +180,14 @@ internal static class QuickHarness
         return new Row("cross-process ping-pong RTT", transport, rounds.ToString("N0", CultureInfo.InvariantCulture), LatencyCell(s, 1), detail);
     }
 
-    private static Row TransportThroughput(string transport, int bucketElements, Func<int, long, int, (TimeSpan Elapsed, string Detail)> run)
+    private static Row TransportThroughput(string transport, int bucketElements, Transports.Work work, Func<int, long, int, Transports.Work, (TimeSpan Elapsed, string Detail)> run)
     {
         long buckets = ThroughputBytes / (bucketElements * sizeof(float));
-        (TimeSpan elapsed, string detail) = run(bucketElements, buckets, s_coreB);
+        (TimeSpan elapsed, string detail) = run(bucketElements, buckets, s_coreB, work);
         double bytes = buckets * (double)bucketElements * sizeof(float);
         double gbps = bytes / elapsed.TotalSeconds / 1e9;
         double commitsPerSec = buckets / elapsed.TotalSeconds;
-        string mode = Inv($"{bucketElements * sizeof(float) / 1024.0:F1} KiB buckets, fill+sum, {transport}");
+        string mode = Inv($"{bucketElements * sizeof(float) / 1024.0:F1} KiB buckets, {WorkLabel(work)}, {transport}");
         string result = Inv($"{gbps:F2} GB/s, {commitsPerSec / 1e6:F2} M writes/s");
         Console.WriteLine(Inv($"{"cross-process throughput",-24} [{mode}] {buckets,9} buckets in {elapsed.TotalSeconds:F2} s: {result}  ({detail})"));
         return new Row("cross-process throughput", mode, buckets.ToString("N0", CultureInfo.InvariantCulture), result, detail);
@@ -387,7 +436,53 @@ internal static class QuickHarness
         }
     }
 
+    /// <summary>Ring buffer of <see cref="int"/> with the peer process as consumer (<c>--peer drain1</c>); the producer side depends on <paramref name="work"/>.</summary>
+    private static Row CrossProcessThroughputInt(int bucketElements, Transports.Work work)
+    {
+        long buckets = ThroughputBytes / (bucketElements * sizeof(int));
+        if (work == Transports.Work.None)
+        {
+            buckets = Math.Max(buckets, 4_000_000);                              // nothing is touched: measure enough commits that the peer handshake (~1 ms) does not matter
+        }
+
+        string name = Unique();
+        using RingBuffer<int> buffer = RingBuffer<int>.Create(ThroughputRing, name);
+        using var peer = PeerProcess.Start("drain1", name, Inv($"{bucketElements}"), Inv($"{buckets}"), "default", Inv($"{s_coreB}"), Transports.WorkName(work));
+        string ready = peer.Expect("ready");
+
+        var sw = Stopwatch.StartNew();
+        for (long i = 0; i < buckets; i++)
+        {
+            using Bucket<int> b = buffer.GetBucket(bucketElements);
+            switch (work)
+            {
+                case Transports.Work.Count1:
+                    Peer.FillPattern(b.Span, i);
+                    break;
+                case Transports.Work.Touch1:
+                    b.Span[0] = 1;
+                    break;
+                default:
+                    break;                                                       // None: the payload is never touched
+            }
+
+            b.Commit(bucketElements);
+        }
+
+        string done = peer.Expect("done");
+        sw.Stop();
+        peer.WaitForExit();
+
+        long bad = long.Parse(Field(done, "bad"), CultureInfo.InvariantCulture);
+        long kw = long.Parse(Field(done, "kernelWaits"), CultureInfo.InvariantCulture);
+        long sig = long.Parse(Field(done, "signals"), CultureInfo.InvariantCulture);
+        return ThroughputRow("cross-process throughput", bucketElements, buckets, sw.Elapsed, bad, work, buffer.Counters, kw, sig, ready["ready ".Length..]);
+    }
+
     private static Row ThroughputRow(string scenario, int bucketElements, long buckets, TimeSpan elapsed, long bad, RingBuffer<float> buffer, long readerKernelWaits, long readerSignals, string extra)
+        => ThroughputRow(scenario, bucketElements, buckets, elapsed, bad, Transports.Work.Sum, buffer.Counters, readerKernelWaits, readerSignals, extra);
+
+    private static Row ThroughputRow(string scenario, int bucketElements, long buckets, TimeSpan elapsed, long bad, Transports.Work work, Counters writer, long readerKernelWaits, long readerSignals, string extra)
     {
         if (bad != 0)
         {
@@ -397,9 +492,11 @@ internal static class QuickHarness
         double bytes = buckets * (double)bucketElements * sizeof(float);
         double gbps = bytes / elapsed.TotalSeconds / 1e9;
         double commitsPerSec = buckets / elapsed.TotalSeconds;
-        string mode = Inv($"{bucketElements * sizeof(float) / 1024.0:F1} KiB buckets, fill+sum");
-        string result = Inv($"{gbps:F2} GB/s, {commitsPerSec / 1e6:F2} M commits/s");
-        string detail = Inv($"writer kernel waits={buffer.Counters.KernelWaits} signals={buffer.Counters.Signals}; reader kernel waits={readerKernelWaits} signals={readerSignals}{(extra.Length > 0 ? "; " + extra : string.Empty)}");
+        string mode = Inv($"{bucketElements * sizeof(float) / 1024.0:F1} KiB buckets, {WorkLabel(work)}");
+        string result = work == Transports.Work.None
+            ? Inv($"{gbps:F2} GB/s nominal, {commitsPerSec / 1e6:F2} M commits/s = {1e9 / commitsPerSec:F0} ns/commit")
+            : Inv($"{gbps:F2} GB/s, {commitsPerSec / 1e6:F2} M commits/s");
+        string detail = Inv($"writer kernel waits={writer.KernelWaits} signals={writer.Signals}; reader kernel waits={readerKernelWaits} signals={readerSignals}{(extra.Length > 0 ? "; " + extra : string.Empty)}");
         Console.WriteLine(Inv($"{scenario,-24} [{mode}] {buckets,9} buckets in {elapsed.TotalSeconds:F2} s: {result}  ({detail})"));
         return new Row(scenario, mode, buckets.ToString("N0", CultureInfo.InvariantCulture), result, detail);
     }

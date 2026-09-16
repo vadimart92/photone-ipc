@@ -55,15 +55,47 @@ internal static class Transports
         return (ticks, "TCP loopback, NoDelay, synchronous Send/Receive; " + done["done ".Length..]);
     }
 
-    public static (TimeSpan Elapsed, string Detail) PipeThroughput(int bucketElements, long buckets, int coreB)
+    /// <summary>Workload of the throughput rows.</summary>
+    public enum Work
+    {
+        /// <summary>Producer fills every float, consumer sums every float (memory-bandwidth bound on both sides).</summary>
+        Sum,
+
+        /// <summary>Producer fills every int (pattern with a 1 every 16 elements), consumer counts the ones and validates the count.</summary>
+        Count1,
+
+        /// <summary>Producer touches one int per bucket, consumer counts the ones over the whole bucket (one vector pass; no validation). Measures the transport, not the workload.</summary>
+        Touch1,
+
+        /// <summary>Nothing touches the payload (ring buffer only: commit + advance). Pure protocol cost.</summary>
+        None,
+    }
+
+    public static string WorkName(Work w) => w switch
+    {
+        Work.Count1 => "count1",
+        Work.Touch1 => "touch1",
+        Work.None => "none",
+        _ => "sum",
+    };
+
+    public static Work ParseWork(string s) => s switch
+    {
+        "count1" => Work.Count1,
+        "touch1" => Work.Touch1,
+        "none" => Work.None,
+        _ => Work.Sum,
+    };
+
+    public static (TimeSpan Elapsed, string Detail) PipeThroughput(int bucketElements, long buckets, int coreB, Work work)
     {
         string name = "photone-bench-pipe-" + Guid.NewGuid().ToString("N");
         using var server = new NamedPipeServerStream(name, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.None, StreamBufferBytes, StreamBufferBytes);
-        using var peer = QuickHarness.PeerProcess.Start("pipe-drain", name, Inv($"{bucketElements}"), Inv($"{buckets}"), Inv($"{coreB}"));
+        using var peer = QuickHarness.PeerProcess.Start("pipe-drain", name, Inv($"{bucketElements}"), Inv($"{buckets}"), Inv($"{coreB}"), WorkName(work));
         server.WaitForConnection();
         peer.Expect("ready");
         var sw = Stopwatch.StartNew();
-        WriteBuckets(server, bucketElements, buckets);
+        WriteBuckets(server, bucketElements, buckets, work);
         string done = peer.Expect("done");
         sw.Stop();
         peer.WaitForExit();
@@ -71,26 +103,27 @@ internal static class Transports
         return (sw.Elapsed, Inv($"named pipe, {StreamBufferBytes >> 10} KiB pipe buffer; ") + done["done ".Length..]);
     }
 
-    public static (TimeSpan Elapsed, string Detail) TcpThroughput(int bucketElements, long buckets, int coreB)
+    public static (TimeSpan Elapsed, string Detail) TcpThroughput(int bucketElements, long buckets, int coreB, Work work)
     {
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         listener.Listen(1);
         int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
-        using var peer = QuickHarness.PeerProcess.Start("tcp-drain", Inv($"{port}"), Inv($"{bucketElements}"), Inv($"{buckets}"), Inv($"{coreB}"));
+        using var peer = QuickHarness.PeerProcess.Start("tcp-drain", Inv($"{port}"), Inv($"{bucketElements}"), Inv($"{buckets}"), Inv($"{coreB}"), WorkName(work));
         using Socket socket = listener.Accept();
         socket.NoDelay = true;
         socket.SendBufferSize = StreamBufferBytes;
         peer.Expect("ready");
         using var stream = new NetworkStream(socket, ownsSocket: false);
         var sw = Stopwatch.StartNew();
-        WriteBuckets(stream, bucketElements, buckets);
+        WriteBuckets(stream, bucketElements, buckets, work);
         string done = peer.Expect("done");
         sw.Stop();
         peer.WaitForExit();
         Check(done);
         return (sw.Elapsed, Inv($"TCP loopback, NoDelay, {StreamBufferBytes >> 10} KiB socket buffers; ") + done["done ".Length..]);
     }
+
 
     private static void Check(string done)
     {
@@ -138,13 +171,27 @@ internal static class Transports
         }
     }
 
-    private static void WriteBuckets(Stream stream, int bucketElements, long buckets)
+    private static void WriteBuckets(Stream stream, int bucketElements, long buckets, Work work)
     {
-        var buffer = new byte[bucketElements * sizeof(float)];
+        var buffer = new byte[bucketElements * sizeof(int)];                    // sizeof(float) == sizeof(int)
         Span<float> floats = MemoryMarshal.Cast<byte, float>(buffer.AsSpan());
+        Span<int> ints = MemoryMarshal.Cast<byte, int>(buffer.AsSpan());
         for (long i = 0; i < buckets; i++)
         {
-            floats.Fill(i);
+            switch (work)
+            {
+                case Work.Count1:
+                    Peer.FillPattern(ints, i);
+                    break;
+                case Work.Touch1:
+                case Work.None:
+                    ints[0] = 1;                                                    // one store per bucket; the rest of the buffer stays as it is
+                    break;
+                default:
+                    floats.Fill(i);
+                    break;
+            }
+
             stream.Write(buffer);
         }
 
@@ -187,12 +234,13 @@ internal static class Transports
         int n = int.Parse(a[2], CultureInfo.InvariantCulture);
         long buckets = long.Parse(a[3], CultureInfo.InvariantCulture);
         int core = int.Parse(a[4], CultureInfo.InvariantCulture);
+        Work work = ParseWork(a[5]);
         Affinity.Pin(core, highest: false);
         using var client = new NamedPipeClientStream(".", name, PipeDirection.In, PipeOptions.None);
         client.Connect(30_000);
         Print("ready pipe");
-        (long bad, double sum) = DrainLoop(client, n, buckets);
-        Print(Inv($"done bad={bad} sum={sum:E3}"));
+        (long bad, double result) = DrainLoop(client, n, buckets, work);
+        Print(Inv($"done bad={bad} {WorkName(work)}={result:E3}"));
         return bad == 0 ? 0 : 4;
     }
 
@@ -202,6 +250,7 @@ internal static class Transports
         int n = int.Parse(a[2], CultureInfo.InvariantCulture);
         long buckets = long.Parse(a[3], CultureInfo.InvariantCulture);
         int core = int.Parse(a[4], CultureInfo.InvariantCulture);
+        Work work = ParseWork(a[5]);
         Affinity.Pin(core, highest: false);
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         socket.Connect(new IPEndPoint(IPAddress.Loopback, port));
@@ -209,8 +258,8 @@ internal static class Transports
         socket.ReceiveBufferSize = StreamBufferBytes;
         using var stream = new NetworkStream(socket, ownsSocket: false);
         Print("ready tcp");
-        (long bad, double sum) = DrainLoop(stream, n, buckets);
-        Print(Inv($"done bad={bad} sum={sum:E3}"));
+        (long bad, double result) = DrainLoop(stream, n, buckets, work);
+        Print(Inv($"done bad={bad} {WorkName(work)}={result:E3}"));
         return bad == 0 ? 0 : 4;
     }
 
@@ -236,7 +285,7 @@ internal static class Transports
     /// read syscall covers many buckets when the producer is ahead (the way a real consumer of a byte stream works; one read per bucket
     /// would measure the wake-up cost per bucket instead of the transport).
     /// </summary>
-    private static (long Bad, double Sum) DrainLoop(Stream stream, int n, long buckets)
+    private static (long Bad, double Result) DrainLoop(Stream stream, int n, long buckets, Work work)
     {
         int bucketBytes = n * sizeof(float);
         var buffer = new byte[Math.Max(StreamBufferBytes, bucketBytes * 2)];
@@ -244,6 +293,7 @@ internal static class Transports
         int end = 0;
         long bad = 0;
         double sum = 0;
+        long expectedOnes = Peer.OnesPerBucket(n);
         for (long i = 0; i < buckets; i++)
         {
             if (end - start < bucketBytes)
@@ -267,14 +317,28 @@ internal static class Transports
                 }
             }
 
-            ReadOnlySpan<float> span = MemoryMarshal.Cast<byte, float>(buffer.AsSpan(start, bucketBytes));
-            float expected = i;
-            if (span[0] != expected || span[n - 1] != expected)
+            if (work is Work.Count1 or Work.Touch1 or Work.None)
             {
-                bad++;
+                long c = Peer.CountOnes(MemoryMarshal.Cast<byte, int>(buffer.AsSpan(start, bucketBytes)));
+                if (work == Work.Count1 && c != expectedOnes)
+                {
+                    bad++;
+                }
+
+                sum += c;
+            }
+            else
+            {
+                ReadOnlySpan<float> span = MemoryMarshal.Cast<byte, float>(buffer.AsSpan(start, bucketBytes));
+                float expected = i;
+                if (span[0] != expected || span[n - 1] != expected)
+                {
+                    bad++;
+                }
+
+                sum += Peer.Sum(span);
             }
 
-            sum += Peer.Sum(span);
             start += bucketBytes;
         }
 
