@@ -80,6 +80,10 @@ InitializationTimeout, PreferredBaseAddress, PreFault }`, `ReaderOptions { SpinT
 
 BenchmarkDotNet (one thread): protocol cost per bucket (GetBucket + Commit + TryRead + Advance) 20-23 ns independent of the bucket size; fill + vectorised sum 86 ns / 1.3 us / 17.9 us for 256 / 4096 / 65536 floats; a bucket that wraps through the mirror costs 2-8 % more; writer-only commit with a spinning reader thread 11-17 ns; 0 B allocated in all twelve.
 
+Compared with the alternatives (`--compare`, same session): ping-pong RTT p50 ring buffer 0.14 us spinning / 21 us blocking, named pipe 25 us,
+TCP loopback 59 us; throughput at 3.9 KiB buckets ring buffer 7.8 GB/s, named pipe 1.4 GB/s, TCP loopback 0.2 GB/s; at 62.5 KiB buckets
+7.1 / 4.0 / 1.2 GB/s. Details and the reading of these numbers are in the README.
+
 ## Known limitations (v1)
 
 - Windows 10 1803+ / x64 only; one writer per buffer (the creator); no writer takeover; 32 readers.

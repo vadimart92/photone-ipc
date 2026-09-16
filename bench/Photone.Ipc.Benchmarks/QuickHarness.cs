@@ -72,6 +72,78 @@ internal static class QuickHarness
         return 0;
     }
 
+    /// <summary>
+    /// <c>--compare</c>: the cross-process rows of <see cref="Run"/> next to the same measurements over a named pipe and a TCP loopback socket
+    /// (<see cref="Transports"/>), all in one session with the same cores and the same peer-process discipline.
+    /// </summary>
+    public static int RunCompare(ReadOnlySpan<string> args)
+    {
+        ParseCores(args);
+        Console.WriteLine(Inv($"photone-ipc transport comparison | {RuntimeInformation.OSDescription} | {RuntimeInformation.FrameworkDescription} | {Environment.ProcessorCount} logical cores | cores {s_coreA},{s_coreB}"));
+        Console.WriteLine();
+        Affinity.Pin(s_coreA, highest: false);
+        var total = Stopwatch.StartNew();
+        var rows = new List<Row>();
+
+        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 100_000), (WakeMode.Default, 50_000), (WakeMode.Block, 10_000), (WakeMode.Async, 10_000) })
+        {
+            rows.Add(CrossProcessPingPong(mode, rounds));
+        }
+
+        rows.Add(TransportPingPong("named pipe", 10_000, static (rounds, core) => Transports.PipePingPong(rounds, core)));
+        rows.Add(TransportPingPong("tcp loopback", 10_000, static (rounds, core) => Transports.TcpPingPong(rounds, core)));
+
+        foreach (int bucketElements in new[] { 1000, 16000 })
+        {
+            rows.Add(CrossProcessThroughput(bucketElements));
+            rows.Add(TransportThroughput("named pipe", bucketElements, static (n, buckets, core) => Transports.PipeThroughput(n, buckets, core)));
+            rows.Add(TransportThroughput("tcp loopback", bucketElements, static (n, buckets, core) => Transports.TcpThroughput(n, buckets, core)));
+        }
+
+        Console.WriteLine();
+        PrintTable(rows);
+        Console.WriteLine();
+        Console.WriteLine(Inv($"total comparison time {total.Elapsed.TotalSeconds:F1} s"));
+        return 0;
+    }
+
+    private static void ParseCores(ReadOnlySpan<string> args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--cores" && i + 1 < args.Length)
+            {
+                string[] parts = args[++i].Split(',');
+                s_coreA = int.Parse(parts[0], CultureInfo.InvariantCulture);
+                s_coreB = int.Parse(parts[1], CultureInfo.InvariantCulture);
+            }
+        }
+    }
+
+    private static Row TransportPingPong(string transport, int rounds, Func<int, int, (long[] Ticks, string Detail)> run)
+    {
+        ThreadPriority old = Thread.CurrentThread.Priority;
+        Thread.CurrentThread.Priority = ThreadPriority.Highest;
+        (long[] ticks, string detail) = run(rounds, s_coreB);
+        Thread.CurrentThread.Priority = old;
+        LatencyStats s = LatencyStats.FromBatches(ticks, 1);
+        Console.WriteLine(Inv($"cross-process ping-pong [{transport,-12}] {rounds,7} rounds: RTT {LatencyCell(s, 1)}  ({detail})"));
+        return new Row("cross-process ping-pong RTT", transport, rounds.ToString("N0", CultureInfo.InvariantCulture), LatencyCell(s, 1), detail);
+    }
+
+    private static Row TransportThroughput(string transport, int bucketElements, Func<int, long, int, (TimeSpan Elapsed, string Detail)> run)
+    {
+        long buckets = ThroughputBytes / (bucketElements * sizeof(float));
+        (TimeSpan elapsed, string detail) = run(bucketElements, buckets, s_coreB);
+        double bytes = buckets * (double)bucketElements * sizeof(float);
+        double gbps = bytes / elapsed.TotalSeconds / 1e9;
+        double commitsPerSec = buckets / elapsed.TotalSeconds;
+        string mode = Inv($"{bucketElements * sizeof(float) / 1024.0:F1} KiB buckets, fill+sum, {transport}");
+        string result = Inv($"{gbps:F2} GB/s, {commitsPerSec / 1e6:F2} M writes/s");
+        Console.WriteLine(Inv($"{"cross-process throughput",-24} [{mode}] {buckets,9} buckets in {elapsed.TotalSeconds:F2} s: {result}  ({detail})"));
+        return new Row("cross-process throughput", mode, buckets.ToString("N0", CultureInfo.InvariantCulture), result, detail);
+    }
+
     private static string Inv(FormattableString s) => s.ToString(CultureInfo.InvariantCulture);
 
     private static string Fmt(double us) => us < 10 ? us.ToString("F2", CultureInfo.InvariantCulture) : us.ToString("F1", CultureInfo.InvariantCulture);
@@ -364,7 +436,7 @@ internal static class QuickHarness
     }
 
     /// <summary>Spawns this executable with <c>--peer</c> and talks to it over stdout lines.</summary>
-    private sealed class PeerProcess : IDisposable
+    internal sealed class PeerProcess : IDisposable
     {
         private readonly Process _process;
 

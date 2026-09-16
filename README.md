@@ -182,6 +182,35 @@ is the double mapping's own overhead: a span that crosses the data/mirror bounda
 Zero bytes are allocated per operation in every benchmark; the test suite additionally asserts 0 B across 1 M `GetBucket/Commit/Wait/TryRead/Advance`
 and across suspended-then-completed async waits.
 
+## Compared with named pipes and TCP loopback
+
+`Photone.Ipc.Benchmarks.exe --compare` runs the cross-process rows above next to the two fastest plain-.NET transports between Windows
+processes that do not share memory: a byte-mode synchronous named pipe (`NamedPipeServerStream`/`NamedPipeClientStream`) and a TCP loopback
+socket (`NoDelay`, synchronous `Send`/`Receive`). Same cores, same peer-process discipline, same message shapes: an 8-byte ping-pong round
+trip, and 2 GiB streamed in fixed buckets that the producer fills and the consumer sums. The pipe and socket use 1 MiB buffers; the
+stream consumer reads up to 1 MiB per call and parses buckets out of its receive buffer (one read per bucket would measure the wake-up cost
+per bucket instead of the transport). Representative run; a second run agreed within ~15 %:
+
+| scenario | ring buffer (spin) | ring buffer (block) | ring buffer (`await Wait`) | named pipe | TCP loopback |
+|---|---:|---:|---:|---:|---:|
+| ping-pong RTT p50 | **0.14 µs** | 21.4 µs | 20.9 µs | 24.7 µs | 59.1 µs |
+| ping-pong RTT p99 | 0.18 µs | 36.9 µs | 66.4 µs | 39.2 µs | 94.4 µs |
+| ping-pong RTT p99.9 | 0.30 µs | 118 µs | 139 µs | 61.1 µs | 179 µs |
+| throughput, 3.9 KiB buckets | **7.8 GB/s** | | | 1.38 GB/s | 0.19 GB/s |
+| throughput, 62.5 KiB buckets | **7.1 GB/s** | | | 4.02 GB/s | 1.16 GB/s |
+
+Reading it:
+
+- With a spinning reader the ring buffer answers in 140 ns, about 170x faster than a named pipe and 400x faster than TCP loopback. That is the
+  zero-copy, zero-syscall path: the message *is* the cache line.
+- Even when every wait is a kernel wait (`block`), the ring buffer is a little faster than a named pipe (one `SetEvent` + one wait per hop
+  versus `WriteFile` + `ReadFile` with a copy on each side) and about 3x faster than TCP.
+- Throughput with small buckets is where copies and syscalls hurt the most: the pipe manages 1.4 GB/s at 3.9 KiB per write, TCP loopback
+  0.2 GB/s (Windows delivers a loopback segment synchronously inside the `Send` call, about 20 µs per segment on this laptop), the ring
+  buffer 7.8 GB/s regardless of the bucket size because nothing is copied and the consumer never enters the kernel while data keeps coming.
+- The ring buffer's remaining cost at large buckets is memory bandwidth (the writer fills, the reader sums: two passes over 2 GiB); the
+  pipe at 62.5 KiB is within 2x of it because its per-write overhead is amortised, while it still copies every byte twice.
+
 ## Building, testing, benchmarking
 
 ```

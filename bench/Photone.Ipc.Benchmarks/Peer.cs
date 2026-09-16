@@ -18,6 +18,10 @@ internal static class Peer
             {
                 "echo" => Echo(args),
                 "drain" => Drain(args),
+                "pipe-echo" => Transports.PipeEcho(args),
+                "tcp-echo" => Transports.TcpEcho(args),
+                "pipe-drain" => Transports.PipeDrain(args),
+                "tcp-drain" => Transports.TcpDrain(args),
                 _ => throw new ArgumentException("unknown peer verb " + args[0]),
             };
         }
