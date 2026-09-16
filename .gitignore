@@ -1,0 +1,19 @@
+## .NET build output
+bin/
+obj/
+artifacts/
+BenchmarkDotNet.Artifacts/
+TestResults/
+
+## IDE
+.vs/
+.idea/
+*.user
+*.suo
+*.swp
+launchSettings.json
+
+## Misc
+*.log
+*.tmp
+*.DotSettings.user
