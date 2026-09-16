@@ -19,6 +19,7 @@ internal static class Peer
                 "echo" => Echo(args),
                 "drain" => Drain(args),
                 "drain1" => Drain1(args),
+                "paced" => PacedLatency.Peer(args),
                 "pipe-echo" => Transports.PipeEcho(args),
                 "tcp-echo" => Transports.TcpEcho(args),
                 "pipe-drain" => Transports.PipeDrain(args),
@@ -55,7 +56,7 @@ internal static class Peer
         using RingBuffer<long> outBuf = RingBuffer<long>.Create(1 << 12, nameOut, WakeModes.Writer(mode));
         Print(Inv($"ready atCreator={inBuf.IsMappedAtCreatorAddress}"));
 
-        long rounds = mode == WakeMode.Async
+        long rounds = WakeModes.IsAsync(mode)
             ? EchoLoopAsync(reader, outBuf).GetAwaiter().GetResult()
             : EchoLoop(reader, outBuf);
         if (rounds < 0)

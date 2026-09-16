@@ -51,19 +51,21 @@ Tried and not adopted:
   laptop's run-to-run noise (+-25 %). Not worth depending on ntdll exports for an unmeasurable gain; revisit on a quiet desktop with the
   same harness if the kernel path ever becomes the focus.
 
-What is left, ranked by expected effect on real latency:
+Done in phase 2, step 1 (DESIGN §14, numbers in README "Waiting: latency versus CPU"):
 
-1. Adaptive spin budget (bursty traffic): lengthen the spin while recent waits were satisfied by spinning, shrink it after quiet periods, so
-   a stream with gaps under ~100 us keeps the 0.14 us latency without pinning a core forever. Medium effort, no layout change
-   (`ReaderOptions.SpinTime` becomes a policy instead of a constant).
-2. A dedicated waiter thread that spins for the reader (`await Wait` users): today the async path suspends through an event + waiter thread +
-   thread-pool continuation (21-33 us); letting that waiter thread spin for a configurable budget before it sleeps gives async consumers the
-   spinning latency. Small effort on top of the existing waiter thread.
-3. `UMWAIT`/`TPAUSE` (WAITPKG) for low-power spinning: not available on this CPU (Kaby Lake R); needs Alder Lake or newer and dynamically
-   emitted machine code (no .NET intrinsic). Later.
-4. Keyed events (one kernel object instead of 33 per buffer): faster `Open` (saves ~0.3 ms) and fewer handles, but the same wake path;
+1. **Adaptive spin budget.** `SpinPolicy` decides from the recent share of waits within `MaxSpinTime` whether to spin, and spins for twice the
+   recent short gaps. Default: same latency as before, CPU at 50 µs gaps 55% -> 17%. With `MaxSpinTime = 1 ms`: 0.3-0.9 µs delivery through
+   50 µs-1 ms gaps, back to blocking beyond that. (A haltpoll-style grow/halve rule oscillated under wake-up jitter and was replaced.)
+2. **The async waiter spins, and continuations run inline on it.** `await reader.Wait` went from 12-100 µs at up to two cores to the `WaitSync`
+   numbers; re-arming costs no system call (`ArmSignals` stays 0 in an await loop).
+
+Still open, ranked by expected effect:
+
+1. `UMWAIT`/`TPAUSE` (WAITPKG) for low-power spinning: not available on this CPU (Kaby Lake R); needs Alder Lake or newer and dynamically
+   emitted machine code (no .NET intrinsic).
+2. Keyed events (one kernel object instead of 33 per buffer): faster `Open` (saves ~0.3 ms) and fewer handles, but the same wake path;
    only worth it if many buffers are opened per process.
-5. Layout v2 with 128-byte reader slots (adjacent-line prefetcher): multi-reader configurations only.
+3. Layout v2 with 128-byte reader slots (adjacent-line prefetcher): multi-reader configurations only.
 
 Not candidates (measured): `NtAlertThreadByThreadId` (process-local), `WaitOnAddress` (process-local), `SignalObjectAndWait` (no gain),
 named pipes and TCP loopback as a wake mechanism (25-60 us round trips, plus copies).

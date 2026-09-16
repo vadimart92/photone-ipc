@@ -30,6 +30,11 @@ internal static class Program
             return QuickHarness.RunCompare(args.AsSpan(1));
         }
 
+        if (args.Length > 0 && args[0] == "--latency")
+        {
+            return PacedLatency.Run(args.AsSpan(1));
+        }
+
         BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
         return 0;
     }

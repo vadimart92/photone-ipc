@@ -42,8 +42,11 @@ internal enum WakeMode
     /// <summary>Block immediately (<c>SpinTime = 0</c>): every wait is a kernel wait, every wake a <c>SetEvent</c>.</summary>
     Block,
 
-    /// <summary>The sketch's <c>await reader.Wait(n)</c> with <c>AsyncSpinTime = 0</c>: every wait suspends through the waiter thread and a thread-pool continuation.</summary>
+    /// <summary>The sketch's <c>await reader.Wait(n)</c> with the library defaults (adaptive spin, continuation inline on the reader's waiter thread).</summary>
     Async,
+
+    /// <summary><c>await reader.Wait(n)</c> with no spin and thread-pool continuations: every wait suspends through the waiter thread and the pool (the v1 async path).</summary>
+    AsyncPool,
 }
 
 internal static class WakeModes
@@ -54,6 +57,7 @@ internal static class WakeModes
         "default" => WakeMode.Default,
         "block" => WakeMode.Block,
         "async" => WakeMode.Async,
+        "async-pool" => WakeMode.AsyncPool,
         _ => throw new ArgumentException("unknown wake mode " + s),
     };
 
@@ -62,20 +66,29 @@ internal static class WakeModes
         WakeMode.Spin => "spin",
         WakeMode.Default => "default",
         WakeMode.Block => "block",
-        _ => "async",
+        WakeMode.Async => "async",
+        _ => "async-pool",
     };
+
+    /// <summary>Awaiting rows (the ping-pong loops use <c>await reader.Wait</c>).</summary>
+    public static bool IsAsync(WakeMode m) => m is WakeMode.Async or WakeMode.AsyncPool;
 
     public static TimeSpan SpinTime(WakeMode m) => m switch
     {
         WakeMode.Spin => Timeout.InfiniteTimeSpan,
-        WakeMode.Default => TimeSpan.FromMicroseconds(20),
+        WakeMode.Default or WakeMode.Async => TimeSpan.FromMicroseconds(20),
         _ => TimeSpan.Zero,
     };
 
     /// <summary>Rounds per timing batch: kernel-wake modes are slow enough to be timed one by one.</summary>
-    public static int Batch(WakeMode m) => m is WakeMode.Spin or WakeMode.Default ? 100 : 1;
+    public static int Batch(WakeMode m) => m is WakeMode.Spin or WakeMode.Default or WakeMode.Async ? 100 : 1;
 
-    public static ReaderOptions Reader(WakeMode m) => new() { SpinTime = SpinTime(m), AsyncSpinTime = SpinTime(m) };
+    public static ReaderOptions Reader(WakeMode m) => m switch
+    {
+        WakeMode.Async => new ReaderOptions(),
+        WakeMode.AsyncPool => new ReaderOptions { SpinTime = TimeSpan.Zero, AsyncSpinTime = TimeSpan.Zero, AllowSynchronousContinuations = false },
+        _ => new ReaderOptions { SpinTime = SpinTime(m), AsyncSpinTime = SpinTime(m) },
+    };
 
-    public static RingBufferOptions Writer(WakeMode m) => new() { SpinTime = SpinTime(m) };
+    public static RingBufferOptions Writer(WakeMode m) => m == WakeMode.Async ? new RingBufferOptions() : new RingBufferOptions { SpinTime = SpinTime(m) };
 }

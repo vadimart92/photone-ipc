@@ -53,9 +53,10 @@ Semantics in one table:
 | `RingBuffer.Dispose()` (writer) | commits `0` for an outstanding bucket, publishes *Closed*, wakes every reader; readers keep draining |
 | `RingReader.Dispose()` | releases the slot, wakes a blocked writer, completes a pending `Wait` with `ObjectDisposedException` |
 
-Options: `RingBufferOptions { SpinTime = 20 µs, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true }`,
-`ReaderOptions { SpinTime = 20 µs, AsyncSpinTime = 5 µs }`. A spin budget of `Timeout.InfiniteTimeSpan` never touches the kernel (one busy core
-per waiting side); `TimeSpan.Zero` blocks immediately.
+Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true }`,
+`ReaderOptions { SpinTime = 20 µs, MaxSpinTime = null, AsyncSpinTime = 5 µs, AllowSynchronousContinuations = true }`. The spin budget adapts between
+zero and `MaxSpinTime` (default: `SpinTime`) from the gaps actually observed; `Timeout.InfiniteTimeSpan` never touches the kernel (one busy core
+per waiting side); `TimeSpan.Zero` blocks immediately. See "Waiting: latency versus CPU".
 
 ## How cross-process zero-copy works
 
@@ -101,9 +102,15 @@ All coordination is lock-free through the control block: the writer's `WriteCurs
 `WaitersMask` (readers that went to sleep, with their wanted cursor), and a `WriterWaiting` flag (the writer went to sleep for space).
 
 * **Data path** (`Commit`, `TryRead`, `Advance`): one cache-line store/load each; no kernel object is touched.
-* **Waiting**: a reader that finds too little data spins for `SpinTime` (default 20 µs) polling `WriteCursor`, then publishes its slot bit in
+* **Waiting**: a reader that finds too little data spins polling `WriteCursor` for an adaptive budget, then publishes its slot bit in
   `WaitersMask` (Dekker handshake with the writer's commit), re-checks, and only then enters a kernel wait. The writer does the symmetric thing
   for space, with the process handles of the readers it waits on in its wait set (a reader that dies wakes the writer immediately).
+  The budget is learned from the gaps each waiting party actually sees (see "Waiting: latency versus CPU" below): by default a reader spins
+  up to `SpinTime` (20 µs) while most gaps are shorter than that and not at all while they are longer; `MaxSpinTime` lets it spin through
+  longer gaps for sub-microsecond latency.
+* **Async**: `await reader.Wait(n)` hands the wait to a thread owned by the reader, which spins, then blocks, and completes the task.
+  By default (`AllowSynchronousContinuations`) the code after the `await` runs right there, and every further `Wait` made on that thread runs
+  synchronously, so an `await` loop over a reader costs the same as a `WaitSync` loop: no thread-pool hop, no extra system call.
 * **Signaling**: `Commit` looks at `WaitersMask` and issues a wake only for readers whose wanted cursor is now satisfied; `Advance` wakes the
   writer only when it is the `Advance` that crosses the writer's target. So the fast path never makes a syscall, and a blocked side costs one
   `SetEvent` per sleep, not per commit (measured: 1 M commits against a spinning reader in another process = 0 kernel calls on both sides).
@@ -122,17 +129,71 @@ alternatives planned for the next phase need no layout change:
 | `NtAlertThreadByThreadId` / `NtWaitForAlertByThreadId` | Measured **process-local only** (`STATUS_ACCESS_DENIED` cross-process); in-process candidate. |
 | `WaitOnAddress` / `WakeByAddressSingle` | Process-local; in-process candidate (the reserved `BackendWord` is the address). |
 | Keyed events (`NtCreateKeyedEvent`) | One kernel object instead of 33; same wake path. To measure. |
-| Pure spin with core pinning, `UMWAIT`/`TPAUSE` | 0.1 µs round trip (measured); costs a core per waiting side. Already available via `SpinTime = Timeout.InfiniteTimeSpan`. |
+| Pure spin with core pinning, `UMWAIT`/`TPAUSE` | 0.1 µs round trip (measured); costs a core per waiting side. Available via `SpinTime = Timeout.InfiniteTimeSpan`, or adaptively via `MaxSpinTime`. |
 
-The probe's main finding: the kernel wake itself is cheap; the ~15 µs is the *idle core* waking up. That is why every wait spins first.
+The probe's main finding: the kernel wake itself is cheap; the ~15 µs is the *idle core* waking up (and ~50-60 µs once the core has idled for a
+millisecond and dropped into a deep C-state). That is why the lever is how long a waiter spins, not which kernel primitive wakes it.
+
+## Waiting: latency versus CPU
+
+`Photone.Ipc.Benchmarks.exe --latency` measures what a wait policy actually trades. A writer process publishes a timestamp every *gap*
+(busy-waiting to a fixed schedule, so its own core never sleeps); a reader in another process measures delivery latency (`now - stamp`,
+QueryPerformanceCounter is machine-wide) and its whole process's CPU, from CPU cycle counts (`QueryProcessCycleTime`, calibrated on a busy
+core; the tick-sampled process times misattribute short wake-ups). The reader process may use any core except the writer's physical core and
+runs in the High priority class. Same laptop, one session; cells are p50 latency and reader CPU (100% = one core busy):
+
+| reader | gap 10 µs | gap 50 µs | gap 200 µs | gap 1 ms | gap 5 ms |
+|---|---:|---:|---:|---:|---:|
+| `WaitSync`, before (fixed 20 µs spin) | 0.2 µs, 96% | 17 µs, 55% | 21 µs, 16% | 28 µs, 4% | 37 µs, 1% |
+| `WaitSync`, **default now** (adaptive, up to 20 µs) | 0.2 µs, 96% | 17 µs, **17%** | 20 µs, **5%** | 44 µs, 1% | 51 µs, 1% |
+| `WaitSync`, `MaxSpinTime = 1 ms` | 0.2 µs, 100% | **0.3 µs**, 95% | **0.3 µs**, 97% | **0.6 µs**, 98% | 35 µs, 1% |
+| `WaitSync`, `MaxSpinTime = 5 ms` | 0.2 µs, 93% | 0.3 µs, 91% | 0.4 µs, 97% | 0.5 µs, 100% | **1.0 µs**, 100% |
+| `WaitSync`, block immediately (`SpinTime = 0`) | 11 µs, 35% | 18 µs, 19% | 21 µs, 5% | 27 µs, 2% | 34 µs, 1% |
+| `await Wait`, before (thread-pool continuation) | 12 µs, 219% | 20 µs, 131% | 26 µs, 86% | 62 µs, 31% | 102 µs, 15% |
+| `await Wait`, **default now** (inline continuation) | **0.2 µs**, 100% | 18 µs, **18%** | 19 µs, **5%** | **27 µs**, **2%** | **35 µs**, **2%** |
+| `await Wait`, default now + `MaxSpinTime = 1 ms` | 0.3 µs, 95% | **0.3 µs**, 98% | **0.4 µs**, 97% | **0.9 µs**, 96% | 35 µs, 2% |
+| `await Wait`, `AllowSynchronousContinuations = false` | 12 µs, 200% | 22 µs, 159% | 42 µs, 64% | 69 µs, 13% | 76 µs, 4% |
+
+Reading it:
+
+- **Before**, a fixed 20 µs spin ahead of every kernel wait burned 55% of a core at 50 µs gaps for no latency gain: the spin never caught the data.
+  The adaptive default keeps the same latency and stops spinning once most gaps are longer than the budget (17% left is the cost of the kernel
+  wait and wake-up per message, the same as blocking immediately).
+- **Sub-microsecond delivery through millisecond gaps** costs one core while traffic is that dense and nothing when it is not: with
+  `MaxSpinTime = 1 ms` the reader spins through 50 µs-1 ms gaps (0.3-0.9 µs) and goes back to blocking (1-2% CPU) when gaps grow to 5 ms.
+  Without spinning, a gap of a millisecond or more costs 30-60 µs, because the core has dropped into a deep idle state.
+- **`await` now costs what `WaitSync` costs.** Before, every suspended wait went through an event, the waiter thread and a thread-pool
+  continuation: 12-100 µs and up to two cores of CPU. With the continuation inline on the reader's thread, an await loop never suspends while it
+  keeps up. Thread-pool continuations stay available (`AllowSynchronousContinuations = false`) and remain slow; with a large spin budget they
+  also starve the pool (p99 in the tens of milliseconds), so combine `MaxSpinTime` with the default inline continuations.
+- The p99 columns (in the benchmark output) are dominated by the laptop's scheduler noise in this run (30-60 µs for every mode that blocks).
+
+Choosing options:
+
+```csharp
+// default: sub-microsecond while traffic is denser than ~20 µs per message, otherwise block (a few % of a core per 10 k messages/s)
+var reader = buffer.CreateReader();
+
+// latency first: spin through gaps up to 1 ms (up to one core while traffic is that dense, ~0 when idle)
+var fast = buffer.CreateReader(new ReaderOptions { MaxSpinTime = TimeSpan.FromMilliseconds(1) });
+
+// never spin (many readers, oversubscribed machine)
+var frugal = buffer.CreateReader(new ReaderOptions { SpinTime = TimeSpan.Zero });
+
+// the code after `await reader.Wait(n)` must run on the thread pool
+var pooled = buffer.CreateReader(new ReaderOptions { AllowSynchronousContinuations = false });
+```
+
+The writer's wait for space follows the same policy (`RingBufferOptions.SpinTime` / `MaxSpinTime`).
 
 ## Measured on this dev box
 
 Intel Core i7-8550U (4 cores / 8 threads, laptop, "Balanced" power plan), 16 GB, Windows 11 26200, .NET 10.0.12. All numbers from
 `Photone.Ipc.Benchmarks.exe --quick` (writer/side A pinned to logical core 2, reader/peer to core 4; different physical cores). RTT = a
 full round trip (A writes 8 bytes, B echoes, A reads); one-way latency is about half. The wake mode is the *reader's* `SpinTime`
-(`spin` = never block, `default` = 20 µs spin then kernel wait, `block` = kernel wait immediately, `async` = `await reader.Wait(1)` with a
-zero spin budget, i.e. every wait suspends through the waiter thread and a thread-pool continuation).
+(`spin` = never block, `default` = 20 µs spin then kernel wait, `block` = kernel wait immediately, `async` = `await reader.Wait(1)` with the
+library defaults, i.e. the continuation runs on the reader's waiter thread and later waits there run synchronously, `async-pool` =
+`await reader.Wait(1)` with no spin and thread-pool continuations, the v1 async path).
 
 Methodology: warm-up is time-based (500 ms, past the JIT tiering delay). The spin/default rows time batches of 100 round trips and report
 per-round percentiles of the batch means, because `QueryPerformanceCounter` ticks every 100 ns and costs ~20 ns per call, so a single
@@ -143,11 +204,13 @@ per-round percentiles of the batch means, because `QueryPerformanceCounter` tick
 | in-process ping-pong RTT | spin | 200,000 | p50 **0.14** / p99 0.18 / p99.9 0.48 / max 0.67 µs | 0 kernel waits, 0 signals |
 | in-process ping-pong RTT | default | 100,000 | p50 **0.15** / p99 0.19 / p99.9 0.27 / max 0.52 µs | 33 kernel waits in 100,000 rounds |
 | in-process ping-pong RTT | block | 10,000 | p50 **20.5** / p99 32.6 / p99.9 89 / max 2346 µs | 2 kernel waits + 2 `SetEvent` per round |
-| in-process ping-pong RTT | async | 10,000 | p50 **25.6** / p99 40.2 / p99.9 76 / max 1483 µs | waiter thread + thread-pool continuation per wait |
+| in-process ping-pong RTT | async | 100,000 | p50 **0.28** / p99 0.55 / p99.9 1.8 / max 2.6 µs | 79 kernel waits in 100,000 rounds; no thread hop |
+| in-process ping-pong RTT | async-pool | 10,000 | p50 **19.7** / p99 146 / p99.9 3490 / max 6767 µs | waiter thread + thread-pool continuation per wait |
 | cross-process ping-pong RTT | spin | 100,000 | p50 **0.14** / p99 0.19 / p99.9 0.32 / max 0.60 µs | 0 kernel waits, 0 signals, same VA in both processes |
 | cross-process ping-pong RTT | default | 50,000 | p50 **0.14** / p99 0.20 / p99.9 0.66 / max 0.66 µs | 43 kernel waits in 50,000 rounds |
 | cross-process ping-pong RTT | block | 10,000 | p50 **20.6** / p99 34.8 / p99.9 116 / max 741 µs | 2 kernel waits + 2 `SetEvent` per round |
-| cross-process ping-pong RTT | async | 10,000 | p50 **22.4** / p99 69.1 / p99.9 83 / max 377 µs | waiter thread + thread-pool continuation per wait |
+| cross-process ping-pong RTT | async | 100,000 | p50 **0.27** / p99 0.36 / p99.9 0.47 / max 0.71 µs | 116 kernel waits in 100,000 rounds; no thread hop |
+| cross-process ping-pong RTT | async-pool | 10,000 | p50 **23.5** / p99 77.8 / p99.9 103 / max 475 µs | waiter thread + thread-pool continuation per wait |
 | in-process throughput | 3.9 KiB buckets, fill+sum | 536,870 | **7.9 GB/s**, 1.97 M commits/s | 51 kernel waits total |
 | cross-process throughput | 3.9 KiB buckets, fill+sum | 536,870 | **7.5 GB/s**, 1.87 M commits/s | 63 kernel waits total |
 | in-process throughput | 62.5 KiB buckets, fill+sum | 33,554 | **9.9 GB/s**, 0.15 M commits/s | 76 kernel waits total |
@@ -230,10 +293,13 @@ Reading it:
 
 ```
 dotnet build E:\GitHub\photone-ipc\Photone.Ipc.slnx -c Release
-dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 275 tests, ~15 s
+dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 289 tests, ~30 s
 
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]
+
+# delivery latency and reader CPU under paced traffic, per wait policy (~1.5 min; --modes / --intervals to narrow it down)
+E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --latency
 
 # the same cross-process measurements next to a named pipe and a TCP loopback socket, plus light-workload and protocol-only rows (~2.5 min)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --compare [--cores 2,4]

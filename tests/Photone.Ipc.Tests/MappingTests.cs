@@ -4,6 +4,7 @@ using Photone.Ipc.Internal;
 
 namespace Photone.Ipc.Tests;
 
+[Collection("ipc")]   // process-wide measurements (virtual size, handle count) and timing: must not share the process with parallel tests
 public sealed unsafe class MappingTests
 {
     private const long D = 2 * 65536;   // small data region: 128 KiB

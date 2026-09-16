@@ -1289,3 +1289,113 @@ Custom harness (`Photone.Ipc.Benchmarks.exe --cross ...`, peer = TestChild `echo
 ## 13. Post-review changes
 
 The implementation was reviewed after stage C; 22 confirmed findings were fixed and are listed in `docs/REVIEW-NOTES.md`; the resulting deviations from this document are items 26-35 of `docs/DEVIATIONS.md`. The pseudo-code above has been updated in place where the protocol changed (blocked-writer local ref, no hot-path `ReserveEnd` store, dead-only claim sweep with identity zeroing, `Status` liveness probe, Dekker between `BeginWait` and `Dispose`, finalizers, waiter-thread idle retirement, pre-faulting of both views, access-denied liveness through creation times, session-split detection in the named-event backend).
+
+## 14. Adaptive spinning, the async waiter and synchronous continuations (phase 2, step 1)
+
+Measured motivation (`bench --latency`, `docs/SIGNALING-PROBE.md`): a kernel wake costs ~10-20 µs after a short idle and ~30-60 µs once the core
+has idled for a millisecond (deep C-state); spinning costs 0.1-0.3 µs of latency and a core while it lasts. v1 spun a fixed 20 µs before every
+kernel wait (55% of a core at 50 µs gaps for no gain) and completed every suspended `await` through an event, the waiter thread and a thread-pool
+continuation (12-100 µs, up to two cores). Both are replaced; the shared-memory layout and the wake protocol of §5 are unchanged.
+
+### 14.1 `SpinPolicy` (`Internal\SpinPolicy.cs`)
+
+One instance per waiting party: `RingReader._spin` (data waits, both `WaitSync` and the waiter thread; one wait at a time, so no sharing),
+`RingReader._idleSpin` (the waiter thread waiting for its next request), `RingBuffer._spaceSpin` (writer waiting for space).
+
+```
+state: initial = ToTicks(SpinTime); max = max(initial, ToTicks(MaxSpinTime ?? SpinTime)); window = initial;
+       envelope = initial / 2; share = 256 (fixed-point 1.0); fixed = SpinTime < 0 (window = +inf) || max == 0 (window = 0)
+OnSatisfied(waited):                                  // every wait that got its condition, spun or blocked (not timeouts/closure/cancel)
+    if fixed: return
+    short = waited <= max
+    share += ((short ? 256 : 0) - share) >> 3         // EWMA, weight 1/8
+    if short: envelope = max(waited, envelope - envelope >> 3)
+    window = share < 128 ? 0 : clamp(2 * envelope, initial, max)
+WaitCore(target, deadline, honorCancel):              // RingReader; WaitForSpace is the same shape on the writer
+    start = now; budget = min(window, deadline - start)
+    if budget > 0 && SpinUntil(target, budget, honorCancel): if adaptive: OnSatisfied(now - start); return true
+    ok = BlockUntil(target, deadline, honorCancel)     // §5.5 unchanged
+    if ok: OnSatisfied(now - start)
+    return ok
+```
+
+Properties: the decision to spin needs a majority of recent waits within `max`, so a single early wake-up in a stream of long gaps (jitter)
+cannot switch spinning on, and a single long gap in dense traffic cannot switch it off. The window covers twice the recent short gaps and is never
+below `SpinTime` while spinning, so with the default (`MaxSpinTime = null` = `SpinTime`) the window is exactly `SpinTime` or zero.
+`SpinUntil` gives up early on dispose, cancellation (when honoured) and the cold checks of §5.5; those waits then block or throw and are not
+reported. An earlier haltpoll-style variant (grow on one short blocked wait, halve on a long one) oscillated under wake-up jitter (34% of a core
+at 50 µs gaps) and was replaced.
+
+### 14.2 Arm / park handshake of the waiter thread (`RingReader.Async.cs`)
+
+Process-local fields: `_request` (a `Wait` is armed and not yet taken), `_waiterParked` (the waiter is blocked, or about to block, on the
+process-local `_arm` auto-reset event), `_waiter` (the thread, or null), `_gate` (lock; thread creation and retirement only).
+
+```
+Wait (caller, not on the waiter thread):
+    fast path; zero timeout; caller spin min(AsyncSpinTime, _spin.window); cancelled?
+    BeginWait()                                          // §5.9 Dekker with Dispose
+    _vts.Reset(); token = _vts.Version; _asyncTarget/_asyncDeadline/_ct = ...; _cancelRequested = 0; register ct
+    Arm(); return ValueTask(this, token)
+Arm:
+    Exchange(_request, 1)                               // store [full fence]
+    if Volatile.Read(_waiterParked) != 0 || _waiter == null: ArmSlow()
+ArmSlow:
+    lock _gate: if _waiter == null { _waiterParked = 0; start thread; return }
+    _arm.Set()                                          // counted as ArmSignals
+WaiterLoop:
+    loop:
+        if _exit: return
+        if Exchange(_request, 0) != 0: Serve(); continue
+        idleStart = now
+        if SpinForRequest(_idleSpin.window): _idleSpin.OnSatisfied(now - idleStart); continue
+        Exchange(_waiterParked, 1)                      // store [full fence]
+        if Volatile.Read(_request) == 0 && !_exit:      // load
+            if !_arm.WaitOne(5 s):
+                lock _gate: if _request == 0 { _waiter = null; return }   // retire; _waiterParked stays 1 so the next Arm starts a thread
+        _waiterParked = 0
+        if _request != 0: _idleSpin.OnSatisfied(now - idleStart)
+Serve:
+    result/ex = WaitCore(_asyncTarget, _asyncDeadline, honorCancel: true)
+    _ctr.Dispose(); _waitOutstanding = 0                // before completion: the continuation may call Wait again
+    _vts.SetResult/SetException                         // inline when AllowSynchronousContinuations (the default), else thread pool
+```
+
+No lost request: `Arm` (store `_request`, fence, load `_waiterParked`) and the park (store `_waiterParked`, fence, load `_request`) form a Dekker
+pair, so either the waiter sees the request and does not block, or `Arm` sees the waiter parked and signals `_arm` (a stale set is consumed as
+a spurious wake: the loop re-reads `_request`). Retirement re-reads `_request` under `_gate`; `ArmSlow` publishes `_request` before taking
+`_gate`, so a request is either seen by the retiring waiter or finds `_waiter == null` and starts a new thread. `_asyncTarget`/`_asyncDeadline`/
+`_ct` are written before the fenced `_request` store and read after the waiter's `Exchange(_request, 0)`: happens-before holds.
+
+### 14.3 Synchronous continuations and waits on the waiter thread
+
+`ReaderOptions.AllowSynchronousContinuations` (default true) sets `_vts.RunContinuationsAsynchronously = false`: the continuation of a
+suspended `Wait` runs inside `SetResult`, on the waiter thread (unless the awaiter captured a synchronization context). A `Wait` called on
+that thread cannot be served by the loop (the loop is below it on the stack), so it runs synchronously instead:
+
+```
+Wait on the waiter thread: fast path; zero timeout; cancelled?
+    BeginWait(); register ct (OnCancel sets _cancelRequested and wakes our slot event)
+    return completed ValueTask(WaitCore(target, deadline, honorCancel: ct.CanBeCanceled))   // exceptions -> faulted / cancelled ValueTask
+    finally: unregister; _waitOutstanding = 0
+```
+
+An `await` loop over the reader therefore migrates onto the waiter thread at its first suspension and then never suspends while it keeps up:
+no arm, no thread hop, no system call beyond the kernel wait itself. Sync-over-async on this reader inside the loop completes synchronously
+instead of deadlocking. `Dispose` on the waiter thread: `CompletePendingRequestOnDispose` completes an armed request that the loop has not
+taken with `ObjectDisposedException` (otherwise `Dispose` would wait for itself), and `StopWaiterThread` sets `_exit` without joining itself;
+the loop exits when control returns to it, before touching `_arm` or the mapping.
+
+### 14.4 Results (same laptop, same session, `bench --latency`; p50 latency, reader process CPU)
+
+| reader | 10 µs | 50 µs | 200 µs | 1 ms | 5 ms |
+|---|---:|---:|---:|---:|---:|
+| `WaitSync` v1 (fixed 20 µs) | 0.2 µs, 96% | 17 µs, 55% | 21 µs, 16% | 28 µs, 4% | 37 µs, 1% |
+| `WaitSync` default | 0.2 µs, 96% | 17 µs, 17% | 20 µs, 5% | 44 µs, 1% | 51 µs, 1% |
+| `WaitSync`, `MaxSpinTime = 1 ms` | 0.2 µs, 100% | 0.3 µs, 95% | 0.3 µs, 97% | 0.6 µs, 98% | 35 µs, 1% |
+| `await` v1 (pool continuation) | 12 µs, 219% | 20 µs, 131% | 26 µs, 86% | 62 µs, 31% | 102 µs, 15% |
+| `await` default (inline) | 0.2 µs, 100% | 18 µs, 18% | 19 µs, 5% | 27 µs, 2% | 35 µs, 2% |
+| `await` default, `MaxSpinTime = 1 ms` | 0.3 µs, 95% | 0.3 µs, 98% | 0.4 µs, 97% | 0.9 µs, 96% | 35 µs, 2% |
+
+Tests: `AdaptiveWaitTests` (policy arithmetic, learned spinning in real waits for readers and the writer, inline continuations on the waiter
+thread, zero allocation on the inline path, `Dispose` and cancellation on the waiter thread, arm handshake under random gaps).

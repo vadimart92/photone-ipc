@@ -56,6 +56,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         _atCreatorAddress = mapping.BaseAddress == creatorBase;
         double ms = options.LivenessCheckInterval.TotalMilliseconds;
         _livenessMs = ms < 1 ? 1u : ms >= int.MaxValue ? (uint)int.MaxValue : (uint)ms;
+        _spaceSpin = new SpinPolicy(options.SpinTime, options.MaxSpinTime);
         _laggards = isWriter ? new LaggardEntry[Layout.MaxReaders] : [];
         _laggardHandles = isWriter ? new nint[Layout.MaxReaders] : [];
         _laggardSlot = isWriter ? new int[Layout.MaxReaders] : [];

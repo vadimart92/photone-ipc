@@ -39,6 +39,9 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
     private int _waitOutstanding;
     private long _nextLivenessProbe;    // Stopwatch timestamp of the next writer-liveness probe made by Status (polling readers)
     private readonly long _livenessTicks;
+    private readonly long _asyncSpinTicks;
+    private SpinPolicy _spin;           // data waits (WaitSync on the caller, Wait on the waiter thread); one wait at a time, so no sharing
+    private SpinPolicy _idleSpin;       // the waiter thread waiting for the next request
     private Counters _counters;
 
     internal RingReader(RingBuffer<T> owner, int slot, long word, long cursor, ReaderOptions options)
@@ -55,9 +58,12 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         _mask = owner.Mask;
         _livenessMs = owner.LivenessCheckIntervalMs;
         _livenessTicks = SpinClock.ToTicks(TimeSpan.FromMilliseconds(_livenessMs));
+        _asyncSpinTicks = options.AsyncSpinTime < TimeSpan.Zero ? long.MaxValue : SpinClock.ToTicks(options.AsyncSpinTime);
+        _spin = new SpinPolicy(options.SpinTime, options.MaxSpinTime);
+        _idleSpin = new SpinPolicy(options.SpinTime, options.MaxSpinTime);
         _r = cursor;
         _wc = cursor;
-        _vts.RunContinuationsAsynchronously = true;
+        _vts.RunContinuationsAsynchronously = !options.AllowSynchronousContinuations;
     }
 
     // ------------------------------------------------------------------ properties
@@ -149,6 +155,9 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
 
     /// <summary>Internal diagnostics counters.</summary>
     internal Counters Counters => _counters;
+
+    /// <summary>Current adaptive spin budget of data waits, in Stopwatch ticks (tests and benchmarks).</summary>
+    internal long SpinWindowTicks => _spin.Window;
 
     private ref ControlBlock Hdr => ref Unsafe.AsRef<ControlBlock>(_hdr);
 
@@ -284,17 +293,44 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         BeginWait();
         try
         {
-            if (SpinUntil(target, _options.SpinTime))
-            {
-                return true;
-            }
-
-            return BlockUntil(target, SpinClock.ToDeadline(timeout), honorCancel: false);
+            return WaitCore(target, SpinClock.ToDeadline(timeout), honorCancel: false);
         }
         finally
         {
             Volatile.Write(ref _waitOutstanding, 0);
         }
+    }
+
+    /// <summary>
+    /// Two-phase wait shared by <see cref="WaitSync(int, TimeSpan)"/> (caller thread) and the async waiter thread: spin for the adaptive budget
+    /// (never past the deadline), then block; a wait that had to block feeds its total duration back into the spin policy.
+    /// </summary>
+    private bool WaitCore(long target, long deadline, bool honorCancel)
+    {
+        long start = Stopwatch.GetTimestamp();
+        long budget = _spin.Window;
+        if (deadline != long.MaxValue && deadline - start < budget)
+        {
+            budget = deadline - start;
+        }
+
+        if (budget > 0 && SpinUntil(target, budget, honorCancel))
+        {
+            if (_spin.IsAdaptive)
+            {
+                _spin.OnSatisfied(Stopwatch.GetTimestamp() - start);
+            }
+
+            return true;
+        }
+
+        bool satisfied = BlockUntil(target, deadline, honorCancel);
+        if (satisfied)
+        {
+            _spin.OnSatisfied(Stopwatch.GetTimestamp() - start);
+        }
+
+        return satisfied;
     }
 
     /// <summary>
@@ -316,15 +352,19 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         }
     }
 
-    /// <summary>Polls W on every pause; timestamps every 16 iterations. Returns <see langword="true"/> only when the target is reached.</summary>
-    private bool SpinUntil(long target, TimeSpan budget)
+    /// <summary>
+    /// Polls W on every pause for <paramref name="budgetTicks"/> Stopwatch ticks (<see cref="long.MaxValue"/> = forever); reads the clock every 16 iterations.
+    /// Returns <see langword="true"/> only when the target is reached; gives up early on dispose, on cancellation (when honoured) and on the cold checks.
+    /// </summary>
+    private bool SpinUntil(long target, long budgetTicks, bool honorCancel)
     {
-        if (budget == TimeSpan.Zero)
+        if (budgetTicks <= 0)
         {
             return false;
         }
 
-        SpinClock clock = SpinClock.Start(budget);
+        long now = Stopwatch.GetTimestamp();
+        long end = budgetTicks >= long.MaxValue - now ? long.MaxValue : now + budgetTicks;
         int i = 0;
         while (true)
         {
@@ -342,7 +382,9 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
                 continue;
             }
 
-            if (clock.Expired || Volatile.Read(ref _disposing) != 0)
+            if ((end != long.MaxValue && Stopwatch.GetTimestamp() >= end)
+                || Volatile.Read(ref _disposing) != 0
+                || (honorCancel && Volatile.Read(ref _cancelRequested) != 0))
             {
                 return false;
             }
@@ -524,6 +566,13 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         GC.SuppressFinalize(this);
         Interlocked.Exchange(ref _disposing, 1);                    // full fence: pairs with BeginWait (Dekker), see there
         Volatile.Write(ref _cancelRequested, 1);
+        if (Thread.CurrentThread == _waiter)
+        {
+            // Called from a synchronous continuation on the waiter thread. If that continuation had already armed another wait,
+            // the waiter loop (this very thread) cannot serve it until we return: complete it here, or the loop below never ends.
+            CompletePendingRequestOnDispose();
+        }
+
         while (Volatile.Read(ref _waitOutstanding) != 0)
         {
             _backend.WakeReader(_slot);                             // wakes OUR OWN blocked wait (sync on another thread, or the waiter thread)

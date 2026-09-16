@@ -16,6 +16,7 @@ public sealed unsafe partial class RingBuffer<T>
     private long _e;
     private long _min;
     private bool _outstanding;
+    private SpinPolicy _spaceSpin;
     private Counters _counters;
 
     // laggard bookkeeping (writer only; sized 32 for the writer, empty otherwise)
@@ -244,43 +245,69 @@ public sealed unsafe partial class RingBuffer<T>
         }
     }
 
+    /// <summary>Two-phase wait for free space: spin for the adaptive budget (rescanning every ~1 µs), then block; a blocked wait feeds the policy.</summary>
     private void WaitForSpace(int count)
     {
-        long target = _e + count - _capacity;                       // min reader cursor that frees `count` elements (fixed for this episode)
-
-        // phase 1: spin, rescanning at most every ~1 µs
-        if (_options.SpinTime != TimeSpan.Zero)
+        long start = Stopwatch.GetTimestamp();
+        if (SpinForSpace(count, start, _spaceSpin.Window))
         {
-            SpinClock clock = SpinClock.Start(_options.SpinTime);
-            int i = 0;
-            while (true)
+            if (_spaceSpin.IsAdaptive)
             {
-                Thread.SpinWait(1);
-                if ((++i & 7) != 0)
+                _spaceSpin.OnSatisfied(Stopwatch.GetTimestamp() - start);
+            }
+
+            return;
+        }
+
+        BlockForSpace(count);
+        _spaceSpin.OnSatisfied(Stopwatch.GetTimestamp() - start);
+    }
+
+    private bool SpinForSpace(int count, long start, long budget)
+    {
+        if (budget <= 0)
+        {
+            return false;
+        }
+
+        long end = budget >= long.MaxValue - start ? long.MaxValue : start + budget;
+        long rescan = SpinClock.ToTicks(s_rescanInterval);
+        long lastScan = start;
+        int i = 0;
+        while (true)
+        {
+            Thread.SpinWait(1);
+            if ((++i & 7) != 0)
+            {
+                continue;
+            }
+
+            long now = Stopwatch.GetTimestamp();
+            if (now - lastScan >= rescan)
+            {
+                lastScan = now;
+                _min = ScanMin();
+                if (_capacity - (_e - _min) >= count)
                 {
-                    continue;
+                    return true;
                 }
 
-                if (clock.Tick(s_rescanInterval))
+                if (Volatile.Read(ref _disposed) != 0)
                 {
-                    _min = ScanMin();
-                    if (_capacity - (_e - _min) >= count)
-                    {
-                        return;
-                    }
-
-                    if (Volatile.Read(ref _disposed) != 0)
-                    {
-                        break;
-                    }
-                }
-
-                if (clock.Expired)
-                {
-                    break;
+                    return false;
                 }
             }
+
+            if (end != long.MaxValue && now >= end)
+            {
+                return false;
+            }
         }
+    }
+
+    private void BlockForSpace(int count)
+    {
+        long target = _e + count - _capacity;                       // min reader cursor that frees `count` elements (fixed for this episode)
 
         // phase 2: kernel (the caller holds a local ref: the mapping stays valid even if Dispose runs on another thread)
         _counters.KernelWaits++;

@@ -13,7 +13,7 @@ docs/
   RESEARCH.md            the four research reports (Win32 mapping, sync protocol, .NET specifics, vmcircbuffer)
   DEVIATIONS.md          35 numbered deviations from DESIGN.md with reasons (stage A/B/C + post-review)
   REVIEW-NOTES.md        31 review findings: 22 fixed, 9 refuted/deferred, each with the reason
-  SIGNALING-PROBE.md     measured cross-process wake costs (spin / Event / NtEvent / SignalObjectAndWait / NtAlert)
+  SIGNALING-PROBE.md     measured cross-process wake costs (spin / Event / NtEvent / SignalObjectAndWait / NtAlert), phase-2 status
   STATUS.md              this file
 src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible, InternalsVisibleTo tests/bench)
   RingBuffer.cs          Create / Open(name) / Open(handle) / DuplicateSectionHandleTo / properties / Dispose / finalizer
@@ -27,11 +27,12 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   Internal/Kernel.cs     19 [LibraryImport]s (kernelbase: VirtualAlloc2, MapViewOfFile3; kernel32; ntdll: NtQuerySystemInformation)
   Internal/MirroredSection.cs   placeholder + 3 views (header, data, mirror); create / open at the creator's address / teardown
   Internal/Layout.cs     4096-byte ControlBlock, 32 x 64-byte ReaderSlot, static layout asserts
+  Internal/SpinPolicy.cs  adaptive spin budget (DESIGN §14)
   Internal/Capacity.cs, AddressHint.cs, ProcessLiveness.cs, SpinClock.cs, Counters.cs, TestHooks.cs
-tests/Photone.Ipc.Tests/       275 xunit.v3 tests (unit, stress, and 20 cross-process tests via TestChild)
+tests/Photone.Ipc.Tests/       289 xunit.v3 tests (unit, stress, and 20 cross-process tests via TestChild)
 tests/Photone.Ipc.TestChild/   child-process verbs: reader, spin-reader, step-reader, writer [--crash], echo, crash-reader,
                                claim-and-die, slow-init, hold-name, join-storm, map-region
-bench/Photone.Ipc.Benchmarks/  BenchmarkDotNet hot path + `--quick` Stopwatch harness (in-process and cross-process, `--peer` mode)
+bench/Photone.Ipc.Benchmarks/  BenchmarkDotNet hot path, `--quick`, `--compare` (named pipe / TCP), `--latency` (paced delivery latency + CPU)
 samples/Photone.Ipc.Samples.Writer, .Reader   the user's API sketch verbatim, cross-process, sine wave
 ```
 
@@ -56,13 +57,13 @@ if (await reader.Wait(100))                                   // ValueTask<bool>
 ```
 
 Also: `TryGetBucket`, `WaitSync(count[, timeout])`, `Wait(count, timeout, ct)`, `Available`, `ReadCursor`, `Status`, `IsCompleted`,
-`RingBuffer.Open(SafeSectionHandle)`, `DuplicateSectionHandleTo(pid)`, `RingBufferOptions { SpinTime, LivenessCheckInterval,
-InitializationTimeout, PreferredBaseAddress, PreFault }`, `ReaderOptions { SpinTime, AsyncSpinTime }`.
+`RingBuffer.Open(SafeSectionHandle)`, `DuplicateSectionHandleTo(pid)`, `RingBufferOptions { SpinTime, MaxSpinTime, LivenessCheckInterval,
+InitializationTimeout, PreferredBaseAddress, PreFault }`, `ReaderOptions { SpinTime, MaxSpinTime, AsyncSpinTime, AllowSynchronousContinuations }`.
 
 ## Verification
 
 - `dotnet build Photone.Ipc.slnx -c Release`: 0 warnings, 0 errors (`TreatWarningsAsErrors`, `AnalysisLevel=latest`).
-- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 275/275, three consecutive runs, ~15 s each.
+- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 289/289, four consecutive runs, ~30 s each.
 - Samples run cross-process at the same virtual address; killing the writer ends the reader with `WriterTerminated` after draining.
 - Zero allocations on every hot path (asserted by tests and by BenchmarkDotNet's `MemoryDiagnoser`).
 
@@ -96,11 +97,24 @@ Details and the reading of these numbers are in the README.
 - `Dispose` of the writer while a bucket is outstanding on another thread is unsupported; `Dispose` while blocked in `GetBucket` is supported.
 - 64-byte reader slots pair up under the adjacent-line prefetcher (multi-reader configurations only); a 128-byte slot layout is a v2 candidate.
 
-## Next steps (phase 2: signaling)
+## Phase 2, step 1: adaptive waiting (done)
 
-1. `docs/SIGNALING-PROBE.md` shows the lever is *where the waiter waits*, not which kernel primitive wakes it: an idle core costs ~12 us
-   per wake (C-state exit), a busy core ~4 us, spinning 0.07 us. `NtAlertThreadByThreadId` is process-local (access denied cross-process).
-2. Candidates to implement behind `SignalBackend` and benchmark cross-process: keyed events (one kernel object for all slots),
-   direct `NtSetEvent`/`NtWaitForMultipleObjects` (about 1 us per round trip), a dedicated spinning waiter thread with an adaptive budget,
-   `UMWAIT`/`TPAUSE` (WAITPKG) via a tiny native helper to spin at low power.
-3. Expose a backend selector on `RingBufferOptions` once a second backend exists (the header already carries `SignalBackendId`).
+Spin budgets adapt to the gaps each waiting party observes (`MaxSpinTime`), the async waiter thread spins, and awaited continuations run
+inline on the reader's thread (`AllowSynchronousContinuations`, default on). `bench --latency`, same session, p50 latency and reader CPU:
+
+| reader | gap 10 µs | gap 50 µs | gap 200 µs | gap 1 ms | gap 5 ms |
+|---|---:|---:|---:|---:|---:|
+| `WaitSync` before | 0.2 µs, 96% | 17 µs, 55% | 21 µs, 16% | 28 µs, 4% | 37 µs, 1% |
+| `WaitSync` default now | 0.2 µs, 96% | 17 µs, 17% | 20 µs, 5% | 44 µs, 1% | 51 µs, 1% |
+| `WaitSync`, `MaxSpinTime = 1 ms` | 0.2 µs, 100% | 0.3 µs, 95% | 0.3 µs, 97% | 0.6 µs, 98% | 35 µs, 1% |
+| `await` before | 12 µs, 219% | 20 µs, 131% | 26 µs, 86% | 62 µs, 31% | 102 µs, 15% |
+| `await` default now | 0.2 µs, 100% | 18 µs, 18% | 19 µs, 5% | 27 µs, 2% | 35 µs, 2% |
+| `await`, `MaxSpinTime = 1 ms` | 0.3 µs, 95% | 0.3 µs, 98% | 0.4 µs, 97% | 0.9 µs, 96% | 35 µs, 2% |
+
+## Next steps
+
+1. `UMWAIT`/`TPAUSE` (WAITPKG) to spin at low power while staying in C0: needs Alder Lake or newer and emitted machine code (no .NET intrinsic);
+   not available on this laptop (Kaby Lake R).
+2. Keyed events (one kernel object instead of 33 per buffer): faster `Open`, fewer handles, same wake path.
+3. Layout v2 with 128-byte reader slots (adjacent-line prefetcher), multi-reader configurations only.
+4. Direct `NtSetEvent` / `NtWaitForMultipleObjects`: tried, no measurable gain on this laptop (DESIGN/SIGNALING-PROBE); revisit on a quiet desktop.

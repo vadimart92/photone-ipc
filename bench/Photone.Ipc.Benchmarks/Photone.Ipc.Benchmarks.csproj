@@ -7,6 +7,8 @@
     <Optimize>true</Optimize>
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <TieredPGO>true</TieredPGO>
+    <!-- measurement loops are compiled fully optimised up front: no on-stack-replacement stall in the middle of a measured window -->
+    <TieredCompilationQuickJitForLoops>false</TieredCompilationQuickJitForLoops>
     <IsPackable>false</IsPackable>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>

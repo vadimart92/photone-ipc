@@ -29,4 +29,7 @@ internal struct Counters
 
     /// <summary>Bytes allocated on the reader's async waiter thread across all suspensions (diagnostic for the zero-allocation contract).</summary>
     public long WaiterAllocatedBytes;
+
+    /// <summary>System calls made to wake a parked async waiter thread (reader; zero while the waiter keeps up by spinning).</summary>
+    public long ArmSignals;
 }

@@ -165,3 +165,26 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
     the drain thread exists only for `Write_SpinningReaderThread`; throughput rows read every element on the consumer side (fill+sum) and
     use bucket sizes that do not divide the ring (1000 / 16000 floats) so buckets wrap through the mirror; an `async` wake mode measures
     `await reader.Wait(1)`; `WriteRead_FillAndSum_OddBucket` measures wrapping buckets in BenchmarkDotNet.
+
+## Phase 2, step 1: adaptive waiting (see DESIGN §14)
+
+36. **Spin budgets adapt** (DESIGN §2/§5.3/§5.5 had fixed `SpinTime` budgets). `SpinPolicy` learns from observed wait durations; new options
+    `ReaderOptions.MaxSpinTime` and `RingBufferOptions.MaxSpinTime` (default `null` = `SpinTime`). `SpinTime = 0` still never spins and a
+    negative `SpinTime` still spins forever.
+
+37. **The async waiter thread spins** (DESIGN §7: it blocked right away, after a 5 µs spin on the caller): for data (`_spin`) and, between requests,
+    for the next request (`_idleSpin`). The caller-side spin is now at most the adaptive budget. The `_arm` event is only set when the waiter
+    parked (Dekker pair `_request` / `_waiterParked`); `Counters.ArmSignals` counts those sets.
+
+38. **`ReaderOptions.AllowSynchronousContinuations`, default true** (DESIGN §7: continuations always on the thread pool). With it, a `Wait` called on
+    the waiter thread runs synchronously and returns a completed task. Thread-pool continuations measured 12-100 µs and up to two cores; with a
+    large spin budget they also starved the pool (p99 in the tens of milliseconds).
+
+39. **`Dispose` on the waiter thread** completes an armed-but-untaken request with `ObjectDisposedException` and does not join itself.
+
+40. **Test isolation:** `MappingTests` (process-wide virtual size / handle counts) and `AdaptiveWaitTests` (timing, thread-pool injection)
+    joined the non-parallel `ipc` collection; the async zero-allocation test measures the writer over the steady-state window only (the first
+    `SetEvent` of a process allocates 48 bytes once, in the runtime's lazy P/Invoke binding).
+
+41. **Benchmarks:** `--latency` (paced delivery latency and reader CPU from cycle counts); `TieredCompilationQuickJitForLoops=false` in the
+    benchmark project, so measurement loops never hit an on-stack-replacement compile inside a measured window.

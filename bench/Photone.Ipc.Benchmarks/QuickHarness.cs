@@ -49,12 +49,12 @@ internal static class QuickHarness
         var total = Stopwatch.StartNew();
         var rows = new List<Row>();
 
-        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 200_000), (WakeMode.Default, 100_000), (WakeMode.Block, 10_000), (WakeMode.Async, 10_000) })
+        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 200_000), (WakeMode.Default, 100_000), (WakeMode.Block, 10_000), (WakeMode.Async, 100_000), (WakeMode.AsyncPool, 10_000) })
         {
             rows.Add(InProcessPingPong(mode, rounds));
         }
 
-        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 100_000), (WakeMode.Default, 50_000), (WakeMode.Block, 10_000), (WakeMode.Async, 10_000) })
+        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 100_000), (WakeMode.Default, 50_000), (WakeMode.Block, 10_000), (WakeMode.Async, 100_000), (WakeMode.AsyncPool, 10_000) })
         {
             rows.Add(CrossProcessPingPong(mode, rounds));
         }
@@ -85,7 +85,7 @@ internal static class QuickHarness
         var total = Stopwatch.StartNew();
         var rows = new List<Row>();
 
-        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 100_000), (WakeMode.Default, 50_000), (WakeMode.Block, 10_000), (WakeMode.Async, 10_000) })
+        foreach ((WakeMode mode, int rounds) in new[] { (WakeMode.Spin, 100_000), (WakeMode.Default, 50_000), (WakeMode.Block, 10_000), (WakeMode.Async, 100_000), (WakeMode.AsyncPool, 10_000) })
         {
             rows.Add(CrossProcessPingPong(mode, rounds));
         }
@@ -217,7 +217,7 @@ internal static class QuickHarness
             Affinity.Pin(s_coreB, highest: true);
             using RingReader<long> fromA = ab.CreateReader(WakeModes.Reader(mode));
             ready.Set();                                          // a reader only sees commits made after it joined
-            if (mode == WakeMode.Async)
+            if (WakeModes.IsAsync(mode))
             {
                 Peer.EchoLoopAsync(fromA, ba).GetAwaiter().GetResult();
             }
@@ -236,7 +236,7 @@ internal static class QuickHarness
         ThreadPriority old = Thread.CurrentThread.Priority;
         Thread.CurrentThread.Priority = ThreadPriority.Highest;
         int batch = WakeModes.Batch(mode);
-        long[] ticks = mode == WakeMode.Async
+        long[] ticks = WakeModes.IsAsync(mode)
             ? RunPingPongAsync(ab, fromB, rounds, batch).GetAwaiter().GetResult()
             : RunPingPong(ab, fromB, rounds, batch);
         Thread.CurrentThread.Priority = old;
@@ -262,7 +262,7 @@ internal static class QuickHarness
         ThreadPriority old = Thread.CurrentThread.Priority;
         Thread.CurrentThread.Priority = ThreadPriority.Highest;
         int batch = WakeModes.Batch(mode);
-        long[] ticks = mode == WakeMode.Async
+        long[] ticks = WakeModes.IsAsync(mode)
             ? RunPingPongAsync(outbound, reader, rounds, batch).GetAwaiter().GetResult()
             : RunPingPong(outbound, reader, rounds, batch);
         Thread.CurrentThread.Priority = old;

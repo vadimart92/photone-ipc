@@ -240,14 +240,21 @@ public sealed class LifetimeTests
     public async Task ZeroAlloc_AsyncSuspendResume_SteadyState()
     {
         using RingBuffer<long> buffer = RingBuffer<long>.Create(1 << 12);
-        using RingReader<long> reader = buffer.CreateReader();
+        using RingReader<long> reader = buffer.CreateReader(new ReaderOptions { AllowSynchronousContinuations = false });   // every wait suspends and resumes on the pool
         using var stop = new CancellationTokenSource();
+        int measuring = 0;
         Task<long> producer = Task.Run(() =>
         {
-            // the writer's signalling path (Commit -> SignalReaders -> SetEvent) measured exactly on its own thread
-            long t0 = GC.GetAllocatedBytesForCurrentThread();
+            // The writer's signalling path (Commit -> SignalReaders -> SetEvent) measured exactly on its own thread, over the same steady-state
+            // window as the reader (the very first SetEvent of the process allocates 48 bytes once, in the runtime's lazy P/Invoke binding).
+            long t0 = -1;
             while (!stop.IsCancellationRequested)
             {
+                if (t0 < 0 && Volatile.Read(ref measuring) != 0)
+                {
+                    t0 = GC.GetAllocatedBytesForCurrentThread();
+                }
+
                 if (RingTestUtil.ReaderBitSet(buffer, reader.Slot))
                 {
                     RingTestUtil.WriteSequence(buffer, 4, 4);
@@ -258,7 +265,7 @@ public sealed class LifetimeTests
                 }
             }
 
-            return GC.GetAllocatedBytesForCurrentThread() - t0;
+            return t0 < 0 ? -1 : GC.GetAllocatedBytesForCurrentThread() - t0;
         });
 
         long suspended = 0;
@@ -279,6 +286,7 @@ public sealed class LifetimeTests
         // test host allocate on their own; the library's threads allocate nothing.)
         long armAllocated = 0;
         long waiterBefore = reader.Counters.WaiterAllocatedBytes;
+        Volatile.Write(ref measuring, 1);
         for (int i = 0; i < 2000; i++)
         {
             long t0 = GC.GetAllocatedBytesForCurrentThread();
