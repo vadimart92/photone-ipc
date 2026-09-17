@@ -812,6 +812,182 @@ public sealed unsafe class TagTests
         Assert.Equal(shared.CurrentRing, ((SharedTagReader)reader.Tags!).Ring);
     }
 
+    // ------------------------------------------------------------------ tag memory, as the buffer reports it (RingBuffer.TagMemory)
+
+    [Fact]
+    public void TagMemory_ReportsTheCommittedSizes_TheCurrentRingAndThePersistentKeys()
+    {
+        using var setup = new Setup(ReaderKind.CrossProcessOpener);
+        TagMemoryInfo before = setup.Writer.TagMemory;
+        Assert.Equal(0, before.CommittedBytes);                             // nothing is committed before the first tag
+        Assert.Equal(TagFormat.MinRingBytes, before.CurrentRingBytes);      // the log starts in the smallest ring
+
+        WriteBucket(setup.Writer, 10, b => b.AddTag(new SampleRateTag { Rate = 48000 }));
+        TagMemoryInfo memory = setup.Writer.TagMemory;
+        Assert.Equal((long)Layout.HeaderViewBytes, memory.TableCommittedBytes);      // the table's first view
+        Assert.Equal(TagFormat.MinRingBytes, memory.RingCommittedBytes);            // ring 0
+        Assert.Equal(TagFormat.MinRingBytes + Layout.HeaderViewBytes, memory.CommittedBytes);
+        Assert.Equal(TagFormat.MinRingBytes, memory.CurrentRingBytes);
+        Assert.Equal(0, memory.RingSwitches);
+        Assert.Equal(1, memory.PersistentKeys);
+        Assert.Equal(1, memory.UnreadTags);
+        Assert.True(memory.UnreadBytes > 0, "the record of the tag is reserved");
+    }
+
+    [Fact]
+    public void TagMemory_KeepsWhatThePeakNeeded_AfterTheLogMovesBackToASmallerRing()
+    {
+        const int Capacity = 1 << 10;
+        using var setup = new Setup(ReaderKind.CrossProcessOpener, capacity: Capacity);
+        using RingReader<long> reader = setup.CreateReader();
+        string text = new('g', 2000);
+
+        long written = 0;                                                   // the reader reads nothing: the log grows through several rings
+        while (written < Capacity)
+        {
+            WriteBucket(setup.Writer, 16, b =>
+            {
+                for (int j = 0; j < 16; j++)
+                {
+                    b.AddTag(Label(text + (b.Cursor + j)), j);
+                }
+            });
+            written += 16;
+        }
+
+        TagMemoryInfo peak = setup.Writer.TagMemory;
+        Assert.True(peak.CommittedBytes > 2 << 20, $"only {peak.CommittedBytes} bytes committed");
+        Assert.True(peak.RingSwitches >= 3, $"only {peak.RingSwitches} ring switches");
+        Assert.Equal(Capacity, peak.UnreadTags);
+        Assert.Equal(0, peak.PersistentKeys);                               // labels are not persistent: no table, nothing that stays per key
+
+        long read = 0;
+        while (read < Capacity)
+        {
+            int n = (int)Math.Min(100, reader.Available);
+            Assert.True(reader.TryRead(n, out _));
+            reader.Advance(n);
+            read += n;
+        }
+
+        for (int round = 0; round < 20_000 && setup.Writer.TagMemory.CurrentRingBytes >= peak.CurrentRingBytes / 2; round++)
+        {
+            WriteBucket(setup.Writer, 4, b => b.AddTag(Label(text)));
+            Assert.True(reader.TryRead(4, out _));
+            reader.Advance(4);
+        }
+
+        TagMemoryInfo after = setup.Writer.TagMemory;
+        Assert.True(after.CurrentRingBytes < peak.CurrentRingBytes, $"still in a ring of {after.CurrentRingBytes} bytes");
+        Assert.True(after.UnreadTags < peak.UnreadTags, $"{after.UnreadTags} tags still held");
+        Assert.True(after.CommittedBytes >= peak.CommittedBytes, "the pages of the larger ring stay committed");
+    }
+
+    [Fact]
+    public void TagMemory_PersistentKeys_OnlyGrow_AndTheTableGrowsWithThem()
+    {
+        const int Keys = 1000;
+        using var setup = new Setup(ReaderKind.CrossProcessOpener);
+        using RingReader<long> reader = setup.CreateReader();
+        for (int k = 0; k < Keys; k++)
+        {
+            int key = k;
+            WriteBucket(setup.Writer, 2, b => b.AddTag(new StateTag { Key = "k" + key, Value = key }));
+            Assert.True(reader.TryRead(2, out _));
+            reader.Advance(2);
+        }
+
+        TagMemoryInfo full = setup.Writer.TagMemory;
+        Assert.Equal(Keys, full.PersistentKeys);
+        Assert.True(full.TableCommittedBytes >= Layout.HeaderViewBytes, $"{full.TableCommittedBytes} bytes of table");
+
+        for (int round = 0; round < Keys; round++)                          // the same keys again: their slots are reused, nothing is added
+        {
+            int key = round;
+            WriteBucket(setup.Writer, 2, b => b.AddTag(new StateTag { Key = "k" + key, Value = key }));
+            Assert.True(reader.TryRead(2, out _));
+            reader.Advance(2);
+        }
+
+        TagMemoryInfo again = setup.Writer.TagMemory;
+        Assert.Equal(Keys, again.PersistentKeys);
+        Assert.Equal(full.TableCommittedBytes, again.TableCommittedBytes);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(64)]
+    public void TagMemory_InProcessTags_CommitNothing_AndCountTheirKeys(long maxUnreadTags)
+    {
+        using var setup = new Setup(ReaderKind.InProcess, maxUnreadTags: maxUnreadTags);
+        using RingReader<long> reader = setup.CreateReader();
+        for (int k = 0; k < TagPlan.StateKeys; k++)
+        {
+            int key = k;
+            WriteBucket(setup.Writer, 2, b => b.AddTag(new StateTag { Key = TagPlan.StateKey(key), Value = key }));
+        }
+
+        TagMemoryInfo memory = setup.Writer.TagMemory;
+        Assert.Equal(0, memory.CommittedBytes);                             // tag objects only: no section memory at all
+        Assert.Equal(0, memory.TableCommittedBytes);
+        Assert.Equal(0, memory.CurrentRingBytes);
+        Assert.Equal(0, memory.UnreadBytes);
+        Assert.Equal(TagPlan.StateKeys, memory.PersistentKeys);
+        Assert.Equal(maxUnreadTags == 0 ? 0 : TagPlan.StateKeys, memory.UnreadTags);     // without a limit the log tracks nothing
+    }
+
+    [Fact]
+    public void TagMemory_AnOpenerSeesTheCommittedSizesAndTheKeys_ButNotTheWritersBookkeeping()
+    {
+        using var setup = new Setup(ReaderKind.CrossProcessOpener);
+        WriteBucket(setup.Writer, 4, b => b.AddTag(new SampleRateTag { Rate = 48000 }));
+        TagMemoryInfo writer = setup.Writer.TagMemory;
+        TagMemoryInfo opened = setup.Opened!.TagMemory;
+        Assert.Equal(writer.CommittedBytes, opened.CommittedBytes);
+        Assert.Equal(writer.TableCommittedBytes, opened.TableCommittedBytes);
+        Assert.Equal(writer.PersistentKeys, opened.PersistentKeys);
+        Assert.Equal(0, opened.CurrentRingBytes);                           // writer-local bookkeeping: not published, not guessed
+        Assert.Equal(0, opened.RingSwitches);
+        Assert.Equal(0, opened.UnreadTags);
+        Assert.Equal(0, opened.UnreadBytes);
+    }
+
+    [Fact]
+    public void TagMemory_OnAPooledSection_CountsWhatTheBuffersBeforeItCommitted()
+    {
+        using var pool = new RingBufferPool();
+        long first;
+        using (var buffer = RingBuffer<long>.Create(1 << 16, options: CrossProcess(pool)))
+        {
+            WriteBucket(buffer, 100, b =>
+            {
+                for (int j = 0; j < 100; j++)
+                {
+                    b.AddTag(Label(new string('u', 1000)), j);              // more than the smallest ring holds
+                }
+            });
+            first = buffer.TagMemory.CommittedBytes;
+            Assert.True(buffer.TagMemory.CurrentRingBytes > TagFormat.MinRingBytes);
+            Assert.Equal(0, buffer.TagMemory.TableCommittedBytes);          // labels are not persistent
+        }
+
+        Assert.Equal(first, pool.IdleTagBytes);
+        Assert.Equal(first + ((1L << 16) * 8), pool.IdleBytes);
+
+        using (var reuse = RingBuffer<long>.Create(1 << 16, options: CrossProcess(pool)))
+        {
+            Assert.Equal(1, pool.ReusedCount);
+            Assert.Equal(0, pool.IdleTagBytes);                             // the mapping is in use again, not idle
+            WriteBucket(reuse, 1, b => b.AddTag(Label("small")));
+            TagMemoryInfo memory = reuse.TagMemory;
+            Assert.Equal(TagFormat.MinRingBytes, memory.CurrentRingBytes);  // its own log starts in the smallest ring again ...
+            Assert.Equal(first, memory.CommittedBytes);                     // ... but the section still holds what the first buffer committed
+        }
+
+        pool.Trim();
+        Assert.Equal(0, pool.IdleTagBytes);                                 // released with the section: the only way the commit goes away
+    }
+
     [Fact]
     public void FirstCommit_LargerThanTheSmallestRing_JumpsOutOfItAtPositionZero()
     {

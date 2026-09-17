@@ -63,6 +63,21 @@ internal sealed class PooledMapping
     /// <summary>What the mapping counts against <see cref="RingBufferPool.IdleBytes"/>: the data region and the committed tag memory.</summary>
     public long PooledBytes => DataBytes + TagBytes;
 
+    /// <summary>
+    /// The committed tag memory of the section while a writer holds it with <paramref name="rings"/> and <paramref name="table"/> of its own: the union
+    /// with what the buffers before it committed, since pages stay committed for the section's life (DESIGN §16.2).
+    /// </summary>
+    public long TagBytesWith(ReadOnlySpan<long> rings, long table)
+    {
+        long bytes = Math.Max(TagTableCommitted, table);
+        for (int i = 0; i < _tagRingCommitted.Length; i++)
+        {
+            bytes += Math.Max(_tagRingCommitted[i], i < rings.Length ? rings[i] : 0);
+        }
+
+        return bytes;
+    }
+
     /// <summary>Adds what a creator's writer committed (before the mapping goes back to the pool; the value must not change while it is idle).</summary>
     public void AddTagCommitted(ReadOnlySpan<long> rings, long table)
     {

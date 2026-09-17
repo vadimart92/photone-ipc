@@ -4,10 +4,13 @@
     <OutputType>Exe</OutputType>
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- x64 only, like the library (Kernel.EnsurePlatform): MEMORY_BASIC_INFORMATION has no AnyCPU shape -->
+    <PlatformTarget>x64</PlatformTarget>
     <IsPackable>false</IsPackable>
     <TieredPGO>true</TieredPGO>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CsWin32" PrivateAssets="all" />
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />

@@ -38,8 +38,17 @@ internal sealed unsafe class LocalTagLog
         _unread = tracksUnread ? _tail : null;
     }
 
-    /// <summary>Entries the writer still holds for the slowest reader (<see cref="Release"/> moves this down; 0 without a limit).</summary>
+    /// <summary>
+    /// Entries the writer still holds for the slowest reader (<see cref="Release"/> moves this down). Meaningful only with
+    /// <see cref="TracksUnread"/>: nothing releases entries otherwise, so this counts every entry ever appended.
+    /// </summary>
     public long UnreadEntries => _count - _unreadPosition;
+
+    /// <summary>The log follows the oldest entry no reader has passed (the buffer limits its tags); without it the entries are the collector's business alone.</summary>
+    public bool TracksUnread => _unread is not null;
+
+    /// <summary>Keys with a persistent tag: one slot each, held for the buffer's life.</summary>
+    public int PersistentKeys => _lastValues.Count;
 
     /// <summary>Element offset of the oldest entry no reader has passed; a reader cursor past it releases that entry.</summary>
     public long OldestUnreadOffset

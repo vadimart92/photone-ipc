@@ -15,6 +15,73 @@ public sealed unsafe partial class RingBuffer<T>
     internal TagWriter? TagWriter => _tagWriter;
 
     /// <summary>
+    /// What this buffer's tags occupy right now (DESIGN §16.2): the shared tag memory committed in its section, what holds that memory, and the
+    /// persistent keys that never give their table slot back. A snapshot, cheap enough to poll from a metrics thread; <see cref="TagMemoryInfo"/> says
+    /// which of its numbers a process that only opened the buffer can see.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The buffer was disposed.</exception>
+    public TagMemoryInfo TagMemory
+    {
+        get
+        {
+            ThrowIfDisposed();
+            if (_tagWriter is not TagWriter tags)                   // an opener sees what the writer publishes; in-process tags it does not see at all
+            {
+                return _tagMode == TagMode.CrossProcess ? PublishedTagMemory() : default;
+            }
+
+            if (tags.Shared is not SharedTagLog shared)             // InProcess: tag objects, nothing committed
+            {
+                return new TagMemoryInfo
+                {
+                    UnreadTags = tags.Local.TracksUnread ? tags.Local.UnreadEntries : 0,
+                    PersistentKeys = tags.Local.PersistentKeys,
+                };
+            }
+
+            long table = shared.TableCommitted;
+            long committed = shared.CommittedBytes;
+            if (_pooled is PooledMapping pooled)                    // a pooled section keeps what the buffers before this one committed
+            {
+                table = Math.Max(table, pooled.TagTableCommitted);
+                committed = pooled.TagBytesWith(shared.RingCommitted, shared.TableCommitted);
+            }
+
+            return new TagMemoryInfo
+            {
+                CommittedBytes = committed,
+                TableCommittedBytes = table,
+                CurrentRingBytes = shared.CurrentRingBytes,
+                RingSwitches = shared.RingSwitches,
+                UnreadTags = shared.UnreadRecords,
+                UnreadBytes = shared.UnreadBytes,
+                PersistentKeys = shared.PersistentKeys,
+            };
+        }
+    }
+
+    /// <summary>
+    /// <see cref="TagMemory"/> in a process that opened the buffer: the committed sizes and the key count as the writer published them in the control
+    /// block, each clamped to the region it describes (another process writes them).
+    /// </summary>
+    private TagMemoryInfo PublishedTagMemory()
+    {
+        long table = Math.Clamp(Volatile.Read(ref _hdr->TagTableCommitted), 0, TagFormat.TableReserveBytes);
+        long committed = table;
+        for (int ring = 0; ring < TagFormat.RingClasses; ring++)
+        {
+            committed += Math.Clamp(Volatile.Read(ref _hdr->TagRingCommitted[ring]), 0, TagFormat.RingBytes(ring));
+        }
+
+        return new TagMemoryInfo
+        {
+            CommittedBytes = committed,
+            TableCommittedBytes = table,
+            PersistentKeys = Math.Max(0, Volatile.Read(ref _hdr->TagStateCount)),
+        };
+    }
+
+    /// <summary>
     /// Attaches <paramref name="tag"/> to the next element this writer publishes, without a bucket: sets <c>tag.Offset</c> to the current
     /// <see cref="WriteCursor"/> (the first element of the outstanding bucket, if there is one); with <see cref="TagMode.CrossProcess"/> the tag is serialized
     /// now. It is published with the first commit that publishes at least one element, and stays pending through commits that publish none; it is dropped

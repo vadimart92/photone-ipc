@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Windows.Win32.System.Memory;
 
 namespace Photone.Ipc.Internal;
 
@@ -158,7 +159,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
 
     private static SafeSectionHandle CreateSectionCore(ulong size, string? sectionName, bool reserveOnly)
     {
-        uint protect = reserveOnly ? Kernel.PAGE_READWRITE | Kernel.SEC_RESERVE : Kernel.PAGE_READWRITE;
+        PAGE_PROTECTION_FLAGS protect = reserveOnly ? Kernel.PAGE_READWRITE | Kernel.SEC_RESERVE : Kernel.PAGE_READWRITE;
         SafeSectionHandle section = Kernel.CreateFileMapping(Kernel.INVALID_HANDLE_VALUE, null, protect, (uint)(size >> 32), (uint)size, sectionName);
         int err = Kernel.LastError();                                  // read even on success (183 = opened existing)
         if (section.IsInvalid)

@@ -82,6 +82,12 @@ internal sealed unsafe class SharedTagLog
     /// <summary>Size class of the ring the log currently appends to.</summary>
     public int CurrentRing => _ring;
 
+    /// <summary>Size of that ring.</summary>
+    public long CurrentRingBytes => _ringBytes;
+
+    /// <summary>Keys with a record in the persistent-tag table: one slot each, held for the buffer's life.</summary>
+    public int PersistentKeys => _stateCount;
+
     /// <summary>Generations started after the first one (ring changes).</summary>
     public int RingSwitches { get; private set; }
 

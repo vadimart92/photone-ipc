@@ -1,7 +1,12 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using Windows.Win32;
 using Photone.Ipc.Internal;
+
+// CS0436: this project generates its own CsWin32 types while the library's (internal, visible through InternalsVisibleTo) carry the same names;
+//         the compiler prefers the ones from this project's source, which is what these helpers want.
+#pragma warning disable CS0436
 
 namespace Photone.Ipc.Benchmarks;
 
@@ -13,19 +18,13 @@ namespace Photone.Ipc.Benchmarks;
 /// measured window, its own process CPU time divided by wall time. This is the metric the wait/signal policy actually trades:
 /// latency when the next message arrives after a gap, against CPU burnt while waiting for it.
 /// </summary>
-internal static partial class PacedLatency
+internal static class PacedLatency
 {
-    [LibraryImport("kernel32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool QueryProcessCycleTime(nint process, out ulong cycles);
-
-    [LibraryImport("kernel32.dll")]
-    private static partial nint GetCurrentProcess();
 
     /// <summary>CPU cycles this process has consumed (exact, unlike the tick-sampled process times that miss or overcharge short wake-ups).</summary>
     private static ulong Cycles()
     {
-        QueryProcessCycleTime(GetCurrentProcess(), out ulong c);
+        PInvoke.QueryProcessCycleTime(PInvoke.GetCurrentProcess(), out ulong c);
         return c;
     }
 
