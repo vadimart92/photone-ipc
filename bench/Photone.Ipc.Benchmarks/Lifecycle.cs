@@ -139,7 +139,7 @@ internal static class Lifecycle
             RingReader<byte> reader = buffer.CreateReader();
             long t1 = Stopwatch.GetTimestamp();
             Print(Inv($"joined us={Us(t0, t1):F1}"));
-            if (!reader.WaitSync(1) || !reader.TryRead(1, out Chunk<byte> chunk) || chunk.Span[0] != 42)
+            if (!reader.WaitSync(1) || !reader.TryRead(1, out Chunk<byte> chunk) || chunk.Data.Span[0] != 42)
             {
                 throw new InvalidOperationException("the element did not arrive");
             }

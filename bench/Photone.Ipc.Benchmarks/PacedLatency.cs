@@ -266,7 +266,7 @@ internal static class PacedLatency
             }
 
             reader.TryRead(1, out Chunk<long> chunk);
-            long latency = Stopwatch.GetTimestamp() - chunk.Span[0];
+            long latency = Stopwatch.GetTimestamp() - chunk.Data.Span[0];
             reader.Advance(1);
             if (i >= warmup)
             {
@@ -310,7 +310,7 @@ internal static class PacedLatency
     private static long Take(RingReader<long> reader)
     {
         reader.TryRead(1, out Chunk<long> chunk);
-        long latency = Stopwatch.GetTimestamp() - chunk.Span[0];
+        long latency = Stopwatch.GetTimestamp() - chunk.Data.Span[0];
         reader.Advance(1);
         return latency;
     }

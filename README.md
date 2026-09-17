@@ -3,7 +3,7 @@
 Ultra-fast, zero-copy, broadcast IPC for .NET on Windows: a **double-mapped (virtual-memory mirrored) ring buffer** that lives in
 shared memory, with one writer and up to 32 independent readers in any number of processes.
 
-* `Span<T>` in, `ReadOnlySpan<T>` out, straight on the shared pages: no serialization, no copying, no allocations on the hot path.
+* `Span<T>` in, `ReadOnlyMemory<T>` out, straight on the shared pages: no serialization, no copying, no allocations on the hot path.
 * A span never has to wrap: the data region is mapped twice back-to-back, so the bytes past the end of the ring are the bytes at its start.
 * Same code path in-process and cross-process. Readers in other processes map the *same* section (best effort at the *same* virtual address).
 * Wake-ups are cheap by construction: spin first, kernel wait only when a peer is provably asleep; **no syscall at all when nobody is waiting**.
@@ -34,11 +34,9 @@ using (var bucket = buffer.GetBucket(1024))     // blocks (spin, then kernel) if
 // reader (same process, or any other process: RingBuffer<float>.Open("demo"))
 var reader = buffer.CreateReader();             // independent cursor per reader (broadcast); starts at the current head
 await reader.Wait(100);                         // async wait until >= 100 elements are readable (WaitSync is the blocking twin)
-{
-    reader.TryRead(100, out var chunk);         // chunk.Span : ReadOnlySpan<float>
-    Use(chunk.Span);
-    reader.Advance(90);                         // consume 90 (may advance less than read)
-}
+reader.TryRead(100, out var chunk);             // chunk.Data : ReadOnlyMemory<float>, a window into the ring itself
+Use(chunk.Data.Span);                           // Data.Span to read it, Data.Pin() for an address; it may also be stored or awaited on
+reader.Advance(90);                             // consume 90 (may advance less than read)
 ```
 
 Semantics in one table:

@@ -288,4 +288,19 @@ public sealed class WaitTests
         Assert.Equal(0, reader.Counters.Signals);
         Assert.Equal(Total, reader.ReadCursor);
     }
+
+    [Fact]
+    public async Task Chunk_Data_CrossesAnAwait()
+    {
+        using RingBuffer<long> buffer = RingBuffer<long>.Create(1 << 12);
+        using RingReader<long> reader = buffer.CreateReader();
+        RingTestUtil.WriteSequence(buffer, 4, 4);
+        Assert.True(await reader.Wait(4));
+        Assert.True(reader.TryRead(4, out Chunk<long> chunk));
+        ReadOnlyMemory<long> data = chunk.Data;
+        await Task.Yield();                                     // a chunk is not a ref struct any more: it and its memory live across the await
+        Assert.Equal(new long[] { 0, 1, 2, 3 }, data.ToArray());
+        Assert.Equal(4, chunk.Length);
+        reader.Advance(4);
+    }
 }

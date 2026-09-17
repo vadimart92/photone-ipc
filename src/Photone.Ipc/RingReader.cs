@@ -19,7 +19,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
 
     private readonly RingBuffer<T> _owner;
     private readonly ControlBlock* _hdr;
-    private readonly byte* _data;
+    private readonly ReadOnlyMemory<T> _mem;    // the buffer's double mapping as memory: a chunk is a slice of it
     private readonly SignalBackend _backend;
     private readonly ReaderOptions _options;
     private readonly int _slot;
@@ -55,7 +55,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         _tagThreshold = Math.Min(_tagLoadedW, _tagNextOffset);
         _owner = owner;
         _hdr = owner.Header;
-        _data = owner.Data;
+        _mem = owner.DataMemory;
         _backend = owner.Backend;
         _options = options;
         _slot = slot;
@@ -173,7 +173,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private nint Offset(long cursor) => (nint)((cursor & _mask) * sizeof(T));
+    private int Index(long cursor) => (int)(cursor & _mask);
 
     // ------------------------------------------------------------------ TryRead / Advance (DESIGN §5.4)
 
@@ -217,7 +217,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
             }
         }
 
-        chunk = new Chunk<T>(new ReadOnlySpan<T>(_data + Offset(_r), count), _r, tags);
+        chunk = new Chunk<T>(_mem.Slice(Index(_r), count), _r, tags);
         return true;
     }
 

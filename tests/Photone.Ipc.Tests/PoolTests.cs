@@ -924,11 +924,12 @@ public sealed unsafe class PoolTests
                             int n = (int)Math.Min(count - read, 500);
                             Assert.True(reader.WaitSync(n, RingTestUtil.Long));
                             Assert.True(reader.TryRead(n, out Chunk<long> chunk));
+                            ReadOnlySpan<long> span = chunk.Data.Span;
                             for (int j = 0; j < n; j++)
                             {
-                                if (chunk.Span[j] != (tag | (chunk.Cursor + j)))
+                                if (span[j] != (tag | (chunk.Cursor + j)))
                                 {
-                                    throw new InvalidOperationException($"cross-talk: got 0x{chunk.Span[j]:X} at cursor {chunk.Cursor + j}, tag 0x{tag:X}");
+                                    throw new InvalidOperationException($"cross-talk: got 0x{span[j]:X} at cursor {chunk.Cursor + j}, tag 0x{tag:X}");
                                 }
                             }
 

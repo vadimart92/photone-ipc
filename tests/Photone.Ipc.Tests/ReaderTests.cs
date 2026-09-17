@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using Photone.Ipc.Internal;
 
@@ -68,8 +69,28 @@ public sealed unsafe class ReaderTests
         using RingReader<long> reader = buffer.CreateReader();
         Assert.True(reader.TryRead(0, out Chunk<long> chunk));
         Assert.Equal(0, chunk.Length);
-        Assert.True(chunk.Span.IsEmpty);
+        Assert.True(chunk.Data.Span.IsEmpty);
         Assert.Equal(0, chunk.Cursor);
+    }
+
+    [Fact]
+    public void TryRead_Data_IsTheRingItself()
+    {
+        using RingBuffer<long> buffer = RingBuffer<long>.Create(1 << 12);
+        using RingReader<long> reader = buffer.CreateReader();
+        RingTestUtil.WriteSequence(buffer, 10, 10);
+        Assert.True(reader.TryRead(10, out Chunk<long> chunk));
+        Assert.Equal(10, chunk.Data.Length);
+        RingTestUtil.VerifyChunk(chunk);
+
+        using MemoryHandle pin = chunk.Data.Pin();                      // no copy and nothing to pin: the memory is the data region of the mapping
+        Assert.Equal((nint)buffer.Data, (nint)pin.Pointer);
+        Assert.Equal(7, ((long*)pin.Pointer)[7]);
+
+        reader.Advance(4);                                              // a partial advance leaves the chunk (and its memory) as it was
+        Assert.Equal(10, chunk.Length);
+        Assert.Equal(0, chunk.Cursor);
+        RingTestUtil.VerifyChunk(chunk);
     }
 
     [Fact]

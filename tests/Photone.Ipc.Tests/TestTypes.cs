@@ -82,7 +82,7 @@ internal static unsafe class RingTestUtil
 
     public static void VerifyChunk(Chunk<long> chunk)
     {
-        ReadOnlySpan<long> span = chunk.Span;
+        ReadOnlySpan<long> span = chunk.Data.Span;
         for (int j = 0; j < span.Length; j++)
         {
             if (span[j] != chunk.Cursor + j)

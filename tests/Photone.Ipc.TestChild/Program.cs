@@ -110,7 +110,7 @@ internal static unsafe class Program
                 return 3;
             }
 
-            ReadOnlySpan<long> span = chunk.Span;
+            ReadOnlySpan<long> span = chunk.Data.Span;
             for (int j = 0; j < span.Length; j++)
             {
                 if (span[j] != chunk.Cursor + j)
@@ -330,7 +330,7 @@ internal static unsafe class Program
             }
 
             reader.TryRead(1, out Chunk<long> chunk);
-            long v = chunk.Span[0];
+            long v = chunk.Data.Span[0];
             reader.Advance(1);
             using Bucket<long> b = outBuf.GetBucket(1);
             b.Span[0] = v;
@@ -387,9 +387,10 @@ internal static unsafe class Program
                 }
 
                 reader.TryRead(n, out Chunk<long> chunk);
-                for (int j = 0; j < chunk.Length; j++)
+                ReadOnlySpan<long> span = chunk.Data.Span;
+                for (int j = 0; j < span.Length; j++)
                 {
-                    if (chunk.Span[j] != chunk.Cursor + j)
+                    if (span[j] != chunk.Cursor + j)
                     {
                         Print(Inv($"mismatch at={chunk.Cursor + j}"));
                         return 4;
@@ -420,9 +421,10 @@ internal static unsafe class Program
                 if (r.WaitSync(n, TimeSpan.FromMilliseconds(rng.Next(0, 5))))
                 {
                     r.TryRead(n, out Chunk<long> chunk);
-                    for (int j = 0; j < chunk.Length; j++)
+                    ReadOnlySpan<long> span = chunk.Data.Span;
+                    for (int j = 0; j < span.Length; j++)
                     {
-                        if (chunk.Span[j] != chunk.Cursor + j)
+                        if (span[j] != chunk.Cursor + j)
                         {
                             Print(Inv($"mismatch at={chunk.Cursor + j}"));
                             return 4;
@@ -528,9 +530,10 @@ internal static unsafe class Program
                     }
 
                     reader.TryRead(n, out Chunk<long> chunk);
-                    for (int j = 0; j < chunk.Length; j++)
+                    ReadOnlySpan<long> span = chunk.Data.Span;
+                    for (int j = 0; j < span.Length; j++)
                     {
-                        if (chunk.Span[j] != chunk.Cursor + j)
+                        if (span[j] != chunk.Cursor + j)
                         {
                             mismatchAt = chunk.Cursor + j;
                             break;

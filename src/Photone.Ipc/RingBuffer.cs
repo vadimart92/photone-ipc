@@ -26,6 +26,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     private readonly MirroredSection _mapping;
     private readonly ControlBlock* _hdr;
     private readonly byte* _data;
+    private readonly ReadOnlyMemory<T> _dataMemory;  // the data region and its mirror as memory; readers slice their chunks out of it
     private readonly SignalBackend _backend;
     private readonly RingBufferOptions _options;
     private readonly string? _name;
@@ -67,6 +68,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         _mapping = mapping;
         _hdr = (ControlBlock*)mapping.Header;
         _data = mapping.Data;
+        _dataMemory = new MappedMemory<T>(mapping.Data, (int)(2 * capacity - 1)).Memory;   // a window starts at most at C-1 and spans at most C elements; 2C-1 covers every one and stays an int at the 2^30 cap
         _backend = backend;
         _options = options;
         _name = name;
@@ -983,6 +985,9 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     internal ControlBlock* Header => _hdr;
 
     internal byte* Data => _data;
+
+    /// <summary>The data region and its mirror as memory, owned by a <see cref="MappedMemory{T}"/>; a reader slices its chunks out of it.</summary>
+    internal ReadOnlyMemory<T> DataMemory => _dataMemory;
 
     internal SignalBackend Backend => _backend;
 

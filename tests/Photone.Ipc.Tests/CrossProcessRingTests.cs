@@ -437,7 +437,7 @@ public sealed class CrossProcessRingTests(ITestOutputHelper output)
 
             Assert.True(reader.WaitSync(1, s_timeout), $"round {i}: status={reader.Status}");
             Assert.True(reader.TryRead(1, out Chunk<long> chunk));
-            Assert.Equal(i * 3 + 1, chunk.Span[0]);
+            Assert.Equal(i * 3 + 1, chunk.Data.Span[0]);
             reader.Advance(1);
             rtt[i] = Stopwatch.GetTimestamp() - t0;
         }

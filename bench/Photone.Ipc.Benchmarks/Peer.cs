@@ -83,7 +83,7 @@ internal static class Peer
             }
 
             reader.TryRead(1, out Chunk<long> chunk);
-            long v = chunk.Span[0];
+            long v = chunk.Data.Span[0];
             reader.Advance(1);
             if (v == -1)
             {
@@ -111,7 +111,7 @@ internal static class Peer
             long v;
             {
                 reader.TryRead(1, out Chunk<long> chunk);
-                v = chunk.Span[0];
+                v = chunk.Data.Span[0];
                 reader.Advance(1);
             }
 
@@ -172,7 +172,7 @@ internal static class Peer
             }
 
             reader.TryRead(n, out Chunk<float> chunk);
-            ReadOnlySpan<float> span = chunk.Span;
+            ReadOnlySpan<float> span = chunk.Data.Span;
             float expected = i;
             if (span[0] != expected || span[n - 1] != expected)
             {
@@ -233,7 +233,7 @@ internal static class Peer
             reader.TryRead(n, out Chunk<int> chunk);
             if (work != Transports.Work.None)
             {
-                long c = CountOnes(chunk.Span);
+                long c = CountOnes(chunk.Data.Span);
                 if (work == Transports.Work.Count1 && c != expected)
                 {
                     bad++;

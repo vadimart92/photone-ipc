@@ -28,9 +28,10 @@ public sealed class WriterTests
 
             Assert.True(reader.TryRead(n, out Chunk<T> chunk));
             Assert.Equal(cursor, chunk.Cursor);
+            ReadOnlySpan<T> span = chunk.Data.Span;
             for (int j = 0; j < n; j++)
             {
-                Assert.True(chunk.Span[j].Equals(make(cursor + j)), $"mismatch at {cursor + j}");
+                Assert.True(span[j].Equals(make(cursor + j)), $"mismatch at {cursor + j}");
             }
 
             reader.Advance(n);
@@ -53,9 +54,10 @@ public sealed class WriterTests
         Assert.Equal(c + 295, buffer.WriteCursor);
         Assert.True(reader.TryRead(300, out Chunk<T> wrapped));
         Assert.Equal(c - 5, wrapped.Cursor);
+        ReadOnlySpan<T> wrappedSpan = wrapped.Data.Span;
         for (int j = 0; j < 300; j++)
         {
-            Assert.True(wrapped.Span[j].Equals(make(c - 5 + j)), $"wrap mismatch at {c - 5 + j}");
+            Assert.True(wrappedSpan[j].Equals(make(c - 5 + j)), $"wrap mismatch at {c - 5 + j}");
         }
 
         reader.Advance(300);
@@ -244,9 +246,10 @@ public sealed class WriterTests
         Assert.False(buffer.TryGetBucket(1, out _));
         Assert.Equal(0, buffer.FreeSpace);
         Assert.True(reader.TryRead(c, out Chunk<int> chunk));
+        ReadOnlySpan<int> span = chunk.Data.Span;
         for (int i = 0; i < c; i++)
         {
-            Assert.Equal(i, chunk.Span[i]);
+            Assert.Equal(i, span[i]);
         }
 
         reader.Advance(c);

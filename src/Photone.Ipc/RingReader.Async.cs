@@ -29,7 +29,8 @@ public sealed unsafe partial class RingReader<T> : IValueTaskSource<bool>
     /// closed/terminated and fewer than <paramref name="count"/> elements will ever arrive (drain with <see cref="TryRead"/>/<see cref="Available"/>; see <see cref="Status"/>).
     /// <c>count == 0</c> ⇒ <see langword="true"/>. One outstanding <c>Wait</c>/<c>WaitSync</c> per reader; the returned task must be awaited exactly once.
     /// The wait itself runs on the reader's waiter thread, which spins for the adaptive budget before it blocks (see <see cref="ReaderOptions.MaxSpinTime"/>).
-    /// NOTE: a <see cref="Chunk{T}"/> (ref struct) must not share a block with an <c>await</c>; put <see cref="TryRead"/> + use in a nested block.
+    /// NOTE: a <see cref="Chunk{T}"/> may cross an <c>await</c> - its <see cref="Chunk{T}.Data"/> is <see cref="ReadOnlyMemory{T}"/> - but it points into the
+    /// ring: do not <see cref="Advance"/> past a chunk while an awaited operation still reads it.
     /// </summary>
     /// <exception cref="OperationCanceledException">Cancelled (via the returned task).</exception>
     /// <exception cref="ReaderEvictedException">The slot was taken away (via the returned task).</exception>

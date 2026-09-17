@@ -274,3 +274,19 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
 55. **The test and benchmark projects suppress CS0436** where they call their own generated `PInvoke`. Their generated types have the same names as the
     library's, which `InternalsVisibleTo` makes visible to them; the compiler prefers the ones from the project's own source, which is what these
     helpers want.
+
+## Chunk hands out memory, not a span
+
+56. **`Chunk<T>` exposes `ReadOnlyMemory<T> Data` instead of `ReadOnlySpan<T> Span`, and is a `readonly struct`, no longer a `ref struct`**
+    (DESIGN §2, §5.4). A span cannot leave its frame, so a caller that has to hand the window to code taking `ReadOnlyMemory<T>` - async code, a
+    stream, a pipeline - had to copy it. `Memory<T>` can wrap unmanaged memory through an owner of one's own: `Internal\MappedMemory.cs` is a
+    `MemoryManager<T>` over the data region and its mirror, one per `RingBuffer<T>` (`DataMemory`), and `TryRead` hands out
+    `_mem.Slice(cursor & mask, count)` - a struct, no allocation, as before. The owner is `2C-1` elements long: a window starts at most at `C-1` and
+    spans at most `C` elements, and `2C-1` is still an `int` at the 2^30 capacity cap (§8), so one owner covers every window a reader can ask for.
+    The lifetime rule is unchanged (valid until `Advance` moves past it), but the type no longer enforces it: a chunk can now be stored, so
+    `Chunk.Data` documents that the elements are the mapping itself and that nothing keeps it alive - past `Advance` the writer may overwrite them,
+    past the reader's `Dispose` the memory may be unmapped. Reading costs one virtual `GetSpan()` per `.Span`, so a loop takes it once
+    (`ReadOnlySpan<T> span = chunk.Data.Span;`), as the tests and benchmarks do. Measured against the same tree without the change (interleaved,
+    `--iterationCount 7`): `WriteRead_Protocol` 19.2 / 19.6 / 21.5 ns against 20.0 / 20.0 / 22.3 ns (256 / 4096 / 65536 elements),
+    `WriteRead_FillAndSum` 72.3 ns / 1.05 µs / 16.7 µs against 71.5 ns / 1.12 µs / 17.3 µs, `TagBenchmarks.Protocol_NoTags` 18.5 against 18.4 ns:
+    no difference beyond run-to-run noise, and no allocation on either side.

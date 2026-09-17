@@ -227,7 +227,7 @@ public sealed class LifetimeTests
                     throw new InvalidOperationException("Wait");
                 }
 
-                if (!reader.TryRead(16, out Chunk<long> c) || c.Span[0] != i)
+                if (!reader.TryRead(16, out Chunk<long> c) || c.Data.Span[0] != i)
                 {
                     throw new InvalidOperationException("TryRead");
                 }

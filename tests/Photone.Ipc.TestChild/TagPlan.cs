@@ -128,7 +128,7 @@ public static class TagPlan
     /// <summary>Checks the data and the tags of a chunk against the plan; <see langword="null"/> when they match.</summary>
     public static string? CheckChunk(Chunk<long> chunk, int labelPadding = 0)
     {
-        ReadOnlySpan<long> span = chunk.Span;
+        ReadOnlySpan<long> span = chunk.Data.Span;
         for (int j = 0; j < span.Length; j++)
         {
             if (span[j] != chunk.Cursor + j)
