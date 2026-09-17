@@ -37,6 +37,7 @@ internal sealed unsafe class SharedTagLog
     private int _groupCount;
     private long _end;
     private long _tail;
+    private long _reservedRecords;                                  // records (not jump records) whose bytes are still reserved: the tags the writer holds for readers
 
     // ---- persistent state: the last record of every key, in the order the keys appeared, as the table lays them out ----
     private readonly Dictionary<string, int> _stateIndex = new(StringComparer.Ordinal);
@@ -65,6 +66,18 @@ internal sealed unsafe class SharedTagLog
 
     /// <summary>Absolute log position of the oldest record whose bytes are still reserved.</summary>
     public long Tail => _tail;
+
+    /// <summary>Tag records the writer still holds for the slowest reader (<see cref="RingBufferOptions.MaxUnreadTags"/>).</summary>
+    public long UnreadRecords => _reservedRecords;
+
+    /// <summary>Bytes of those records, including the jump records between them (<see cref="RingBufferOptions.MaxUnreadTagBytes"/>).</summary>
+    public long UnreadBytes => _end - _tail;
+
+    /// <summary><see langword="true"/> when any records are still reserved.</summary>
+    public bool HasReserved => _groupCount != 0;
+
+    /// <summary>The write cursor published when the oldest reserved group was appended; a reader cursor past it releases that group (<see cref="Free"/>).</summary>
+    public long OldestAppendW => _groups[_groupHead].AppendW;
 
     /// <summary>Size class of the ring the log currently appends to.</summary>
     public int CurrentRing => _ring;
@@ -116,6 +129,7 @@ internal sealed unsafe class SharedTagLog
         while (_groupCount > 0 && _groups[_groupHead].AppendW < min)
         {
             _ringGroups[_groups[_groupHead].Ring]--;
+            _reservedRecords -= _groups[_groupHead].Records;
             _groupHead = (_groupHead + 1) & mask;
             _groupCount--;
         }
@@ -169,7 +183,7 @@ internal sealed unsafe class SharedTagLog
         {
             TagRecordHeader jump = TagRecordHeader.Jump(next);
             TagFormat.Write(_views.Ring(_ring).Address, _ringBytes, Physical(_end), MemoryMarshal.AsBytes(new ReadOnlySpan<TagRecordHeader>(ref jump)));
-            AddToGroup(TagRecordHeader.Bytes, appendW);
+            AddToGroup(TagRecordHeader.Bytes, appendW, records: 0);     // a jump record is not a tag
             _end += TagRecordHeader.Bytes;
             _ring = next;
             _ringStart = _end;
@@ -352,7 +366,7 @@ internal sealed unsafe class SharedTagLog
     {
         Debug.Assert(LiveInRing + record.Length <= _ringBytes, "Prepare made room");
         TagFormat.Write(_views.Ring(_ring).Address, _ringBytes, Physical(_end), record);
-        AddToGroup(record.Length, appendW);
+        AddToGroup(record.Length, appendW, records: 1);
         _end += record.Length;
         _generationBytes += record.Length;
         if (persistent)
@@ -366,8 +380,9 @@ internal sealed unsafe class SharedTagLog
     }
 
     /// <summary>Reserves <paramref name="length"/> bytes at <c>_end</c> in the current ring: extends the commit's group, or starts one (capacity was prepared).</summary>
-    private void AddToGroup(long length, long appendW)
+    private void AddToGroup(long length, long appendW, int records)
     {
+        _reservedRecords += records;
         int mask = _groups.Length - 1;
         if (_groupCount > 0)
         {
@@ -375,11 +390,12 @@ internal sealed unsafe class SharedTagLog
             if (last.AppendW == appendW && last.Ring == _ring && last.Position + last.Length == _end)
             {
                 last.Length += length;
+                last.Records += records;
                 return;
             }
         }
 
-        _groups[(_groupHead + _groupCount) & mask] = new LogGroup { Position = _end, Length = length, AppendW = appendW, Ring = _ring };
+        _groups[(_groupHead + _groupCount) & mask] = new LogGroup { Position = _end, Length = length, AppendW = appendW, Ring = _ring, Records = records };
         _groupCount++;
         _ringGroups[_ring]++;
     }
@@ -495,6 +511,7 @@ internal sealed unsafe class SharedTagLog
         public long Length;
         public long AppendW;
         public int Ring;
+        public int Records;
     }
 
     private struct StateRecord

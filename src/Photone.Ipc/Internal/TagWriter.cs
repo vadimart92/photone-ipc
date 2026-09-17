@@ -33,14 +33,15 @@ internal sealed class TagWriter : IBufferWriter<byte>
     private int _stateChangeCount;
     private readonly Dictionary<string, byte[]> _typeNames = new(StringComparer.Ordinal);
 
-    public TagWriter(ITagSerializer? serializer, SharedTagLog? shared)
+    public TagWriter(ITagSerializer? serializer, SharedTagLog? shared, bool tracksUnread)
     {
         _serializer = serializer;
         Shared = shared;
+        Local = new LocalTagLog(tracksUnread);
     }
 
     /// <summary>The tags as objects, for the readers of the writer's own buffer.</summary>
-    public LocalTagLog Local { get; } = new();
+    public LocalTagLog Local { get; }
 
     /// <summary>The tags in shared memory; <see langword="null"/> unless the buffer's tags cross processes.</summary>
     public SharedTagLog? Shared { get; }

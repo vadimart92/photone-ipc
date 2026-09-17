@@ -1601,7 +1601,9 @@ ReadOnlySpan<ITag> state = reader.ReadLastTagValues();                          
 |---|---|
 | `RingBufferOptions.Tags` | creator; `None` (default): no tags; `InProcess`: tag objects for the readers of the writer's own buffer, never serialized; `CrossProcess`: also serialized into shared memory for readers of every process. No capacity |
 | `RingBufferOptions.TagSerializer` | per process; required by a `CrossProcess` creator (`Create` throws `ArgumentException`); readers of an opened buffer deserialize with it and deliver `UnknownTag`s without it; ignored by `InProcess` |
-| `RingBuffer.Tags` | the creator's mode, on openers too (an opener of an `InProcess` buffer sees the mode, its readers see no tags) |
+| `RingBufferOptions.MaxUnreadTags` | creator; the most tags the writer keeps for the slowest reader before a commit waits for it. 0 (default) = no limit |
+| `RingBufferOptions.MaxUnreadTagBytes` | creator, `CrossProcess` only (in-process tags have no serialized size); the same limit in record bytes. 0 (default) = no limit |
+| `RingBuffer.Tags`, `RingBuffer.MaxUnreadTags` | the creator's mode and limits, on openers too (an opener of an `InProcess` buffer sees the mode, its readers see no tags) |
 | `Bucket.AddTag<TTag>(tag, index = 0)` | `0 <= index < Length`; sets `tag.Offset = StartOffset + index`; `TTag` concrete (it decides persistence and the type name); `CrossProcess`: serialized at once, a key over 65535 UTF-8 bytes throws |
 | `RingBuffer.AddTag<TTag>(tag)` | writer; sets `tag.Offset = WriteCursor` (the first element of the outstanding bucket, if any); pending until a commit publishes at least one element, through commits that publish none; dropped if the writer closes first |
 | `Bucket.Commit(k)` | publishes the tags with `Offset < StartOffset + k` with the elements, drops the rest; never waits for tags |
@@ -1677,6 +1679,7 @@ EndWriteWithTags(k):                                                 // NoInlini
   Interlocked.Exchange(_committing, 1); if _disposed: throw ObjectDisposedException   // touch nothing: the closing thread drops the bucket
   try:
       select the pending tags with Offset < W + k, sorted by (Offset, add order)
+      with a tag limit and no room for them: EnsureTagRoom            // the only wait a commit does for tags; see "Limiting the tags" below
       reserve the object log's chunks and key slots for them                // everything that can fail comes before the appends
       CrossProcess, bytes = their records:
           if !Fits(bytes) or ShrinkDue: Free(_min); if still: _min = ScanMin(); Free(_min);
@@ -1720,8 +1723,33 @@ only when the writer blocks for space (§5.7), which dense tags can be far from:
 ring". So before a commit makes the log move to a larger ring, the writer sweeps the slots for dead processes (at most once per liveness interval, since
 a sweep checks the process of every reader) and frees again if it evicted one.
 
-**No waiting, no tag deadlock.** A commit never waits for tags: when its records do not fit behind the ones readers still need, the log moves to a
-larger ring. Tag memory is still bounded, by the data back-pressure: every reserved record has `AppendW ≥ min`, so its offset lies in
+**Limiting the tags (optional).** `MaxUnreadTags` / `MaxUnreadTagBytes` bound what the writer keeps for the slowest reader. A commit that would exceed
+the limit waits on the reader cursor that releases the oldest tags (`WaitForMin`, the wait `GetBucket` uses for space), then releases and re-checks:
+
+```
+EnsureTagRoom(count, bytes):                                     // NoInlining; only when a limit is set and the cached counters do not fit
+    if count or bytes exceed the limit by themselves: InvalidOperationException (the bucket is dropped; no reader could make room)
+    local ref (Dispose on another thread ends the wait with ObjectDisposedException; CloseWriter wakes it)
+    loop: _min = ScanMin(); release what the readers passed; if it fits: return
+          WaitForMin(oldest tag's release cursor + 1)
+```
+
+Unread tags are counted where each mode already knows them: the shared log counts the records whose bytes are still reserved (§16.4) and their bytes; the
+object log follows a cursor over the chunk chain, moved only by a commit that is at its limit, that releases the entries with an offset below the minimum
+reader cursor (entries are not cleared: a joiner with an older snapshot still replays them). Without a limit neither is tracked and the check is one
+comparison per commit that carries tags; readers and the element path are untouched either way.
+
+Nothing breaks a deadlock here: a reader waiting for more elements than are published, while a commit waits for that reader to read past tags, stops
+both, and only `Dispose` (or a reader's timeout) ends it. The limit has to leave room for the tags of the largest chunk a reader waits for. That is why
+it is off by default.
+
+Measured (`TagBenchmarks.OneTag_InProcess` against `OneTag_InProcess_Limited`, `MaxUnreadTags = 4096`, a reader that keeps up, palindromic runs
+limited / unlimited / unlimited / limited): 145.7 ns against 145.9 ns per tagged commit, inside the noise of the machine. The releases are what could
+cost: a commit that reaches the limit scans the reader cursors once and walks the entries it releases, whole chunks at a time, so the amortized cost is
+a comparison per tag. A very large limit is the wrong way to say "no limit": it keeps that many entries alive before the first release.
+
+**No waiting without a limit, and no tag deadlock.** A commit never waits for tags: when its records do not fit behind the ones readers still need, the
+log moves to a larger ring. Tag memory is still bounded, by the data back-pressure: every reserved record has `AppendW ≥ min`, so its offset lies in
 `[min, W + bucket)`, at most `Capacity` plus one bucket of elements; the rings hold the tags of those elements, about twice over while they grow. The
 first revision's deadlock (a full log while every reader holding old tags waits for more elements than are published) cannot occur, and with it went
 the 1 s detector and `TagLogFullException`. After a burst, the generation moves back to a small ring; the large ring's pages stay committed but
@@ -1865,6 +1893,8 @@ Cost: COSTS
   `InvalidOperationException` and is dropped. The persistent-tag table holds up to `Array.MaxLength` bytes (just under 2 GiB). Keys and type names take
   at most 65535 UTF-8 bytes.
 * A reader that dies holds tag memory until a sweep finds it: before the log grows, or when the writer blocks for space.
+* With `MaxUnreadTags` / `MaxUnreadTagBytes`, tags become back-pressure: sized too small for the chunks readers wait for, writer and readers deadlock
+  until something is disposed (§16.4). A commit whose own tags exceed the limit throws `InvalidOperationException` and is dropped.
 * Committed tag memory is never decommitted while the section exists; it counts against the system commit limit, and a pool keeps it with the section.
 * The writer's readers share the tag instances: a tag changed or added again after `AddTag` is seen changed by all of them.
 * `InProcess` tags are invisible to every opener, also an opener in the writer's process.
