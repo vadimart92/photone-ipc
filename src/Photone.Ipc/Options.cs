@@ -27,6 +27,12 @@ public sealed class RingBufferOptions
     /// <summary>Touch every data page once at creation (removes first-touch page faults from the hot path). Default <see langword="true"/>.</summary>
     public bool PreFault { get; init; } = true;
 
+    /// <summary>
+    /// Pool to take the shared-memory mapping from and to return it to when the buffer is released (creator and opener; see <see cref="RingBufferPool"/>).
+    /// <see langword="null"/> (default) = every buffer maps and unmaps its own section.
+    /// </summary>
+    public RingBufferPool? Pool { get; init; }
+
     internal static readonly RingBufferOptions Default = new();
 }
 

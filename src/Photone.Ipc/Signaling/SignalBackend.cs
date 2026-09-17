@@ -26,16 +26,16 @@ internal abstract unsafe class SignalBackend : IDisposable
     /// Factory. The creator passes the configured id (and has already written the header); openers pass <c>hdr->SignalBackendId</c>.
     /// </summary>
     /// <param name="id">Backend id.</param>
-    /// <param name="instanceId">The buffer's random instance id (names kernel objects).</param>
+    /// <param name="sectionId">The section's random id (<c>ControlBlock.SectionId</c>; names kernel objects, stable across pooled reuse).</param>
     /// <param name="hdr">The control block (backend-private words may be used).</param>
     /// <param name="isCreator"><see langword="true"/> for the creating process.</param>
     /// <param name="globalNamespace"><see langword="true"/> when the section lives in <c>Global\</c> (creator only; openers read the backend area).</param>
     /// <exception cref="RingBufferLayoutException">Unknown backend id.</exception>
-    public static SignalBackend Create(uint id, ulong instanceId, ControlBlock* hdr, bool isCreator, bool globalNamespace)
+    public static SignalBackend Create(uint id, ulong sectionId, ControlBlock* hdr, bool isCreator, bool globalNamespace)
     {
         return id switch
         {
-            SignalBackendId.NamedEvent => new NamedEventBackend(instanceId, hdr, isCreator, globalNamespace),
+            SignalBackendId.NamedEvent => new NamedEventBackend(sectionId, hdr, isCreator, globalNamespace),
             _ => throw new RingBufferLayoutException($"Unknown signal backend id {id}; this library supports id 1 (NamedEvent) only."),
         };
     }

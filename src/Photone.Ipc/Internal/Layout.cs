@@ -8,7 +8,9 @@ internal static class Layout
 {
     /// <summary>"PHOTONE1" as little-endian u64.</summary>
     public const ulong Magic = 0x31454E4F544F4850;
-    public const uint Version = 1;
+
+    /// <summary>2: <see cref="ControlBlock.SectionId"/>, <see cref="LayoutFlag.Pooled"/>, events named from the section id, name aliases (DESIGN §15).</summary>
+    public const uint Version = 2;
     public const uint ControlBytes = 4096;
     public const uint HeaderViewBytes = 65536;
     public const long DataOffset = 65536;
@@ -60,6 +62,7 @@ internal static class Layout
         Check((byte*)&cb.CreatorStartTime - p, 80, nameof(ControlBlock.CreatorStartTime));
         Check((byte*)&cb.InstanceId - p, 88, nameof(ControlBlock.InstanceId));
         Check((byte*)&cb.ReservationBytes - p, 96, nameof(ControlBlock.ReservationBytes));
+        Check((byte*)&cb.SectionId - p, 104, nameof(ControlBlock.SectionId));
         Check((byte*)&cb.WriteCursor - p, 128, nameof(ControlBlock.WriteCursor));
         Check((byte*)&cb.ReserveEnd - p, 256, nameof(ControlBlock.ReserveEnd));
         Check((byte*)&cb.WriterState - p, 264, nameof(ControlBlock.WriterState));
@@ -91,6 +94,20 @@ internal static class Layout
         Check((byte*)&rs.WaiterThreadId - q, 48, nameof(ReaderSlot.WaiterThreadId));
         Check((byte*)&rs.BackendWord - q, 56, nameof(ReaderSlot.BackendWord));
 
+        // An alias shares the fields an opener reads before it knows which kind of section it mapped (WaitForInit, then Magic).
+        AliasBlock ab = default;
+        byte* a = (byte*)&ab;
+        Check((byte*)&ab.Magic - a, 0, nameof(AliasBlock.Magic));
+        Check((byte*)&ab.InitState - a, 52, nameof(AliasBlock.InitState));
+        Check((byte*)&ab.CreatorPid - a, 72, nameof(AliasBlock.CreatorPid));
+        Check((byte*)&ab.CreatorStartTime - a, 80, nameof(AliasBlock.CreatorStartTime));
+        Check((byte*)&ab.InstanceId - a, 88, nameof(AliasBlock.InstanceId));
+        Check((byte*)ab.TargetName - a, AliasBlock.TargetNameOffset, nameof(AliasBlock.TargetName));
+        if (AliasBlock.TargetNameOffset + (2 * AliasBlock.MaxTargetNameChars) > Unsafe.SizeOf<AliasBlock>())
+        {
+            throw new InvalidOperationException("AliasBlock.TargetName does not fit in the block.");
+        }
+
         static void Check(long actual, long expected, string field)
         {
             if (actual != expected)
@@ -105,6 +122,16 @@ internal static class Layout
             }
         }
     }
+}
+
+/// <summary>Bits of <see cref="ControlBlock.LayoutFlags"/>.</summary>
+internal static class LayoutFlag
+{
+    /// <summary>
+    /// The section belongs to a <see cref="RingBufferPool"/>: it outlives the buffer and is reused by later buffers of its creator, so it is reached
+    /// through an <see cref="AliasBlock"/> (by name) or a duplicated handle, never by its own kernel name (DESIGN §15).
+    /// </summary>
+    public const uint Pooled = 1;
 }
 
 /// <summary>Slot state values held in the low two bits of <see cref="ReaderSlot.Word"/>.</summary>
@@ -177,6 +204,7 @@ internal unsafe struct ControlBlock
     /// <summary>0 initialising, 1 ready; <c>Volatile.Write</c> last by the creator.</summary>
     [FieldOffset(52)] public int InitState;
     [FieldOffset(56)] public uint SignalBackendId;
+    /// <summary><see cref="LayoutFlag"/> bits.</summary>
     [FieldOffset(60)] public uint LayoutFlags;
 
     // ---- line 1: creator identity ----
@@ -185,8 +213,11 @@ internal unsafe struct ControlBlock
     [FieldOffset(72)] public int CreatorPid;
     /// <summary>Written first.</summary>
     [FieldOffset(80)] public long CreatorStartTime;
+    /// <summary>Random per buffer: a pooled section gets a new one every time it is reused.</summary>
     [FieldOffset(88)] public ulong InstanceId;
     [FieldOffset(96)] public ulong ReservationBytes;
+    /// <summary>Random per section, constant for its whole life (also across pooled reuse); names the signaling objects.</summary>
+    [FieldOffset(104)] public ulong SectionId;
 
     // ---- line 2: the message (writer Interlocked.Exchange per Commit; readers poll). Line 3 (192..255) is deliberately empty. ----
     [FieldOffset(128)] public long WriteCursor;
@@ -229,4 +260,37 @@ internal unsafe struct ControlBlock
 internal struct ReaderSlotArray
 {
     private ReaderSlot _element0;
+}
+
+/// <summary>
+/// Offset 0 of the 64 KiB named section that carries the name of a pooled buffer (DESIGN §15). The ring itself lives in a pool-owned section that
+/// keeps its kernel name across reuse; the alias ties the user's name to one incarnation (<see cref="InstanceId"/>) of that section.
+/// <see cref="InitState"/>, <see cref="CreatorPid"/>, <see cref="CreatorStartTime"/> and <see cref="InstanceId"/> sit at the same offsets as in
+/// <see cref="ControlBlock"/>, so an opener waits for either kind of section the same way before looking at <see cref="Magic"/>.
+/// </summary>
+[StructLayout(LayoutKind.Explicit, Size = 1024)]
+internal unsafe struct AliasBlock
+{
+    /// <summary>"PHOTLINK" as little-endian u64.</summary>
+    public const ulong MagicValue = 0x4B4E494C544F4850;
+    public const uint CurrentVersion = 1;
+    public const int TargetNameOffset = 128;
+    public const int MaxTargetNameChars = 256;
+
+    [FieldOffset(0)] public ulong Magic;
+    [FieldOffset(8)] public uint Version;
+    /// <summary>UTF-16 code units in <see cref="TargetName"/>.</summary>
+    [FieldOffset(12)] public int TargetNameLength;
+    /// <summary><see cref="ControlBlock.SectionId"/> of the target.</summary>
+    [FieldOffset(16)] public ulong SectionId;
+    /// <summary><see cref="ControlBlock.DataBytes"/> of the target.</summary>
+    [FieldOffset(24)] public long DataBytes;
+    /// <summary>0 while the creator is writing, 1 once the record and the target are complete.</summary>
+    [FieldOffset(52)] public int InitState;
+    [FieldOffset(72)] public int CreatorPid;
+    [FieldOffset(80)] public long CreatorStartTime;
+    /// <summary>The <see cref="ControlBlock.InstanceId"/> the name refers to; any other value in the target means the buffer is gone.</summary>
+    [FieldOffset(88)] public ulong InstanceId;
+    /// <summary>Kernel name of the pooled section (<c>Local\photone.pool.{guid}</c> or <c>Global\...</c>).</summary>
+    [FieldOffset(TargetNameOffset)] public fixed char TargetName[MaxTargetNameChars];
 }

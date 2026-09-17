@@ -8,14 +8,16 @@ namespace Photone.Ipc.Internal;
 /// and a span starting anywhere in <c>Data</c> may run up to <c>D</c> bytes past its end without copying.
 /// This is the ONLY code in the library that maps or unmaps memory (DESIGN §3.2–§3.5).
 /// The handle is the placeholder base; releasing it unmaps the three views (which frees the VA outright, verified) and closes the section.
+/// A pooled opener mapping may keep its views without a section handle while it is parked (<see cref="DetachSection"/>, DESIGN §15).
 /// </summary>
 internal sealed unsafe class MirroredSection : SafeHandle
 {
     private const string LocalPrefix = "Local\\";
     private const string GlobalPrefix = "Global\\";
     private const string DefaultNamePrefix = "Local\\photone.";
+    private const string PoolNamePart = "photone.pool.";
 
-    private readonly SafeSectionHandle _section;
+    private SafeSectionHandle? _section;
     private readonly nuint _dataBytes;
     private readonly byte* _header;
     private readonly byte* _data;
@@ -35,8 +37,26 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <inheritdoc/>
     public override bool IsInvalid => handle == 0;
 
-    /// <summary>The section handle; owned by this object and closed on release.</summary>
-    public SafeSectionHandle Section => _section;
+    /// <summary>The section handle; owned by this object and closed on release (or by <see cref="DetachSection"/>).</summary>
+    /// <exception cref="InvalidOperationException">The handle is detached.</exception>
+    public SafeSectionHandle Section => _section ?? throw new InvalidOperationException("The section handle is detached from this mapping.");
+
+    /// <summary>
+    /// Closes the section handle and keeps the three views. The views keep the memory alive but are invisible to the system-wide handle count, which is
+    /// what lets the creator's pool reuse the section while this mapping is parked. Idempotent.
+    /// </summary>
+    public void DetachSection() => Interlocked.Exchange(ref _section, null)?.Dispose();
+
+    /// <summary>Gives a detached mapping the handle of the section its views show (the caller has proved it is the same section); ownership transfers.</summary>
+    /// <exception cref="InvalidOperationException">A handle is already attached.</exception>
+    public void AttachSection(SafeSectionHandle section)
+    {
+        ArgumentNullException.ThrowIfNull(section);
+        if (Interlocked.CompareExchange(ref _section, section, null) is not null)
+        {
+            throw new InvalidOperationException("A section handle is already attached to this mapping.");
+        }
+    }
 
     /// <summary>Size of the data region in bytes (a multiple of 64 KiB).</summary>
     public nuint DataBytes => _dataBytes;
@@ -93,6 +113,9 @@ internal sealed unsafe class MirroredSection : SafeHandle
         return DefaultNamePrefix + name;
     }
 
+    /// <summary><c>Local\photone.pool.{Guid:N}</c> (or under <c>Global\</c>): the kernel name of a pool-owned section (DESIGN §15).</summary>
+    public static string NewPoolSectionName(bool global) => (global ? GlobalPrefix : LocalPrefix) + PoolNamePart + Guid.NewGuid().ToString("N");
+
     // ------------------------------------------------------------------ sections
 
     /// <summary>
@@ -105,7 +128,23 @@ internal sealed unsafe class MirroredSection : SafeHandle
     {
         Kernel.EnsurePlatform();
         ValidateDataBytes(dataBytes);
-        ulong size = Layout.HeaderViewBytes + (ulong)dataBytes;
+        return CreateSectionCore(Layout.HeaderViewBytes + (ulong)dataBytes, sectionName);
+    }
+
+    /// <summary>
+    /// Creates the 64 KiB named section that holds a pooled buffer's <see cref="AliasBlock"/> (only its first page is ever touched; its size lets
+    /// <see cref="MapHeaderPeek"/> map either kind of section).
+    /// </summary>
+    /// <exception cref="RingBufferAlreadyExistsException">An object with that name already exists.</exception>
+    public static SafeSectionHandle CreateAliasSection(string sectionName)
+    {
+        Kernel.EnsurePlatform();
+        ArgumentException.ThrowIfNullOrEmpty(sectionName);
+        return CreateSectionCore(Layout.HeaderViewBytes, sectionName);
+    }
+
+    private static SafeSectionHandle CreateSectionCore(ulong size, string? sectionName)
+    {
         SafeSectionHandle section = Kernel.CreateFileMapping(Kernel.INVALID_HANDLE_VALUE, null, Kernel.PAGE_READWRITE, (uint)(size >> 32), (uint)size, sectionName);
         int err = Kernel.LastError();                                  // read even on success (183 = opened existing)
         if (section.IsInvalid)
@@ -404,7 +443,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
         bool ok = Kernel.UnmapViewOfFile(_header);
         ok &= Kernel.UnmapViewOfFile(_data);
         ok &= Kernel.UnmapViewOfFile(_data + _dataBytes);
-        _section.Dispose();
+        Interlocked.Exchange(ref _section, null)?.Dispose();
         return ok;
     }
 }

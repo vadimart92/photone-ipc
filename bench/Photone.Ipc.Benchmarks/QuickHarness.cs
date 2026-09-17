@@ -589,6 +589,12 @@ internal static class QuickHarness
             return line;
         }
 
+        public void WriteLine(string line)
+        {
+            _process.StandardInput.WriteLine(line);
+            _process.StandardInput.Flush();
+        }
+
         public void WaitForExit()
         {
             if (!_process.WaitForExit(30_000))
