@@ -42,6 +42,21 @@ public sealed class RingBufferOptions
     public TagMode Tags { get; init; }
 
     /// <summary>
+    /// Creator only: the most tags the writer keeps for the slowest reader before a commit waits for it. 0 (the default) = no limit: tag memory grows with
+    /// what the readers have not read past, which the data ring's back-pressure already bounds. A limit makes a commit that would exceed it wait, exactly
+    /// as <see cref="RingBuffer{T}.GetBucket"/> waits for space; <see cref="RingBuffer{T}.Dispose"/> from another thread ends such a wait. Size it above the
+    /// tags of the largest chunk a reader waits for: every reader waiting for more elements than are published while the writer waits for them to read
+    /// past tags is a deadlock, which nothing breaks.
+    /// </summary>
+    public long MaxUnreadTags { get; init; }
+
+    /// <summary>
+    /// Creator only, <see cref="TagMode.CrossProcess"/> only: the same limit in bytes of tag records (the memory the writer holds for the slowest reader).
+    /// 0 (the default) = no limit. Both limits can be set; the commit waits while either is exceeded.
+    /// </summary>
+    public long MaxUnreadTagBytes { get; init; }
+
+    /// <summary>
     /// How this process turns tags into bytes and back: the writer of a <see cref="TagMode.CrossProcess"/> buffer serializes with it, and readers of a buffer
     /// opened from another process deserialize with it. <see langword="null"/> (default): such readers deliver every tag as an <see cref="UnknownTag"/>.
     /// Typically <c>new JsonTagSerializer().Register&lt;MyTag&gt;()</c>. Not used with <see cref="TagMode.InProcess"/>.

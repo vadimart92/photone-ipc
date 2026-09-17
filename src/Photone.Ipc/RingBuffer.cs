@@ -39,6 +39,8 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     private readonly PooledMapping? _pooled;        // non-null: the mapping goes back to _pool on release (DESIGN §15)
     private readonly SafeSectionHandle? _alias;     // the name object of a pooled buffer (created, or opened by name)
     private readonly TagMode _tagMode;              // DESIGN §16
+    private readonly long _maxUnreadTags;           // 0: the tags the writer holds for the slowest reader are not limited
+    private readonly long _maxUnreadTagBytes;
     private readonly TagViews? _tagViews;           // the mapped parts of the tag reserve (cross-process tags)
     private readonly TagWriter? _tagWriter;         // writer of a buffer with tags
 
@@ -92,9 +94,12 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
 
         if (isWriter && tagMode != TagMode.None)
         {
+            _maxUnreadTags = options.MaxUnreadTags;                 // creator options; an opener never writes tags
+            _maxUnreadTagBytes = options.MaxUnreadTagBytes;
             _tagWriter = new TagWriter(
                 tagMode == TagMode.CrossProcess ? options.TagSerializer : null,
-                tagMode == TagMode.CrossProcess ? new SharedTagLog(_hdr, _tagViews!) : null);
+                tagMode == TagMode.CrossProcess ? new SharedTagLog(_hdr, _tagViews!) : null,
+                tracksUnread: tagMode == TagMode.InProcess && _maxUnreadTags != 0);
         }
     }
 
@@ -103,6 +108,23 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     /// <exception cref="ArgumentException">Cross-process tags without a serializer.</exception>
     private static long ChooseTagReserve(RingBufferOptions options)
     {
+        if (options.MaxUnreadTags < 0 || options.MaxUnreadTagBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxUnreadTags and MaxUnreadTagBytes must not be negative.");
+        }
+
+        if (options.Tags == TagMode.None && (options.MaxUnreadTags != 0 || options.MaxUnreadTagBytes != 0))
+        {
+            throw new ArgumentException("A tag limit needs RingBufferOptions.Tags: a buffer without tags has nothing to limit.", nameof(options));
+        }
+
+        if (options.Tags == TagMode.InProcess && options.MaxUnreadTagBytes != 0)
+        {
+            throw new ArgumentException(
+                "MaxUnreadTagBytes needs TagMode.CrossProcess: in-process tags are never serialized, so they have no size in bytes. Limit their number with MaxUnreadTags.",
+                nameof(options));
+        }
+
         switch (options.Tags)
         {
             case TagMode.None:
@@ -929,6 +951,9 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     /// <see cref="TagMode.InProcess"/> buffer sees the mode, but its readers see no tags.
     /// </summary>
     public TagMode Tags => _tagMode;
+
+    /// <summary>The writer's tag limits (<see cref="RingBufferOptions.MaxUnreadTags"/> / <see cref="RingBufferOptions.MaxUnreadTagBytes"/>); 0 = no limit.</summary>
+    public (long Tags, long Bytes) MaxUnreadTags => (_maxUnreadTags, _maxUnreadTagBytes);
 
     /// <summary>Number of readers currently marked active.</summary>
     public int ActiveReaderCount

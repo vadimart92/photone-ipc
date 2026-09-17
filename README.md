@@ -61,7 +61,7 @@ Semantics in one table:
 | `Chunk.Tags` | the tags of the chunk's elements, in offset order |
 | `RingReader.ReadLastTagValues()` | `ReadOnlySpan<ITag>`: the last persistent tag of every key before `ReadCursor` |
 
-Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true, Pool = null, Tags = TagMode.None, TagSerializer = null }`,
+Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true, Pool = null, Tags = TagMode.None, TagSerializer = null, MaxUnreadTags = 0, MaxUnreadTagBytes = 0 }`,
 `ReaderOptions { SpinTime = 20 µs, MaxSpinTime = null, AsyncSpinTime = 5 µs, AllowSynchronousContinuations = true }`,
 `RingBufferPoolOptions { IdleTimeout = 30 s, MaxIdleBytes, ClearOnReuse = false }`. The spin budget adapts between
 zero and `MaxSpinTime` (default: `SpinTime`) from the gaps actually observed; `Timeout.InfiniteTimeSpan` never touches the kernel (one busy core
@@ -115,6 +115,11 @@ reader.Advance(100);                                  // passing a persistent ta
   slowest reader has not read yet, and the data ring's back-pressure bounds those elements. Committed pages stay with the section until it is destroyed
   (Windows cannot decommit pages of a shared section), so a buffer keeps its high-water mark. Tag memory lives in the section, so a reader can drain every
   tag after the writer's process has exited.
+* **Optional limit.** `MaxUnreadTags` (and, for `CrossProcess`, `MaxUnreadTagBytes`) bound what the writer keeps for the slowest reader: a commit that
+  would exceed the limit waits for readers, exactly as `GetBucket` waits for space, and `Dispose` ends that wait. Both default to 0, no limit. Nothing
+  breaks a deadlock: if a reader waits for more elements than are published while the writer waits for that reader to read past tags, both stop, so size
+  the limit above the tags of the largest chunk a reader waits for. A limit that is not reached costs nothing measurable (145.7 ns against 145.9 ns per
+  tagged commit, interleaved runs), and off it is one comparison.
 * **Where a tag goes.** `bucket.AddTag(tag, index)` puts it on element `index` of the bucket. `buffer.AddTag(tag)` puts it on the next element the writer
   publishes: it waits through commits that publish nothing and is dropped only if the writer closes before publishing another element. Both set
   `tag.Offset`; readers in other processes set it again from the record, so a tag type does not even need to serialize it.
@@ -422,7 +427,7 @@ Reading it:
 
 ```
 dotnet build E:\GitHub\photone-ipc\Photone.Ipc.slnx -c Release
-dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 397 tests, ~35 s
+dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 412 tests, ~35 s
 
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]

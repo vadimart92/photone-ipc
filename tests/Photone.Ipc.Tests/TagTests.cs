@@ -30,7 +30,7 @@ public sealed unsafe class TagTests
     /// <summary>A writer with tags and, for <see cref="ReaderKind.CrossProcessOpener"/>, the same buffer opened by name.</summary>
     private sealed class Setup : IDisposable
     {
-        public Setup(ReaderKind kind, long capacity = 1 << 16, ITagSerializer? serializer = null, RingBufferPool? pool = null)
+        public Setup(ReaderKind kind, long capacity = 1 << 16, ITagSerializer? serializer = null, RingBufferPool? pool = null, long maxUnreadTags = 0, long maxUnreadTagBytes = 0)
         {
             Kind = kind;
             Serializer = serializer ?? TagPlan.CreateSerializer();
@@ -40,6 +40,8 @@ public sealed unsafe class TagTests
                 Tags = kind == ReaderKind.InProcess ? TagMode.InProcess : TagMode.CrossProcess,
                 TagSerializer = kind == ReaderKind.InProcess ? null : Serializer,
                 Pool = pool,
+                MaxUnreadTags = maxUnreadTags,
+                MaxUnreadTagBytes = maxUnreadTagBytes,
             };
             Writer = RingBuffer<long>.Create(capacity, Name, options);
             Opened = kind == ReaderKind.CrossProcessOpener ? RingBuffer<long>.Open(Name, new RingBufferOptions { TagSerializer = Serializer }) : null;
@@ -1036,6 +1038,198 @@ public sealed unsafe class TagTests
         using RingReader<long> reader = buffer.CreateReader();                 // a joiner finds the state the appends built
         Assert.Equal(300, reader.ReadLastTagValues().Length);
         Assert.Equal(599 * 1_000_003L, ((StateTag)Last(reader, "k299")!).Value);
+    }
+
+    // ------------------------------------------------------------------ the optional limit
+
+    [Theory]
+    [MemberData(nameof(AllKinds))]
+    public void MaxUnreadTags_MakesTheCommitWaitUntilTheReaderReadsPastOlderTags(ReaderKind kind)
+    {
+        const int Limit = 16;
+        using var setup = new Setup(kind, maxUnreadTags: Limit);
+        using RingReader<long> reader = setup.CreateReader();
+        Assert.Equal((Limit, 0L), setup.Writer.MaxUnreadTags);
+        int committed = 0;
+        var writer = Task.Factory.StartNew(
+            () =>
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    WriteBucket(setup.Writer, 1, b => b.AddTag(Label("tag " + i)));
+                    Interlocked.Increment(ref committed);
+                }
+            },
+            TaskCreationOptions.LongRunning);
+
+        RingTestUtil.WaitUntil(() => RingTestUtil.WriterIsWaiting(setup.Writer), "the writer waits for tag room");
+        int stalledAt = Volatile.Read(ref committed);
+        Assert.InRange(stalledAt, Limit, Limit + 2);                    // the tags of the elements the reader has not read
+        Assert.False(writer.IsCompleted);
+
+        long read = 0;
+        while (read < 100)
+        {
+            Assert.True(reader.WaitSync(1, RingTestUtil.Long), $"status {reader.Status}");
+            int n = (int)reader.Available;
+            Assert.True(reader.TryRead(n, out Chunk<long> chunk));
+            Assert.Equal(n, chunk.Tags.Length);
+            reader.Advance(n);
+            read += n;
+        }
+
+        Assert.True(writer.Wait(RingTestUtil.Long));
+        Assert.True(setup.Writer.Counters.TagWaits > 0);
+        Assert.Equal(100, setup.Writer.WriteCursor);
+    }
+
+    [Fact]
+    public void MaxUnreadTagBytes_MakesTheCommitWaitOnTheRecordBytes()
+    {
+        const int Limit = 8 * 1024;
+        using var setup = new Setup(ReaderKind.CrossProcessOpener, maxUnreadTagBytes: Limit);
+        using RingReader<long> reader = setup.CreateReader();
+        string text = new('b', 500);                                    // records of about 600 bytes: ~13 fit
+        int committed = 0;
+        var writer = Task.Factory.StartNew(
+            () =>
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    WriteBucket(setup.Writer, 1, b => b.AddTag(Label(text)));
+                    Interlocked.Increment(ref committed);
+                }
+            },
+            TaskCreationOptions.LongRunning);
+
+        RingTestUtil.WaitUntil(() => RingTestUtil.WriterIsWaiting(setup.Writer), "the writer waits for tag room");
+        Assert.InRange(Volatile.Read(ref committed), 5, 20);
+        Assert.True(setup.Shared!.UnreadBytes <= Limit);
+
+        long read = 0;
+        while (read < 100)
+        {
+            Assert.True(reader.WaitSync(1, RingTestUtil.Long), $"status {reader.Status}");
+            int n = (int)reader.Available;
+            Assert.True(reader.TryRead(n, out Chunk<long> chunk));
+            Assert.Equal(n, chunk.Tags.Length);
+            reader.Advance(n);
+            read += n;
+        }
+
+        Assert.True(writer.Wait(RingTestUtil.Long));
+        Assert.True(setup.Writer.Counters.TagWaits > 0);
+    }
+
+    [Theory]
+    [MemberData(nameof(AllKinds))]
+    public void MaxUnreadTags_NeverWaits_WhileTheReadersKeepUp(ReaderKind kind)
+    {
+        using var setup = new Setup(kind, maxUnreadTags: 64);
+        using RingReader<long> reader = setup.CreateReader();
+        for (int i = 0; i < 500; i++)
+        {
+            WriteBucket(setup.Writer, 2, b => b.AddTag(Label("keeping up"), 1));
+            Assert.True(reader.TryRead(2, out Chunk<long> chunk));
+            Assert.Single(chunk.Tags.ToArray());
+            reader.Advance(2);
+        }
+
+        Assert.Equal(0, setup.Writer.Counters.TagWaits);
+        Assert.Equal(0, setup.Writer.Counters.KernelWaits);
+
+        // and with no readers at all, nothing is ever unread
+        using var alone = new Setup(kind, maxUnreadTags: 4);
+        for (int i = 0; i < 100; i++)
+        {
+            WriteBucket(alone.Writer, 1, b => b.AddTag(Label("nobody reads")));
+        }
+
+        Assert.Equal(0, alone.Writer.Counters.TagWaits);
+    }
+
+    [Theory]
+    [MemberData(nameof(AllKinds))]
+    public void MaxUnreadTags_ACommitThatExceedsTheLimitAlone_IsDroppedWithAnError(ReaderKind kind)
+    {
+        using var setup = new Setup(kind, maxUnreadTags: 4);
+        using RingReader<long> reader = setup.CreateReader();
+        WriteBucket(setup.Writer, 1, b => b.AddTag(Label("fits")));
+
+        InvalidOperationException ex = Assert.Throws<InvalidOperationException>(() => WriteBucket(setup.Writer, 10, b =>
+        {
+            for (int j = 0; j < 10; j++)
+            {
+                b.AddTag(Label("too many " + j), j);
+            }
+        }));
+
+        Assert.Contains("MaxUnreadTags", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, setup.Writer.WriteCursor);                      // the bucket was dropped
+        WriteBucket(setup.Writer, 1, b => b.AddTag(Label("still usable")));
+        Assert.True(reader.TryRead(2, out Chunk<long> chunk));
+        Assert.Equal(["fits", "still usable"], Texts(chunk));
+    }
+
+    [Theory]
+    [MemberData(nameof(AllKinds))]
+    public void MaxUnreadTags_ReleasesWholeChunksOfTheObjectLog_AlsoAtItsEnd(ReaderKind kind)
+    {
+        // A limit of exactly one chunk makes the release land on a full chunk whose successor is not linked yet.
+        using var setup = new Setup(kind, maxUnreadTags: LocalTagLog.ChunkSize);
+        using RingReader<long> reader = setup.CreateReader();
+        for (int i = 0; i < 4 * LocalTagLog.ChunkSize; i++)
+        {
+            WriteBucket(setup.Writer, 1, b => b.AddTag(Label("tag " + i)));
+            Assert.True(reader.TryRead(1, out Chunk<long> chunk));
+            Assert.Equal("tag " + i, ((LabelTag)Assert.Single(chunk.Tags.ToArray())).Text);
+            reader.Advance(1);                                      // the reader keeps up: every release frees whole chunks
+        }
+
+        Assert.Equal(0, setup.Writer.Counters.TagWaits);
+        Assert.Equal(4 * LocalTagLog.ChunkSize, setup.Writer.WriteCursor);
+    }
+
+    [Fact]
+    public void Dispose_EndsACommitThatWaitsForTagRoom()
+    {
+        var buffer = RingBuffer<long>.Create(1 << 16, options: new RingBufferOptions
+        {
+            Tags = TagMode.CrossProcess,
+            TagSerializer = TagPlan.CreateSerializer(),
+            MaxUnreadTags = 8,
+        });
+        RingReader<long> reader = buffer.CreateReader();
+        var writer = Task.Factory.StartNew(
+            () =>
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    WriteBucket(buffer, 1, b => b.AddTag(Label("tag " + i)));
+                }
+            },
+            TaskCreationOptions.LongRunning);
+
+        RingTestUtil.WaitUntil(() => RingTestUtil.WriterIsWaiting(buffer), "the writer waits for tag room");
+        buffer.Dispose();
+        AggregateException ex = Assert.Throws<AggregateException>(() => writer.Wait(RingTestUtil.Long));
+        Assert.IsType<ObjectDisposedException>(ex.InnerException);
+        Assert.Equal(ReaderStatus.WriterClosed, reader.Status);
+        reader.Dispose();
+    }
+
+    [Fact]
+    public void TagLimits_Validation()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => RingBuffer<long>.Create(1 << 16, options: new RingBufferOptions { Tags = TagMode.InProcess, MaxUnreadTags = -1 }));
+        ArgumentException noTags = Assert.Throws<ArgumentException>(() => RingBuffer<long>.Create(1 << 16, options: new RingBufferOptions { MaxUnreadTags = 8 }));
+        Assert.Contains("RingBufferOptions.Tags", noTags.Message, StringComparison.Ordinal);
+        ArgumentException inProcessBytes = Assert.Throws<ArgumentException>(
+            () => RingBuffer<long>.Create(1 << 16, options: new RingBufferOptions { Tags = TagMode.InProcess, MaxUnreadTagBytes = 4096 }));
+        Assert.Contains("MaxUnreadTagBytes needs TagMode.CrossProcess", inProcessBytes.Message, StringComparison.Ordinal);
+
+        using var unlimited = RingBuffer<long>.Create(1 << 16, options: new RingBufferOptions { Tags = TagMode.InProcess });
+        Assert.Equal((0L, 0L), unlimited.MaxUnreadTags);
     }
 
     // ------------------------------------------------------------------ dispose, pool, memory

@@ -16,6 +16,9 @@ internal sealed unsafe class LocalTagLog
     private readonly long[] _published = GC.AllocateArray<long>(1, pinned: true);   // pinned: readers load it through a pointer, like TagEnd
     private readonly Dictionary<string, int> _lastIndex = new(StringComparer.Ordinal);
     private readonly List<KeyValuePair<string, ITag>> _lastValues = [];              // the last persistent tag of every key, in first-seen order
+    private Chunk? _unread;                                         // with a tag limit: the chunk of the oldest entry no reader has passed
+    private int _unreadIndex;
+    private long _unreadPosition;
     private Chunk _tail;
     private int _tailCount;
     private Chunk _last;                                            // the end of the chain: chunks after _tail were linked by Reserve, still empty
@@ -23,11 +26,60 @@ internal sealed unsafe class LocalTagLog
     private long _count;
     private Snapshot _snapshot;
 
-    public LocalTagLog()
+    /// <param name="tracksUnread">
+    /// The buffer limits its tags (<see cref="RingBufferOptions.MaxUnreadTags"/>): follow the oldest entry no reader has passed, so the writer can count
+    /// them. Without a limit nothing is tracked and the entries are the garbage collector's business alone.
+    /// </param>
+    public LocalTagLog(bool tracksUnread)
     {
         _tail = new Chunk();
         _last = _tail;
         _snapshot = new Snapshot(0, 0, _tail, 0, []);
+        _unread = tracksUnread ? _tail : null;
+    }
+
+    /// <summary>Entries the writer still holds for the slowest reader (<see cref="Release"/> moves this down; 0 without a limit).</summary>
+    public long UnreadEntries => _count - _unreadPosition;
+
+    /// <summary>Element offset of the oldest entry no reader has passed; a reader cursor past it releases that entry.</summary>
+    public long OldestUnreadOffset
+    {
+        get
+        {
+            Chunk chunk = _unread!;
+            return _unreadIndex == ChunkSize ? chunk.Next!.Items[0].Offset : chunk.Items[_unreadIndex].Offset;
+        }
+    }
+
+    /// <summary>
+    /// Releases the entries every reader has read past (offset below <paramref name="min"/>), so that a buffer with a tag limit counts only what readers
+    /// still owe. Walks at most as far as it releases, and only the writer calls it, on a commit that is at its limit.
+    /// </summary>
+    public void Release(long min)
+    {
+        while (_unreadPosition < _count)
+        {
+            if (_unreadIndex == ChunkSize)
+            {
+                _unread = _unread!.Next!;
+                _unreadIndex = 0;
+            }
+
+            if (_unreadIndex == 0 && _unreadPosition + ChunkSize <= _count && _unread!.Next is Chunk next && _unread.Items[ChunkSize - 1].Offset < min)
+            {
+                _unread = next;                                     // a full chunk whose last entry is behind every reader: skipped as a whole
+                _unreadPosition += ChunkSize;                       // (only when its successor is linked: a full chunk at the end gets one on the next Reserve)
+                continue;
+            }
+
+            if (_unread!.Items[_unreadIndex].Offset >= min)
+            {
+                return;
+            }
+
+            _unreadIndex++;                                         // the entry is not cleared: a joiner with an older snapshot still replays it
+            _unreadPosition++;
+        }
     }
 
     /// <summary>The published entry count, loaded by readers after the write cursor.</summary>

@@ -7,6 +7,7 @@ namespace Photone.Ipc.Tests;
 /// <see cref="RingBufferPool"/> in one process (DESIGN §15): reuse, the "nobody else holds it" rule, aliases, parked opener mappings, expiry and bounds.
 /// All pool tests live in this class (run sequentially) because some of them set process-wide test hooks.
 /// </summary>
+[Collection("ipc")]   // asserts that released address ranges are free: a test that maps memory in parallel (tag views, other buffers) can take them
 public sealed unsafe class PoolTests
 {
     private static readonly RingBufferPoolOptions s_keepForever = new() { IdleTimeout = Timeout.InfiniteTimeSpan };

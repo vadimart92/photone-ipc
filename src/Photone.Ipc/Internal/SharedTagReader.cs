@@ -113,9 +113,11 @@ internal sealed unsafe class SharedTagReader : TagReader
                 // The writer is publishing a snapshot (a few stores and at most one table copy): retry at once, then back off. A writer that died in the
                 // middle of it leaves the version odd for good: start without the table, after every published record, at the final write cursor (loaded
                 // after TagEnd, so every record before TagEnd with a lower offset is behind the reader; one beyond it belongs to elements never published).
-                // Only an odd version leads here: a writer that closed normally always left an even one, which the next attempt copies.
+                // Only an odd version leads here: a writer that closed normally always left an even one, which the next attempt copies. The version is
+                // loaded again after the writer is found gone, because it may have completed the snapshot and closed since this attempt read it; a writer
+                // that is gone cannot make an odd version even any more, so an odd one then stays odd.
                 nextLivenessCheck = Stopwatch.GetTimestamp() + (Stopwatch.Frequency / 100);
-                if (WriterGone(hdr))
+                if (WriterGone(hdr) && (Volatile.Read(ref hdr->TagVersion) & 1) != 0)
                 {
                     long final = Volatile.Read(ref hdr->TagEnd);
                     cursor = Math.Max(joinW, Volatile.Read(ref hdr->WriteCursor));

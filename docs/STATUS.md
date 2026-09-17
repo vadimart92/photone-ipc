@@ -25,7 +25,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   RingReader.cs          TryRead / Advance / WaitSync / SpinUntil / BlockUntil / Status (liveness probe) / Dispose / finalizer
   RingReader.Async.cs    Wait(...) => ValueTask<bool> (IValueTaskSource, per-reader waiter thread with idle retirement)
   RingBufferPool.cs      RingBufferPool / RingBufferPoolOptions: reuse check (handle count + InitState handshake), parking, expiry timer, bounds
-  RingBuffer.Tags.cs     AddTag (buffer: next element) / AddBucketTag / EndWriteWithTags (Dekker pair with Dispose) / PublishTags (frees, grows or shrinks shared tag memory; never waits)
+  RingBuffer.Tags.cs     AddTag (buffer: next element) / AddBucketTag / EndWriteWithTags (Dekker pair with Dispose) / PublishTags (frees, grows or shrinks shared tag memory) / EnsureTagRoom (waits only with a tag limit)
   RingReader.Tags.cs     ReadLastTagValues / TagsForRead, TagsForAdvance (behind one threshold compare; tags loaded once per new write cursor, before the cursor store)
   ITag.cs, TagMode.cs, UnknownTag.cs, ITagSerializer.cs, JsonTagSerializer.cs   the public tag model and the JSON serializer (registration by type name)
   Bucket.cs, Chunk.cs    ref structs (Span / Commit / Dispose; ReadOnlySpan)
@@ -43,7 +43,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   Internal/SpinPolicy.cs  adaptive spin budget (DESIGN §14)
   Internal/PooledMapping.cs     one mapping + its events as the pool hands it out and takes it back (DESIGN §15)
   Internal/Capacity.cs, AddressHint.cs, ProcessLiveness.cs, SpinClock.cs, Counters.cs, TestHooks.cs
-tests/Photone.Ipc.Tests/       397 xunit.v3 tests (unit, stress, and 28 cross-process tests via TestChild)
+tests/Photone.Ipc.Tests/       412 xunit.v3 tests (unit, stress, and 28 cross-process tests via TestChild)
 tests/Photone.Ipc.TestChild/   child-process verbs: reader, spin-reader, step-reader, writer [--crash], echo, crash-reader,
                                claim-and-die, slow-init, hold-name, join-storm, map-region, pool-reader-loop, tag-writer, tag-reader
                                (TagPlan.cs: the deterministic tag plan and oracle shared with the tag tests)
@@ -78,14 +78,14 @@ InitializationTimeout, PreferredBaseAddress, PreFault, Pool }`, `ReaderOptions {
 `RingBufferPool(RingBufferPoolOptions { IdleTimeout = 30 s, MaxIdleBytes, ClearOnReuse })`, `RingBufferPool.Shared`, `IdleCount`, `IdleBytes`,
 `Trim()`, `Dispose()`.
 
-Stream tags (DESIGN §16): `RingBufferOptions { Tags = TagMode.None | InProcess | CrossProcess, TagSerializer }`, `RingBuffer.Tags`, `Bucket.AddTag<TTag>(tag, index = 0)`, `RingBuffer.AddTag<TTag>(tag)`,
+Stream tags (DESIGN §16): `RingBufferOptions { Tags = TagMode.None | InProcess | CrossProcess, TagSerializer, MaxUnreadTags, MaxUnreadTagBytes }`, `RingBuffer.Tags`, `RingBuffer.MaxUnreadTags`, `Bucket.AddTag<TTag>(tag, index = 0)`, `RingBuffer.AddTag<TTag>(tag)`,
 `Bucket.StartOffset`, `Chunk.Tags` (`ReadOnlyMemory<ITag>`), `Chunk.StartOffset`, `RingReader.ReadLastTagValues()` (`ReadOnlySpan<ITag>`), `ITag { static virtual IsPersistent; Offset { get; set; }; Key }`,
 `JsonTagSerializer` (`Register<TTag>(name?)`), `ITagSerializer`, `UnknownTag`.
 
 ## Verification
 
 - `dotnet build Photone.Ipc.slnx -c Release`: 0 warnings, 0 errors (`TreatWarningsAsErrors`, `AnalysisLevel=latest`).
-- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 397/397, repeated runs, ~35 s.
+- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 412/412, repeated runs, ~35 s.
   Process-counter tests (handle count, virtual size) run in the non-parallel collection; 300 pooled create/open/reuse/revive cycles leave 0 handles behind.
 - Samples run cross-process at the same virtual address; killing the writer ends the reader with `WriterTerminated` after draining.
 - Zero allocations on every hot path (asserted by tests and by BenchmarkDotNet's `MemoryDiagnoser`).
@@ -140,6 +140,7 @@ the first revision, R1-R10 for the rework).
 | one tag per bucket: `InProcess` / `CrossProcess` writer's reader / `CrossProcess` opened by name | 133-134 ns / 522-530 ns / 905-925 ns | 64 B / 96 B / 160 B |
 | one persistent tag per bucket: `InProcess` / `CrossProcess` opened by name | 160-162 ns / 1,195-1,222 ns | 65 B / 129 B |
 | `JsonTagSerializer` round trip of that tag alone | 547-556 ns | 128 B |
+| one tag per bucket, `InProcess`, with `MaxUnreadTags = 4096` never reached (against the same without a limit, interleaved) | 145.7 / 145.9 ns | 64 B |
 
 Possible next steps: a binary `ITagSerializer` (JSON is most of a cross-process tag's cost); fewer registry lookups per tag in `JsonTagSerializer`.
 

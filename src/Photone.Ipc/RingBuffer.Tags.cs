@@ -118,6 +118,101 @@ public sealed unsafe partial class RingBuffer<T>
     /// cases until an element is published. Runs only inside <see cref="EndWriteWithTags"/>, after its disposal check.
     /// </summary>
     /// <summary>
+    /// The commit's tags do not fit the buffer's limit (<see cref="RingBufferOptions.MaxUnreadTags"/> / <see cref="RingBufferOptions.MaxUnreadTagBytes"/>)
+    /// by the counters the last release left: releases what the readers passed and, while it still does not fit, waits for them (DESIGN §16.4). It waits exactly as <see cref="GetBucket"/> waits for space, on the reader
+    /// cursor that releases the oldest tags, and holds a local reference so that <see cref="Dispose"/> on another thread ends it with
+    /// <see cref="ObjectDisposedException"/> (<see cref="CloseWriter"/> wakes it). The bucket is dropped in that case, as for any failed commit.
+    /// <para>
+    /// Nothing breaks a deadlock here: a reader that waits for more elements than are published while this commit waits for that reader to read past tags
+    /// stops both. The limit has to leave room for the tags of the largest chunk a reader waits for.
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The commit's own tags exceed the limit, so no reader could ever make room.</exception>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void EnsureTagRoom(TagWriter tags, int count, long bytes)
+    {
+        if ((_maxUnreadTags != 0 && count > _maxUnreadTags) || (_maxUnreadTagBytes != 0 && bytes > _maxUnreadTagBytes))
+        {
+            throw new InvalidOperationException(
+                $"The {count} tags of this commit ({bytes} bytes) exceed the buffer's tag limit by themselves (MaxUnreadTags {_maxUnreadTags}, " +
+                $"MaxUnreadTagBytes {_maxUnreadTagBytes}): no reader could make room for them. The bucket was dropped.");
+        }
+
+        if (!TryAddLocalRef())
+        {
+            throw new ObjectDisposedException(GetType().FullName);
+        }
+
+        try
+        {
+            while (true)
+            {
+                ThrowIfDisposed();
+                _min = ScanMin();
+                ReleaseTags(tags, _min);
+                if (TagRoom(tags, count, bytes))
+                {
+                    return;
+                }
+
+                long target = TagReleaseTarget(tags);
+                if (target == long.MinValue)
+                {
+                    throw new InvalidOperationException(                    // unreachable: a commit that fits an empty log was let through above
+                        $"The {count} tags of this commit ({bytes} bytes) do not fit the buffer's tag limit although the writer holds none. The bucket was dropped.");
+                }
+
+                _counters.TagWaits++;
+                WaitForMin(target);                                 // a reader cursor past the oldest tags releases them
+            }
+        }
+        finally
+        {
+            ReleaseLocalRef();
+        }
+    }
+
+    /// <summary>
+    /// <see langword="true"/> when this commit's tags fit in the buffer's limit, given what the writer still holds for the slowest reader (the counters as
+    /// the last release left them: they only over-estimate, so a commit that passes here needs no scan and no wait).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TagRoom(TagWriter tags, int count, long bytes)
+    {
+        if (_maxUnreadTags != 0 && UnreadTags(tags) + count > _maxUnreadTags)
+        {
+            return false;
+        }
+
+        return _maxUnreadTagBytes == 0 || tags.Shared!.UnreadBytes + bytes <= _maxUnreadTagBytes;
+    }
+
+    private static long UnreadTags(TagWriter tags) => tags.Shared is SharedTagLog shared ? shared.UnreadRecords : tags.Local.UnreadEntries;
+
+    private static void ReleaseTags(TagWriter tags, long min)
+    {
+        if (tags.Shared is SharedTagLog shared)
+        {
+            shared.Free(min);
+        }
+        else
+        {
+            tags.Local.Release(min);
+        }
+    }
+
+    /// <summary>The minimum reader cursor that releases the oldest tags the writer holds; <see cref="long.MinValue"/> when it holds none.</summary>
+    private static long TagReleaseTarget(TagWriter tags)
+    {
+        if (tags.Shared is SharedTagLog shared)
+        {
+            return shared.HasReserved ? shared.OldestAppendW + 1 : long.MinValue;
+        }
+
+        return tags.Local.UnreadEntries != 0 ? tags.Local.OldestUnreadOffset + 1 : long.MinValue;
+    }
+
+    /// <summary>
     /// The shared tags do not fit and the log would move to a larger ring: evicts readers whose process died first. Nothing else would while the data ring
     /// still has space, and a dead reader's cursor keeps every later record reserved (DESIGN §16.4). At most once per liveness interval: a sweep checks
     /// the process of every reader.
@@ -141,8 +236,14 @@ public sealed unsafe partial class RingBuffer<T>
         TagWriter tags = _tagWriter!;
         try
         {
-            if (tags.SelectForCommit(_w + count) != 0)
+            int selected = tags.SelectForCommit(_w + count);
+            if (selected != 0)
             {
+                if ((_maxUnreadTags | _maxUnreadTagBytes) != 0 && !TagRoom(tags, selected, tags.SelectedBytes))
+                {
+                    EnsureTagRoom(tags, selected, tags.SelectedBytes);   // the only place a commit can wait for readers because of tags
+                }
+
                 tags.PrepareLocal();                                // everything that can fail comes first; the appends cannot
                 if (tags.Shared is SharedTagLog shared)
                 {

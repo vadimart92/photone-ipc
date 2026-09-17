@@ -151,7 +151,7 @@ public sealed unsafe partial class RingBuffer<T>
             _min = ScanMin();
             if (_capacity - (_e - _min) < count)
             {
-                WaitForSpace(count);
+                WaitForMin(_e + count - _capacity);                 // the minimum reader cursor that frees `count` elements
             }
         }
         finally
@@ -276,11 +276,14 @@ public sealed unsafe partial class RingBuffer<T>
         }
     }
 
-    /// <summary>Two-phase wait for free space: spin for the adaptive budget (rescanning every ~1 µs), then block; a blocked wait feeds the policy.</summary>
-    private void WaitForSpace(int count)
+    /// <summary>
+    /// Two-phase wait until the minimum reader cursor reaches <paramref name="target"/> (free space for a bucket, or tags the readers have read past):
+    /// spin for the adaptive budget (rescanning every ~1 µs), then block; a blocked wait feeds the policy.
+    /// </summary>
+    private void WaitForMin(long target)
     {
         long start = Stopwatch.GetTimestamp();
-        if (SpinForSpace(count, start, _spaceSpin.Window))
+        if (SpinForMin(target, start, _spaceSpin.Window))
         {
             if (_spaceSpin.IsAdaptive)
             {
@@ -290,11 +293,11 @@ public sealed unsafe partial class RingBuffer<T>
             return;
         }
 
-        BlockForSpace(count);
+        BlockForMin(target);
         _spaceSpin.OnSatisfied(Stopwatch.GetTimestamp() - start);
     }
 
-    private bool SpinForSpace(int count, long start, long budget)
+    private bool SpinForMin(long target, long start, long budget)
     {
         if (budget <= 0)
         {
@@ -318,7 +321,7 @@ public sealed unsafe partial class RingBuffer<T>
             {
                 lastScan = now;
                 _min = ScanMin();
-                if (_capacity - (_e - _min) >= count)
+                if (_min >= target)
                 {
                     return true;
                 }
@@ -336,10 +339,9 @@ public sealed unsafe partial class RingBuffer<T>
         }
     }
 
-    private void BlockForSpace(int count)
+    /// <summary>Kernel phase of <see cref="WaitForMin"/>: the target stays fixed for the episode; the caller holds a local reference.</summary>
+    private void BlockForMin(long target)
     {
-        long target = _e + count - _capacity;                       // min reader cursor that frees `count` elements (fixed for this episode)
-
         // phase 2: kernel (the caller holds a local ref: the mapping stays valid even if Dispose runs on another thread)
         _counters.KernelWaits++;
         Volatile.Write(ref Hdr.WriterWaitSinceTick, Kernel.GetTickCount64());
@@ -347,7 +349,7 @@ public sealed unsafe partial class RingBuffer<T>
         {
             ThrowIfDisposed();                                      // Dispose (any thread) wakes us via WakeWriter and we leave here
             RefreshLaggards(target);                                // every Active blocker gets a validated process handle (or poll mode); dead ones evicted now
-            if (_capacity - (_e - _min) >= count)                   // RefreshLaggards rescanned and may have evicted
+            if (_min >= target)                                     // RefreshLaggards rescanned and may have evicted
             {
                 return;
             }
@@ -356,7 +358,7 @@ public sealed unsafe partial class RingBuffer<T>
             _backend.OnWriterBlocking(_hdr);
             Interlocked.Exchange(ref Hdr.WriterWaiting, 1);         // publish intent [full fence]
             _min = ScanMin();                                       // re-check AFTER the fence (Dekker)
-            if (_capacity - (_e - _min) >= count)
+            if (_min >= target)
             {
                 Interlocked.Exchange(ref Hdr.WriterWaiting, 0);
                 return;
@@ -506,6 +508,7 @@ public sealed unsafe partial class RingBuffer<T>
 
         while (Volatile.Read(ref _committing) != 0)                // after the fenced _disposed store (Dekker pair with EndWriteWithTags)
         {
+            _backend.WakeWriter();                                  // a commit waiting for tag room wakes, sees _disposed and leaves
             Thread.Sleep(1);
         }
 

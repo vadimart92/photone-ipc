@@ -236,8 +236,9 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
     a blocked writer waits for; see REVIEW-NOTES T4. (Kept after tags stopped waiting for tag space: the space wait alone can need it.)
 
 48. **Dispose waits for a commit with tags** (DESIGN §5.8 dropped an outstanding bucket right away). `CloseWriter` loads `_committing` after the fenced
-    `_disposed` store and waits while a commit with tags runs, so the two never run `EndWrite` at once (REVIEW-NOTES T1). Such a commit no longer waits
-    for readers, but it may map and commit tag memory.
+    `_disposed` store and waits while a commit with tags runs, so the two never run `EndWrite` at once (REVIEW-NOTES T1). Such a commit maps and commits
+    tag memory, and waits for readers when the buffer limits its tags (`MaxUnreadTags` / `MaxUnreadTagBytes`); `CloseWriter` wakes it, as it wakes a
+    blocked `GetBucket`.
 
 49. **A claim that fails after its slot became Active releases the slot like a disposed reader** (DESIGN §5.6 only freed the word and the mask). A
     malformed tag snapshot makes `CreateReader` throw after the claim; `ReleaseFailedClaim` zeroes the identity fields before freeing the slot (a sweeper

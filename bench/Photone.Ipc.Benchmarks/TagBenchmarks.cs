@@ -10,6 +10,7 @@ namespace Photone.Ipc.Benchmarks;
 /// <item><see cref="Protocol_NoTags"/>: GetBucket / Commit / TryRead / Advance on a buffer without tags (as <c>HotPathBenchmarks.WriteRead_Protocol</c>).</item>
 /// <item><see cref="Protocol_TagsUnused_WritersReader"/> / <see cref="Protocol_TagsUnused_Opener"/>: the same on a buffer with tags that never carries one.</item>
 /// <item><c>OneTag_*</c>: plus one small non-persistent tag per bucket: stage, publish, load, deliver in the chunk, consume.</item>
+/// <item><see cref="OneTag_InProcess_Limited"/>: the same with <c>MaxUnreadTags</c> set so high that the writer never waits: what the limit costs when it does not bite.</item>
 /// <item><c>OnePersistentTag_*</c>: plus one persistent tag per bucket: also the snapshot for joiners, and the reader's last value.</item>
 /// </list>
 /// </summary>
@@ -27,6 +28,7 @@ public class TagBenchmarks
     private (RingBuffer<float> Writer, RingReader<float> Reader) _unusedLocal;
     private (RingBuffer<float> Writer, RingReader<float> Reader) _unusedOpener;
     private (RingBuffer<float> Writer, RingReader<float> Reader) _inProcess;
+    private (RingBuffer<float> Writer, RingReader<float> Reader) _inProcessLimited;
     private (RingBuffer<float> Writer, RingReader<float> Reader) _crossLocal;
     private (RingBuffer<float> Writer, RingReader<float> Reader) _crossOpener;
 
@@ -38,15 +40,16 @@ public class TagBenchmarks
         _unusedLocal = Pair(TagMode.InProcess, opener: false);
         _unusedOpener = Pair(TagMode.CrossProcess, opener: true);
         _inProcess = Pair(TagMode.InProcess, opener: false);
+        _inProcessLimited = Pair(TagMode.InProcess, opener: false, maxUnreadTags: 4096);      // a limit the reader keeps the writer far below
         _crossLocal = Pair(TagMode.CrossProcess, opener: false);
         _crossOpener = Pair(TagMode.CrossProcess, opener: true);
     }
 
-    private (RingBuffer<float> Writer, RingReader<float> Reader) Pair(TagMode mode, bool opener)
+    private (RingBuffer<float> Writer, RingReader<float> Reader) Pair(TagMode mode, bool opener, long maxUnreadTags = 0)
     {
         var serializer = new JsonTagSerializer().Register<BenchLabel>().Register<BenchRate>();
         string name = "photone.bench.tags." + Guid.NewGuid().ToString("N");
-        var writer = RingBuffer<float>.Create(1 << 20, name, new RingBufferOptions { Tags = mode, TagSerializer = serializer });
+        var writer = RingBuffer<float>.Create(1 << 20, name, new RingBufferOptions { Tags = mode, TagSerializer = serializer, MaxUnreadTags = maxUnreadTags });
         _owned.Add(writer);
         RingBuffer<float> source = writer;
         if (opener)
@@ -82,6 +85,9 @@ public class TagBenchmarks
 
     [Benchmark]
     public int OneTag_InProcess() => OneTag(_inProcess);
+
+    [Benchmark]
+    public int OneTag_InProcess_Limited() => OneTag(_inProcessLimited);
 
     [Benchmark]
     public int OneTag_CrossProcess_WritersReader() => OneTag(_crossLocal);
