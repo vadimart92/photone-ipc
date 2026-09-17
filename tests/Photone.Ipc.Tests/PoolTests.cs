@@ -667,11 +667,12 @@ public sealed unsafe class PoolTests
         Assert.Equal(2, pool.IdleCount);
         Assert.Equal(TestKernel.MEM_COMMIT, TestKernel.QueryState(writerBase, out _));
 
-        RingTestUtil.WaitUntil(() => pool.IdleCount == 0, "idle mappings expired");
+        // the entries leave _idle under the lock and unmap outside it, so the counters reach zero a moment before the address space does
+        RingTestUtil.WaitUntil(() => TestKernel.QueryState(writerBase, out _) == TestKernel.MEM_FREE, "writer mapping released");
+        RingTestUtil.WaitUntil(() => TestKernel.QueryState(openerBase, out _) == TestKernel.MEM_FREE, "opener mapping released");
+        Assert.Equal(0, pool.IdleCount);
         Assert.Equal(0, pool.IdleBytes);
         Assert.Equal(2, pool.ReleasedCount);
-        Assert.Equal(TestKernel.MEM_FREE, TestKernel.QueryState(writerBase, out _));
-        Assert.Equal(TestKernel.MEM_FREE, TestKernel.QueryState(openerBase, out _));
 
         // the timer re-arms for later returns
         RingBuffer<long>.Create(1 << 12, options: With(pool)).Dispose();
