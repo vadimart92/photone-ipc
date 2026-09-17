@@ -285,9 +285,9 @@ internal static class QuickHarness
     private static void Receive(RingReader<long> inbound, long expected)
     {
         inbound.TryRead(1, out Chunk<long> chunk);
-        if (chunk.Span[0] != expected)
+        if (chunk.Data.Span[0] != expected)
         {
-            throw new InvalidOperationException(Inv($"ping-pong: got {chunk.Span[0]}, expected {expected}"));
+            throw new InvalidOperationException(Inv($"ping-pong: got {chunk.Data.Span[0]}, expected {expected}"));
         }
 
         inbound.Advance(1);

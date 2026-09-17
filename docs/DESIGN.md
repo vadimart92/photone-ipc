@@ -70,7 +70,7 @@ E:\GitHub\photone-ipc\
     RingReader.cs                 TryRead/Advance/WaitSync/BlockUntil/Dispose, Status
     RingReader.Async.cs           Wait(...) => ValueTask<bool>, IValueTaskSource<bool>, waiter thread
     Bucket.cs                     ref struct Bucket<T>
-    Chunk.cs                      readonly ref struct Chunk<T>
+    Chunk.cs                      readonly struct Chunk<T> (ReadOnlyMemory<T> Data)
     Options.cs                    RingBufferOptions, ReaderOptions
     ReaderStatus.cs               enum
     Exceptions.cs
@@ -83,6 +83,7 @@ E:\GitHub\photone-ipc\
     Internal\Capacity.cs          ChooseCapacity, TypeHash (FNV-1a)
     Internal\AddressHint.cs       preferred-base probes
     Internal\MirroredSection.cs   placeholder + 3 views (create / open / teardown); the ONLY mapping code
+    Internal\MappedMemory.cs      MemoryManager<T> over the data region + mirror: the owner behind Chunk.Data
     Internal\ProcessLiveness.cs   IsAlive, OpenLaggard, start-time compare
     Internal\SpinClock.cs         Stopwatch-bounded spin helper
     Internal\Counters.cs          internal diagnostics counters
@@ -313,9 +314,9 @@ public ref struct Bucket<T> : IDisposable where T : unmanaged
     public void Dispose();                    // without Commit => Commit(0); idempotent
 }
 
-public readonly ref struct Chunk<T> where T : unmanaged
+public readonly struct Chunk<T> where T : unmanaged
 {
-    public ReadOnlySpan<T> Span { get; }
+    public ReadOnlyMemory<T> Data { get; }    // a window into the ring itself: Data.Span to read it (DEVIATIONS 56)
     public int Length { get; }
     public long Cursor { get; }
 }
@@ -325,7 +326,7 @@ public sealed unsafe class RingReader<T> : IDisposable, IValueTaskSource<bool> w
     /// Awaitable. true: >= count readable. false: timeout, or the writer closed/terminated and fewer than count will ever arrive
     /// (drain with TryRead/Available; see Status). Throws OperationCanceledException, ReaderEvictedException, ObjectDisposedException,
     /// ArgumentOutOfRangeException (count > Capacity). count == 0 => true. One outstanding Wait/WaitSync per reader.
-    /// NOTE (C# 13): a Chunk<T> (ref struct) must not share a block with an await; put TryRead + use in a nested block.
+    /// NOTE: a Chunk<T> may cross an await (Data is ReadOnlyMemory<T>), but it points into the ring: do not Advance past a chunk while an awaited operation still reads it.
     public ValueTask<bool> Wait(int count, CancellationToken cancellationToken = default);
     public ValueTask<bool> Wait(int count, TimeSpan timeout, CancellationToken cancellationToken = default);
     public bool WaitSync(int count);                              // == WaitSync(count, Timeout.InfiniteTimeSpan)
@@ -359,7 +360,7 @@ using (var bucket = buffer.GetBucket(1024)) { bucket.Span.Fill(0); bucket.Commit
 
 var reader = buffer.CreateReader();                                  // or RingBuffer<float>.Open("demo").CreateReader() elsewhere
 await reader.Wait(100);
-{ reader.TryRead(100, out var chunk); Use(chunk.Span); reader.Advance(90); }
+reader.TryRead(100, out var chunk); Use(chunk.Data.Span); reader.Advance(90);
 ```
 
 Semantics table (fixed):
@@ -573,7 +574,7 @@ ReleaseLocalRef()                                          // _localRefs starts 
 ReleaseLocalRef(): if Interlocked.Decrement(ref _localRefs) == 0: ReleaseNative()
 ReleaseNative(): close cached laggard process handles; _backend.Dispose(); _mapping.Dispose()
 ```
-A `RingReader` created from this buffer stays fully usable after the buffer is disposed (it holds the pointers; the mapping is released by the last reader's `Dispose`). `Bucket`/`Chunk` are ref structs and cannot outlive their frame. Process death: the kernel frees views, handles and placeholders; the section survives while any other process holds a handle or view.
+A `RingReader` created from this buffer stays fully usable after the buffer is disposed (it holds the pointers; the mapping is released by the last reader's `Dispose`). `Bucket` is a ref struct and cannot outlive its frame; a `Chunk` may be stored, but its `Data` is the mapping itself and keeps nothing alive (DEVIATIONS 56). Process death: the kernel frees views, handles and placeholders; the section survives while any other process holds a handle or view.
 
 ### 3.6 Address hint (`Internal\AddressHint.cs`)
 
@@ -812,7 +813,7 @@ The laggard set is recomputed on every iteration, so a reader that becomes the s
 TryRead(n, out chunk):
     ThrowIfDisposed(); if ((uint)n > (uint)C) throw AOOR
     if (_wc - _r < n) { _wc = Volatile.Read(ref Hdr.WriteCursor); if (_wc - _r < n) { chunk = default; return false; } }   // ACQUIRE: later data loads see everything published <= _wc
-    chunk = new Chunk<T>(new ReadOnlySpan<T>(_data + off(_r), n), _r); return true
+    chunk = new Chunk<T>(_mem.Slice(idx(_r), n), _r); return true              // _mem: the data region + mirror as ReadOnlyMemory<T> (DEVIATIONS 56); idx(c) == c & mask
 
 Available: _wc = Volatile.Read(ref Hdr.WriteCursor); return _wc - _r
 

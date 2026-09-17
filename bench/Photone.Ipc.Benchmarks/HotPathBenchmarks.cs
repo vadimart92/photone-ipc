@@ -107,7 +107,7 @@ public class HotPathBenchmarks
         }
 
         _singleReader.TryRead(n, out Chunk<float> chunk);
-        float sum = Peer.Sum(chunk.Span);
+        float sum = Peer.Sum(chunk.Data.Span);
         _singleReader.Advance(n);
         return sum;
     }
@@ -123,7 +123,7 @@ public class HotPathBenchmarks
         }
 
         _singleReader.TryRead(n, out Chunk<float> chunk);
-        float sum = Peer.Sum(chunk.Span);
+        float sum = Peer.Sum(chunk.Data.Span);
         _singleReader.Advance(n);
         return sum;
     }

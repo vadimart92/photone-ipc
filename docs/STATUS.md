@@ -28,7 +28,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   RingBuffer.Tags.cs     AddTag (buffer: next element) / AddBucketTag / EndWriteWithTags (Dekker pair with Dispose) / PublishTags (frees, grows or shrinks shared tag memory) / EnsureTagRoom (waits only with a tag limit)
   RingReader.Tags.cs     ReadLastTagValues / TagsForRead, TagsForAdvance (behind one threshold compare; tags loaded once per new write cursor, before the cursor store)
   ITag.cs, TagMode.cs, UnknownTag.cs, ITagSerializer.cs, JsonTagSerializer.cs   the public tag model and the JSON serializer (registration by type name)
-  Bucket.cs, Chunk.cs    ref structs (Span / Commit / Dispose; ReadOnlySpan)
+  Bucket.cs, Chunk.cs    ref struct Bucket<T> (Span / Commit / Dispose); readonly struct Chunk<T> (ReadOnlyMemory<T> Data, Tags)
   Options.cs, ReaderStatus.cs, Exceptions.cs, SafeSectionHandle.cs
   Signaling/SignalBackend.cs, NamedEventBackend.cs, WaitOutcome.cs   the swappable signaling layer (v1: 33 named auto-reset events)
   Internal/Kernel.cs     21 [LibraryImport]s (kernelbase: VirtualAlloc2, MapViewOfFile3; kernel32; ntdll: NtQuerySystemInformation, NtQueryObject)
@@ -66,8 +66,8 @@ var other  = RingBuffer<float>.Open("demo");                  // any process; sa
 var reader = other.CreateReader();                            // one of 32 broadcast readers, starts at the head
 if (await reader.Wait(100))                                   // ValueTask<bool>; false = writer closed/terminated and < 100 will ever arrive
 {
-    reader.TryRead(100, out var chunk);                       // exactly 100 or false; chunk.Span is ReadOnlySpan<float>
-    Use(chunk.Span);
+    reader.TryRead(100, out var chunk);                       // exactly 100 or false; chunk.Data is ReadOnlyMemory<float>
+    Use(chunk.Data.Span);                                     // the window itself: Data.Span to read, Data.Pin() for an address
     reader.Advance(90);                                       // may be less than read
 }
 ```
@@ -79,7 +79,7 @@ InitializationTimeout, PreferredBaseAddress, PreFault, Pool }`, `ReaderOptions {
 `Trim()`, `Dispose()`.
 
 Stream tags (DESIGN §16): `RingBufferOptions { Tags = TagMode.None | InProcess | CrossProcess, TagSerializer, MaxUnreadTags, MaxUnreadTagBytes }`, `RingBuffer.Tags`, `RingBuffer.MaxUnreadTags`, `Bucket.AddTag<TTag>(tag, index = 0)`, `RingBuffer.AddTag<TTag>(tag)`,
-`Bucket.StartOffset`, `Chunk.Tags` (`ReadOnlyMemory<ITag>`), `Chunk.StartOffset`, `RingReader.ReadLastTagValues()` (`ReadOnlySpan<ITag>`), `ITag { static virtual IsPersistent; Offset { get; set; }; Key }`,
+`Bucket.StartOffset`, `Chunk.Data` (`ReadOnlyMemory<T>`), `Chunk.Tags` (`ReadOnlyMemory<ITag>`), `Chunk.StartOffset`, `RingReader.ReadLastTagValues()` (`ReadOnlySpan<ITag>`), `ITag { static virtual IsPersistent; Offset { get; set; }; Key }`,
 `JsonTagSerializer` (`Register<TTag>(name?)`), `ITagSerializer`, `UnknownTag`.
 
 ## Verification

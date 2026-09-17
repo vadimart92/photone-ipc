@@ -53,8 +53,8 @@ using (buffer)
 
     if (await reader.Wait(100))                                 // async wait until >= 100 elements are readable
     {
-        reader.TryRead(100, out var chunk);                     // chunk.Span : ReadOnlySpan<float>, contiguous across the ring's end
-        Console.WriteLine($"first chunk: {chunk.Length} samples at cursor {chunk.Cursor}, sample[0]={chunk.Span[0]:F4}");
+        reader.TryRead(100, out var chunk);                     // chunk.Data.Span : ReadOnlySpan<float>, contiguous across the ring's end
+        Console.WriteLine($"first chunk: {chunk.Length} samples at cursor {chunk.Cursor}, sample[0]={chunk.Data.Span[0]:F4}");
         reader.Advance(90);                                     // consume 90 (may advance less than read: the last 10 are read again below)
     }
 
@@ -80,38 +80,36 @@ using (buffer)
     {
         while (await reader.Wait(BlockSize, cts.Token))        // false => the writer closed or died and fewer than BlockSize will ever arrive
         {
+            reader.TryRead(BlockSize, out var chunk);
+            ReadOnlySpan<float> span = chunk.Data.Span;
+            for (int i = 0; i < span.Length; i++)
             {
-                reader.TryRead(BlockSize, out var chunk);
-                ReadOnlySpan<float> span = chunk.Span;
-                for (int i = 0; i < span.Length; i++)
+                float v = span[i];
+                double a = Math.Abs(v);
+                if (a > peak)
                 {
-                    float v = span[i];
-                    double a = Math.Abs(v);
-                    if (a > peak)
-                    {
-                        peak = a;
-                    }
-
-                    sumSquares += (double)v * v;
+                    peak = a;
                 }
 
-                sumCount += span.Length;
-                foreach (ITag tag in chunk.Tags.Span)               // the tags attached to these 1024 samples, in offset order
-                {
-                    switch (tag)
-                    {
-                        case StreamFormat f:
-                            Console.WriteLine($"          format change at sample {f.Offset:N0}: {f.Frequency} Hz tone");
-                            break;
-                        case SecondMark:
-                            marks++;
-                            break;
-                    }
-                }
-
-                reader.Advance(BlockSize);
-                consumed += BlockSize;
+                sumSquares += (double)v * v;
             }
+
+            sumCount += span.Length;
+            foreach (ITag tag in chunk.Tags.Span)               // the tags attached to these 1024 samples, in offset order
+            {
+                switch (tag)
+                {
+                    case StreamFormat f:
+                        Console.WriteLine($"          format change at sample {f.Offset:N0}: {f.Frequency} Hz tone");
+                        break;
+                    case SecondMark:
+                        marks++;
+                        break;
+                }
+            }
+
+            reader.Advance(BlockSize);
+            consumed += BlockSize;
 
             double now = clock.Elapsed.TotalSeconds;
             if (now - lastReport >= 1.0)
