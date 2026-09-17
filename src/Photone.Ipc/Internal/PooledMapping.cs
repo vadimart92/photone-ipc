@@ -14,6 +14,7 @@ internal sealed class PooledMapping
     {
         Mapping = mapping;
         Backend = backend;
+        HeaderBytes = (long)mapping.HeaderBytes;
         DataBytes = dataBytes;
         SectionId = sectionId;
         SectionName = sectionName;
@@ -27,8 +28,14 @@ internal sealed class PooledMapping
     /// <summary>The 33 events, named from <see cref="SectionId"/>.</summary>
     public SignalBackend Backend { get; }
 
-    /// <summary>Size of the data region (the pool's size class).</summary>
+    /// <summary>Size of the header view: the control view and the tag area (part of the pool's size class; <c>ControlBlock.DataOffset</c>).</summary>
+    public long HeaderBytes { get; }
+
+    /// <summary>Size of the data region (the pool's size class, with <see cref="HeaderBytes"/>).</summary>
     public long DataBytes { get; }
+
+    /// <summary>What the mapping counts against <see cref="RingBufferPool.IdleBytes"/>: the data region and the tag area.</summary>
+    public long PooledBytes => DataBytes + HeaderBytes - Layout.HeaderViewBytes;
 
     /// <summary><c>ControlBlock.SectionId</c>: constant for the section's life.</summary>
     public ulong SectionId { get; }

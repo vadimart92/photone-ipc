@@ -30,6 +30,33 @@ public ref struct Bucket<T> : IDisposable where T : unmanaged
     /// <summary>Absolute element index of <c>Span[0]</c>.</summary>
     public readonly long Cursor => _cursor;
 
+    /// <summary>Absolute element index of <c>Span[0]</c> as the unsigned offset tags use (<see cref="ITag.Offset"/>); equal to <see cref="Cursor"/>.</summary>
+    public readonly ulong StartOffset => (ulong)_cursor;
+
+    /// <summary>
+    /// Attaches <paramref name="tag"/> to the element at <c>tag.Offset</c> (<c>StartOffset &lt;= tag.Offset &lt; StartOffset + Length</c>). The tag is serialized
+    /// now and published with <see cref="Commit"/>, together with the elements it belongs to; a tag beyond the committed prefix is dropped with them.
+    /// Readers see it in <see cref="Chunk{T}.Tags"/>; tags may be added in any order and are delivered in offset order (equal offsets in the order added).
+    /// <see cref="Commit"/> waits while the buffer's tag log is full, until the slowest reader has read past older tags.
+    /// </summary>
+    /// <typeparam name="TTag">The concrete tag type: it decides <see cref="ITag.IsPersistent"/> and the serializer's type name.</typeparam>
+    /// <exception cref="InvalidOperationException">
+    /// The bucket was committed or disposed; the buffer carries no tags (<see cref="RingBufferOptions.TagCapacity"/> is 0) or has no
+    /// <see cref="RingBufferOptions.TagSerializer"/>; the bucket's tags exceed the tag log, or the last persistent tag of every key would exceed the
+    /// persistent-tag table.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException"><c>tag.Offset</c> lies outside the bucket.</exception>
+    /// <exception cref="ArgumentException"><typeparamref name="TTag"/> is an interface, the key is <see langword="null"/> or too long, or the tag alone exceeds the tag log.</exception>
+    public readonly void AddTag<TTag>(TTag tag) where TTag : ITag
+    {
+        if (_committed >= 0 || _owner is null)
+        {
+            throw new InvalidOperationException("The bucket has already been committed or disposed.");
+        }
+
+        _owner.AddTag(_cursor, _span.Length, tag);
+    }
+
     /// <summary>
     /// Publishes the first <paramref name="count"/> elements (<c>0 &lt;= count &lt;= Length</c>) to all readers. Exactly once per bucket;
     /// the unpublished tail is dropped and the next bucket starts at <c>Cursor + count</c>.

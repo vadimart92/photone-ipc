@@ -17,4 +17,7 @@ internal static class TestHooks
 
     /// <summary>Runs in the writer when the slow path of <c>GetBucket</c> leaves (also by an exception), just before it drops its local reference.</summary>
     public static Action? SlowGetBucketLeaving { get; set; }
+
+    /// <summary>Runs in a commit with tags once its tags fit, just before they are copied into the log; the argument is the committing buffer.</summary>
+    public static Action<object>? BeforeTagAppend { get; set; }
 }

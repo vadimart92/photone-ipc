@@ -40,3 +40,27 @@ Each was verified by hand against the code before anything was changed. Verdicts
 | `Evict` never wakes an evictee. | v1 evicts only dead processes; there is nobody to wake. |
 | 64-byte reader slots pair up under the 128-byte adjacent-line prefetcher. | Real but second-order (only multi-reader configurations, only cursor lines). Kept for v1; a 128-byte slot layout is a candidate for layout version 2. |
 | `Status` reads the writer-state line that the writer used to store `ReserveEnd` on. | Resolved by #15 above (no more hot-path stores on that line). |
+
+# Review notes: stream tags (2026-09-17)
+
+One read-only adversarial reviewer checked DESIGN §16 against the code (reuse rule, joiner snapshot, reader loading, exception safety, pool, layout,
+hot paths). It confirmed the reuse rule and the snapshot argument on TSO and found the issues below; each was verified by hand, and all are fixed.
+
+| # | Finding | Fix |
+|---|---|---|
+| T1 | Major. `Dispose` on another thread just as a commit with tags stopped waiting for tag space: the commit had released its local reference, so both threads ran `EndWrite` (the tags could be lost, the write cursor go back, the snapshot be torn, the mapping be released under the copy). | `EndWriteWithTags` and `CloseWriter` form a Dekker pair (`_committing` / `_disposed`): the commit either sees the disposal and touches nothing, or `CloseWriter` waits (waking the writer every millisecond) until the commit completed or gave up. Test: `Dispose_JustAsACommitWithTagsStopsWaiting_LetsTheCommitComplete` (fails with the handshake disabled). |
+| T2 | Major. A corrupt `TagEnd` together with a huge record length made `TagReader.Load` copy far beyond the 4 KiB log (access violation instead of `RingBufferLayoutException`); the constructor also re-read the tag sizes from shared memory after `Validate`. | `TagEnd - position > L` and records longer than the log are reported; the wrap-aware copies refuse lengths above the log; openers take the sizes once (`ReadTagArea`) and only if `64 KiB + S + L` equals the mapped header view. Test: `CorruptTagEnd_OrRecordLength_IsReportedInsteadOfFollowed`. |
+| T3 | With `SpinTime` negative (spin forever) the writer never reached the kernel phase, so the tag deadlock was never detected (endless spin). | `SpinForMin` runs the deadlock check every millisecond during a tag wait. Test: `TagLog_Deadlock_IsDetectedAlsoWhenTheWriterSpinsForever`. |
+| T4 | A join that kept losing to tagged commits held the writer back through its cursor; its bump to the snapshot's cursor did not wake the writer (a liveness slice of stall). | The joiner publishes its start cursor with a full fence and wakes a writer whose target it reached, as `Advance` does. This also re-opens the earlier refuted finding "join step (d) does not wake a blocked writer": a writer's scan can see the provisional cursor of step (a) below a target (a tag wait targets up to `W`, and a space target can exceed a stale provisional cursor), so every join now does this check, with or without tags. |
+| T5 | A joiner whose writer died inside `PublishSnapshot` started at its own join cursor, after the tags of elements it could still read. | It starts at the final write cursor, loaded after `TagEnd`. Test: `JoiningReader_WhenTheWriterDiedMidSnapshot_StartsAtTheFinalCursorWithoutState`. |
+| T6 | `RingBufferPool.MaxIdleBytes` / `IdleBytes` ignored the tag area (up to ~1 GiB per idle entry). | They count the data region and the tag area. Test: `Pool_CountsTheTagAreaAgainstMaxIdleBytes`. |
+| T7 | Suspected: the seqlock's odd version was a plain store, and a large table copy may use non-temporal stores that are not ordered with it. | The odd store is an `Interlocked.Exchange` (full fence). |
+
+Found while fixing: `TagReader.Consume` cleared consumed queue entries, so a chunk the reader had advanced into only partly showed `null` for the tags it
+was advanced past; entries are no longer cleared (test `PartiallyAdvancedChunk_KeepsTheTagsItStillCovers`). Benchmarks showed 5 ns per round for a tag area
+that carries no tags (two out-of-line calls per new write cursor), and about 1 ns per round for buffers without tags against the base commit (four
+extra compares and a 16-byte tag view in every chunk): `TryRead` and `Advance` now test one threshold, and a chunk carries a single reference from
+which `Chunk.Tags` is computed on access.
+
+Deliberately not changed: the deadlock detector treats a reader parked with a timeout or a cancellation longer than 1 s as stuck (documented). Out of scope
+and reported separately: the same class of race as T1 exists, much narrower, between a blocked `GetBucket` that stops waiting and `Dispose` (pre-existing).

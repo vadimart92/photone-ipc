@@ -1,5 +1,6 @@
-// Photone.Ipc sample: WRITER. Creates the shared ring buffer "sine" and streams a 440 Hz sine wave of floats into it.
-// Run the Reader sample (any number of instances, in other processes) while this is running.
+// Photone.Ipc sample: WRITER. Creates the shared ring buffer "sine" and streams a sine wave of floats into it, alternating between 440 Hz and 880 Hz
+// every 10 seconds of samples. Stream tags describe the stream: a persistent "format" tag (sample rate, tone) wherever the tone changes, and a
+// "second" tag on the first sample of every second. Run the Reader sample (any number of instances, in other processes) while this is running.
 //
 //   dotnet run --project samples/Photone.Ipc.Samples.Writer -c Release [-- --rate 48000] [--name sine]
 //
@@ -27,15 +28,22 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-// ---- the API sketch, writer side ----------------------------------------------------------------
-using RingBuffer<float> buffer = RingBuffer<float>.Create(1 << 20, name);   // 2^20 floats = 4 MiB, section "Local\photone.<name>"
+// tags cross processes as JSON; the names tie the Writer's and the Reader's (separately compiled) tag types together
+var tagSerializer = new JsonTagSerializer().Register<StreamFormat>("sine.format").Register<SecondMark>("sine.second");
+double nominalRate = rate > 0 ? rate : 48_000;
 
-Console.WriteLine($"writer  : {buffer.Name}  capacity={buffer.Capacity:N0} floats ({buffer.DataBytes / 1024 / 1024} MiB)  base=0x{buffer.BaseAddress:X}  pid={Environment.ProcessId}");
+// ---- the API sketch, writer side ----------------------------------------------------------------
+using RingBuffer<float> buffer = RingBuffer<float>.Create(1 << 20, name,     // 2^20 floats = 4 MiB, section "Local\photone.<name>"
+    new RingBufferOptions { TagCapacity = 1 << 16, TagSerializer = tagSerializer });
+
+Console.WriteLine($"writer  : {buffer.Name}  capacity={buffer.Capacity:N0} floats ({buffer.DataBytes / 1024 / 1024} MiB)  tags={buffer.TagCapacity / 1024} KiB  base=0x{buffer.BaseAddress:X}  pid={Environment.ProcessId}");
 Console.WriteLine($"          rate={rate:N0} samples/s ({(rate == 0 ? "unpaced" : "paced")}); start readers now; Ctrl+C stops");
 
+const double LowTone = 440.0;
 using (var bucket = buffer.GetBucket(1024))      // blocks if there is no space for 1024 elements (never with zero readers)
 {
     bucket.Span.Fill(0);                          // Span<float> of length 1024, contiguous even across the ring's end (double mapping)
+    bucket.AddTag(new StreamFormat { Offset = bucket.StartOffset, SampleRate = nominalRate, Frequency = LowTone });   // published with the elements
     bucket.Commit(1000);                          // publish the first 1000 elements only (a bucket may commit less than requested)
 }
 
@@ -48,8 +56,9 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 const int BucketSize = 1024;
-const double Frequency = 440.0;
-double phaseStep = 2 * Math.PI * Frequency / (rate > 0 ? rate : 48_000);
+long samplesPerSecond = (long)nominalRate;
+double frequency = LowTone;
+double phaseStep = 2 * Math.PI * frequency / nominalRate;
 double phase = 0;
 long written = 1000;
 var clock = Stopwatch.StartNew();
@@ -60,6 +69,21 @@ while (!cts.IsCancellationRequested)
 {
     using (var bucket = buffer.GetBucket(BucketSize))                 // back-pressure: waits (spin, then kernel) for the slowest reader
     {
+        long second = written / samplesPerSecond;
+        double tone = second / 10 % 2 == 0 ? LowTone : 2 * LowTone;
+        if (tone != frequency)
+        {
+            frequency = tone;
+            phaseStep = 2 * Math.PI * frequency / nominalRate;
+            bucket.AddTag(new StreamFormat { Offset = bucket.StartOffset, SampleRate = nominalRate, Frequency = frequency });   // persistent: readers keep the last one
+        }
+
+        long nextSecond = (second + 1) * samplesPerSecond;
+        if (nextSecond < written + BucketSize)
+        {
+            bucket.AddTag(new SecondMark { Offset = (ulong)nextSecond, Second = second + 1 });
+        }
+
         Span<float> span = bucket.Span;
         for (int i = 0; i < span.Length; i++)
         {
@@ -104,3 +128,27 @@ while (!cts.IsCancellationRequested)
 }
 
 Console.WriteLine($"closing after {written:N0} samples; readers drain what is left and then see Status == WriterClosed");
+
+/// <summary>Persistent: the format in effect from <see cref="Offset"/> on. A reader that joins later still gets the last one (ReadLastTagValues).</summary>
+public sealed class StreamFormat : ITag
+{
+    public static bool IsPersistent => true;
+
+    public ulong Offset { get; set; }
+
+    public string Key => "format";
+
+    public double SampleRate { get; set; }
+
+    public double Frequency { get; set; }
+}
+
+/// <summary>Marks the first sample of a second of stream time.</summary>
+public sealed class SecondMark : ITag
+{
+    public ulong Offset { get; set; }
+
+    public string Key => "second";
+
+    public long Second { get; set; }
+}

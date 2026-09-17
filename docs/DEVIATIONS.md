@@ -188,3 +188,27 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
 
 41. **Benchmarks:** `--latency` (paced delivery latency and reader CPU from cycle counts); `TieredCompilationQuickJitForLoops=false` in the
     benchmark project, so measurement loops never hit an on-stack-replacement compile inside a measured window.
+
+## Stream tags (see DESIGN §16)
+
+42. **Layout version 3; the data no longer starts at a fixed offset** (DESIGN §4: `DataOffset = 65536`, `HeaderViewBytes = 65536`). The tag area sits between
+    the control view and the data, so `DataOffset` = G = 64 KiB + tag area, `MirroredSection` maps a header view of G bytes, and the pool's size class is
+    (G, D). A buffer without tags has the version-2 layout apart from the version number; version-2 peers are refused as before.
+
+43. **Line 2 holds `TagEnd` next to `WriteCursor`** (DESIGN §4.1: nothing else on the write cursor's line). Stored by the writer immediately before the write
+    cursor, only on commits that carry tags, and loaded by readers immediately after it; `LayoutTests` allows exactly this field.
+
+44. **`WaitForSpace(count)` became `WaitForMin(target)`** (DESIGN §5.3). The writer waits for the minimum reader cursor to reach a target: `E + count - C` for
+    a bucket (the same condition as before), or a tag record's write cursor + 1 for a commit whose tags do not fit. Only a tag wait runs the deadlock check
+    that throws `TagLogFullException`.
+
+45. **The requested tag API, adjusted** (DESIGN §16.1): `ITag.IsPersistent` is `static virtual` with a default of `false` (a `static abstract` member would make
+    `ReadOnlyMemory<ITag>` illegal, CS8920); `ReadLastTagValues` returns `IReadOnlyDictionary<string, ITag>`; a chunk's tags are the tags of its own elements
+    (`StartOffset <= Offset < StartOffset + Length`, not every tag at or after the start); `StartOffset` is added to `Chunk` and `Bucket`.
+
+46. **Join step (f): the start cursor is published with a full fence and a waiting writer is woken** (DESIGN §5.6 ended with the plain store of (d), and
+    the earlier review refuted the need for a wake). With tag waits, and with a provisional cursor that a later commit left behind, a joiner can be the
+    reader a blocked writer waits for; see REVIEW-NOTES T4.
+
+47. **Dispose waits for a commit with tags** (DESIGN §5.8 dropped an outstanding bucket right away). `CloseWriter` loads `_committing` after the fenced
+    `_disposed` store and, while a commit with tags runs, wakes the writer and waits, so the two never run `EndWrite` at once (REVIEW-NOTES T1).

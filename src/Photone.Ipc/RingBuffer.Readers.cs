@@ -90,7 +90,27 @@ public sealed unsafe partial class RingBuffer<T>
                 RingReader<T>? reader = null;
                 try
                 {
-                    reader = new RingReader<T>(this, i, active, w2, options);
+                    long start = w2;
+                    TagReader? tags = null;
+                    if (_tagLogBytes != 0)
+                    {
+                        // (e) the tag snapshot, taken with the cursor published: the last persistent tag per key, and where this reader's tags start;
+                        // the start cursor is w2, or the snapshot's newer write cursor (a monotone bump) (DESIGN §16.5)
+                        tags = TagReader.Join(_hdr, TagState, _tagStateBytes, TagLog, _tagLogBytes, _options.TagSerializer, w2, out start);
+                    }
+
+                    // (f) publish the start cursor with a full fence, then look for a writer waiting on this reader. Its scan may have seen the
+                    // provisional cursor of (a), which a commit since then can leave below its target (for space, or for tag space, whose target
+                    // can be as high as W), while (d) and the bump store more without waking it; a slow tag join may also have held it back.
+                    // Fenced store then flag load pairs with the writer's flag store then cursor scan (Dekker), as in Advance.
+                    Interlocked.Exchange(ref s.ReadCursor, start);
+                    if (Volatile.Read(ref Hdr.WriterWaiting) != 0 && start >= Volatile.Read(ref Hdr.WriterWaitFor)
+                        && Interlocked.Exchange(ref Hdr.WriterWaiting, 0) == 1)
+                    {
+                        _backend.WakeWriter();
+                    }
+
+                    reader = new RingReader<T>(this, i, active, start, options, tags);
                     handedOver = true;                                                      // from here on the reader releases the reference (Dispose / finalizer)
                     reader.ResolveWriterProcess();
                     return reader;

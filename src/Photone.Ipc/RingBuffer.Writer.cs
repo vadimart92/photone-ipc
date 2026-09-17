@@ -10,6 +10,8 @@ namespace Photone.Ipc;
 public sealed unsafe partial class RingBuffer<T>
 {
     private static readonly TimeSpan s_rescanInterval = TimeSpan.FromMicroseconds(1);
+    private static readonly TimeSpan s_tagDeadlockTimeout = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan s_tagDeadlockCheckInterval = TimeSpan.FromMilliseconds(1);
 
     // writer-local state (DESIGN §5 notation): _w == W, _e = reserve end (authoritative), _min = cached minimum reader cursor
     private long _w;
@@ -148,7 +150,7 @@ public sealed unsafe partial class RingBuffer<T>
             _min = ScanMin();
             if (_capacity - (_e - _min) < count)
             {
-                WaitForSpace(count);
+                WaitForMin(_e + count - _capacity);                 // the min reader cursor that frees `count` elements
             }
         }
         finally
@@ -173,6 +175,12 @@ public sealed unsafe partial class RingBuffer<T>
             }
 
             throw new InvalidOperationException("The bucket is no longer outstanding (the writer was disposed).");
+        }
+
+        if (_tagWork)
+        {
+            EndWriteWithTags(count);                                // DESIGN §16.4: tags before the write cursor, the snapshot after it, Dispose kept out
+            return;
         }
 
         _w += count;
@@ -247,11 +255,17 @@ public sealed unsafe partial class RingBuffer<T>
         }
     }
 
-    /// <summary>Two-phase wait for free space: spin for the adaptive budget (rescanning every ~1 µs), then block; a blocked wait feeds the policy.</summary>
-    private void WaitForSpace(int count)
+    /// <summary>
+    /// Two-phase wait until the minimum reader cursor reaches <paramref name="target"/> (free space for a bucket, or a tag record the readers passed): spin for
+    /// the adaptive budget (rescanning every ~1 µs), then block; a blocked wait feeds the policy.
+    /// </summary>
+    /// <param name="target">The minimum reader cursor to wait for.</param>
+    /// <param name="tagWait">A commit waits for tag space: fail with <see cref="TagLogFullException"/> when the wait can never end (DESIGN §16.4).</param>
+    private void WaitForMin(long target, bool tagWait = false)
     {
         long start = Stopwatch.GetTimestamp();
-        if (SpinForSpace(count, start, _spaceSpin.Window))
+        long stuckSince = 0;
+        if (SpinForMin(target, start, _spaceSpin.Window, tagWait, ref stuckSince))
         {
             if (_spaceSpin.IsAdaptive)
             {
@@ -261,11 +275,11 @@ public sealed unsafe partial class RingBuffer<T>
             return;
         }
 
-        BlockForSpace(count);
+        BlockForMin(target, tagWait, ref stuckSince);
         _spaceSpin.OnSatisfied(Stopwatch.GetTimestamp() - start);
     }
 
-    private bool SpinForSpace(int count, long start, long budget)
+    private bool SpinForMin(long target, long start, long budget, bool tagWait, ref long stuckSince)
     {
         if (budget <= 0)
         {
@@ -274,7 +288,9 @@ public sealed unsafe partial class RingBuffer<T>
 
         long end = budget >= long.MaxValue - start ? long.MaxValue : start + budget;
         long rescan = SpinClock.ToTicks(s_rescanInterval);
+        long deadlockCheck = SpinClock.ToTicks(s_tagDeadlockCheckInterval);
         long lastScan = start;
+        long lastDeadlockCheck = start;
         int i = 0;
         while (true)
         {
@@ -289,7 +305,7 @@ public sealed unsafe partial class RingBuffer<T>
             {
                 lastScan = now;
                 _min = ScanMin();
-                if (_capacity - (_e - _min) >= count)
+                if (_min >= target)
                 {
                     return true;
                 }
@@ -297,6 +313,12 @@ public sealed unsafe partial class RingBuffer<T>
                 if (Volatile.Read(ref _disposed) != 0)
                 {
                     return false;
+                }
+
+                if (tagWait && now - lastDeadlockCheck >= deadlockCheck)
+                {
+                    lastDeadlockCheck = now;
+                    CheckTagDeadlock(target, ref stuckSince);       // also while spinning: with an unbounded spin budget the kernel phase never comes
                 }
             }
 
@@ -307,10 +329,9 @@ public sealed unsafe partial class RingBuffer<T>
         }
     }
 
-    private void BlockForSpace(int count)
+    /// <summary>Kernel phase of <see cref="WaitForMin"/>: the target stays fixed for the episode; the caller holds a local reference.</summary>
+    private void BlockForMin(long target, bool tagWait, ref long stuckSince)
     {
-        long target = _e + count - _capacity;                       // min reader cursor that frees `count` elements (fixed for this episode)
-
         // phase 2: kernel (the caller holds a local ref: the mapping stays valid even if Dispose runs on another thread)
         _counters.KernelWaits++;
         Volatile.Write(ref Hdr.WriterWaitSinceTick, Kernel.GetTickCount64());
@@ -318,7 +339,7 @@ public sealed unsafe partial class RingBuffer<T>
         {
             ThrowIfDisposed();                                      // Dispose (any thread) wakes us via WakeWriter and we leave here
             RefreshLaggards(target);                                // every Active blocker gets a validated process handle (or poll mode); dead ones evicted now
-            if (_capacity - (_e - _min) >= count)                   // RefreshLaggards rescanned and may have evicted
+            if (_min >= target)                                     // RefreshLaggards rescanned and may have evicted
             {
                 return;
             }
@@ -327,7 +348,7 @@ public sealed unsafe partial class RingBuffer<T>
             _backend.OnWriterBlocking(_hdr);
             Interlocked.Exchange(ref Hdr.WriterWaiting, 1);         // publish intent [full fence]
             _min = ScanMin();                                       // re-check AFTER the fence (Dekker)
-            if (_capacity - (_e - _min) >= count)
+            if (_min >= target)
             {
                 Interlocked.Exchange(ref Hdr.WriterWaiting, 0);
                 return;
@@ -346,6 +367,11 @@ public sealed unsafe partial class RingBuffer<T>
                     continue;
                 case WaitOutcome.Timeout:
                     SweepLaggards();
+                    if (tagWait)
+                    {
+                        CheckTagDeadlock(target, ref stuckSince);
+                    }
+
                     continue;
                 default:
                     int err = Kernel.LastError();
@@ -353,6 +379,56 @@ public sealed unsafe partial class RingBuffer<T>
                     throw Kernel.Fail("WaitForMultipleObjects", err, "writer waiting for space");
             }
         }
+    }
+
+    /// <summary>
+    /// A commit waiting for tag space can wait forever: when every reader below <paramref name="target"/> is blocked waiting for a write cursor beyond the
+    /// published one, nobody can move until this commit publishes, and it cannot publish until they move. Such a reader leaves the state only by a timeout,
+    /// a cancellation or its disposal, so the state has to persist for <see cref="s_tagDeadlockTimeout"/> before the commit gives up.
+    /// </summary>
+    private void CheckTagDeadlock(long target, ref long stuckSince)
+    {
+        if (!AllTagHoldersWaitForData(target))
+        {
+            stuckSince = 0;
+            return;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        if (stuckSince == 0)
+        {
+            stuckSince = now;
+        }
+        else if (now - stuckSince >= SpinClock.ToTicks(s_tagDeadlockTimeout))
+        {
+            throw new TagLogFullException(
+                $"The tags of this commit do not fit in the tag log ({_tagLogBytes} bytes), and every reader that holds older tags has been waiting for more elements than "
+                + $"are published (write cursor {_w}) for {s_tagDeadlockTimeout.TotalSeconds:0.#} s. Increase RingBufferOptions.TagCapacity, or wait for fewer elements at a time. "
+                + "The bucket was dropped.");
+        }
+    }
+
+    private bool AllTagHoldersWaitForData(long target)
+    {
+        ulong waiters = Volatile.Read(ref Hdr.WaitersMask);
+        bool any = false;
+        for (int i = 0; i < Layout.MaxReaders; i++)
+        {
+            ref ReaderSlot s = ref Slot(i);
+            if (SlotWord.State(Volatile.Read(ref s.Word)) != SlotState.Active || Volatile.Read(ref s.ReadCursor) >= target)
+            {
+                continue;
+            }
+
+            if ((waiters & (1UL << i)) == 0 || Volatile.Read(ref s.WaitFor) <= _w)
+            {
+                return false;                                       // this reader can still read and advance
+            }
+
+            any = true;
+        }
+
+        return any;
     }
 
     /// <summary>Rebuilds the set of blocking readers (<c>ReadCursor &lt; target</c>) with validated process handles; evicts provably dead ones.</summary>
@@ -463,6 +539,8 @@ public sealed unsafe partial class RingBuffer<T>
     /// <summary>
     /// Drops the outstanding bucket, publishes <c>Closed</c>, wakes every reader (DESIGN §5.8) and a writer thread blocked in
     /// <see cref="GetBucket"/> (it then throws <see cref="ObjectDisposedException"/>). Idempotent.
+    /// A commit with tags running on another thread (possibly waiting for tag space) is let finish first: it completes, or it sees
+    /// <c>_disposed</c> and gives up, and only then is the bucket dropped here (DESIGN §16.4).
     /// </summary>
     private void CloseWriter()
     {
@@ -471,9 +549,21 @@ public sealed unsafe partial class RingBuffer<T>
             return;
         }
 
+        while (Volatile.Read(ref _committing) != 0)                // after the fenced _disposed store (Dekker pair with EndWriteWithTags)
+        {
+            _backend.WakeWriter();                                  // a commit waiting for tag space wakes, sees _disposed and leaves
+            Thread.Sleep(1);
+        }
+
         if (_outstanding)
         {
             _closedWithBucket = true;                               // its span may still be in use on another thread: the mapping is never pooled (ReleaseNative)
+            if (_tagWork)
+            {
+                _tagWriter!.ClearPending();                         // the bucket's tags go with it
+                _tagWork = false;
+            }
+
             EndWrite(0);
         }
 

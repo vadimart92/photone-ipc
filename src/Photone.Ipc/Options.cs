@@ -1,3 +1,5 @@
+using Photone.Ipc.Internal;
+
 namespace Photone.Ipc;
 
 /// <summary>Options for <see cref="RingBuffer{T}.Create"/> and <see cref="RingBuffer{T}.Open(string, RingBufferOptions?)"/>.</summary>
@@ -32,6 +34,25 @@ public sealed class RingBufferOptions
     /// <see langword="null"/> (default) = every buffer maps and unmaps its own section.
     /// </summary>
     public RingBufferPool? Pool { get; init; }
+
+    /// <summary>
+    /// Creator only: bytes of tag records that can be written but not yet read past by the slowest reader (rounded up to a power of two, at least 4 KiB).
+    /// 0 (default) = the buffer carries no tags. A commit whose tags do not fit waits, like <see cref="RingBuffer{T}.GetBucket"/> waits for space, until the
+    /// slowest reader has read past older tags. See <see cref="Bucket{T}.AddTag{TTag}"/>.
+    /// </summary>
+    public long TagCapacity { get; init; }
+
+    /// <summary>
+    /// Creator only: bytes for the last persistent tag of every key (the state a joining reader starts from, see <see cref="ITag.IsPersistent"/>).
+    /// Used only with <see cref="TagCapacity"/> &gt; 0; the tag area is rounded up to 64 KiB and the slack goes here. Default 16 KiB.
+    /// </summary>
+    public int PersistentTagCapacity { get; init; } = TagFormat.DefaultStateBytes;
+
+    /// <summary>
+    /// How this process turns tags into bytes and back (writer and readers). <see langword="null"/> (default): the writer cannot add tags, and readers
+    /// deliver every tag as an <see cref="UnknownTag"/>. Typically <c>new JsonTagSerializer().Register&lt;MyTag&gt;()</c>.
+    /// </summary>
+    public ITagSerializer? TagSerializer { get; init; }
 
     internal static readonly RingBufferOptions Default = new();
 }

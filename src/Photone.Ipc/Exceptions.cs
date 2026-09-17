@@ -124,6 +124,29 @@ public sealed class RingBufferInitializationException : PhotoneIpcException
     }
 }
 
+/// <summary>
+/// A commit's tags cannot fit in the tag log: every reader that has not read past the older tags has been blocked for a second waiting for more elements
+/// than are published, while the commit waits for those readers to move on. The tag log is too small for the tags of the chunks the readers wait for
+/// (<see cref="RingBufferOptions.TagCapacity"/>). The bucket is dropped: nothing of it was published.
+/// </summary>
+public sealed class TagLogFullException : PhotoneIpcException
+{
+    /// <inheritdoc cref="PhotoneIpcException()"/>
+    public TagLogFullException()
+    {
+    }
+
+    /// <inheritdoc cref="PhotoneIpcException(string)"/>
+    public TagLogFullException(string message) : base(message)
+    {
+    }
+
+    /// <inheritdoc cref="PhotoneIpcException(string, Exception)"/>
+    public TagLogFullException(string message, Exception innerException) : base(message, innerException)
+    {
+    }
+}
+
 /// <summary>All reader slots are active (after a dead-slot sweep).</summary>
 public sealed class TooManyReadersException : PhotoneIpcException
 {

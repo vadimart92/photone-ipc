@@ -11,6 +11,8 @@ shared memory, with one writer and up to 32 independent readers in any number of
   or closed writer makes every reader's `Wait` return `false` with a `Status`.
 * The signaling mechanism (how a blocked side is woken) is an isolated, swappable layer; the shared-memory layout reserves the words that
   alternative mechanisms need, so switching it never changes the layout.
+* Stream tags: the writer attaches serialized metadata (JSON by default) to elements; every reader gets the tags of each chunk it reads, and the
+  last value of every persistent tag, even when it joins long after the tag was written. Opt-in per buffer.
 
 Requirements: Windows 10 1803+ (`VirtualAlloc2` / `MapViewOfFile3`), x64, .NET 10 (C# 14). Zero package dependencies in the library.
 
@@ -53,12 +55,80 @@ Semantics in one table:
 | `RingBuffer.Dispose()` (writer) | commits `0` for an outstanding bucket, publishes *Closed*, wakes every reader; readers keep draining |
 | `RingReader.Dispose()` | releases the slot, wakes a blocked writer, completes a pending `Wait` with `ObjectDisposedException` |
 | `RingBufferOptions.Pool` | `Create`/`Open` take the shared memory from a `RingBufferPool` and give it back on release (see below) |
+| `Bucket.AddTag(tag)` | attaches a tag to the element at `tag.Offset` (inside the bucket); published by `Commit` with the elements (see "Stream tags") |
+| `Chunk.Tags` | the tags of the chunk's elements, in offset order |
+| `RingReader.ReadLastTagValues()` | the last persistent tag of every key before `ReadCursor` |
 
-Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true, Pool = null }`,
+Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true, Pool = null, TagCapacity = 0, PersistentTagCapacity = 16 KiB, TagSerializer = null }`,
 `ReaderOptions { SpinTime = 20 µs, MaxSpinTime = null, AsyncSpinTime = 5 µs, AllowSynchronousContinuations = true }`,
 `RingBufferPoolOptions { IdleTimeout = 30 s, MaxIdleBytes, ClearOnReuse = false }`. The spin budget adapts between
 zero and `MaxSpinTime` (default: `SpinTime`) from the gaps actually observed; `Timeout.InfiniteTimeSpan` never touches the kernel (one busy core
 per waiting side); `TimeSpan.Zero` blocks immediately. See "Waiting: latency versus CPU".
+
+### Stream tags
+
+Metadata that belongs to particular elements (a burst start, a timestamp, a change of sample rate) travels with the data. The writer attaches tags to
+the elements of a bucket; a reader gets, with every chunk, the tags of exactly that chunk's elements. A tag type that is *persistent* describes state:
+the reader can ask for the last one of every key at any time, including right after it joined, long after the tag was written.
+
+```csharp
+public sealed class SampleRate : ITag                 // any serializable type; the reader's process needs a type of the same shape
+{
+    public static bool IsPersistent => true;          // state: ReadLastTagValues keeps the last one per key
+    public ulong Offset { get; set; }                 // the absolute element index the tag belongs to
+    public string Key => "sample_rate";
+    public double Hz { get; set; }
+}
+
+// writer process: tags are opt-in per buffer
+var writerOptions = new RingBufferOptions { TagCapacity = 1 << 20, TagSerializer = new JsonTagSerializer() };
+using var buffer = RingBuffer<float>.Create(1 << 20, "sdr", writerOptions);
+using (var bucket = buffer.GetBucket(1024))
+{
+    Fill(bucket.Span);
+    bucket.AddTag(new SampleRate { Offset = bucket.StartOffset, Hz = 48_000 });   // serialized now
+    bucket.Commit(1024);                                                           // published with the elements
+}
+
+// reader process: register the tag types this process wants back as objects
+var tags = new JsonTagSerializer().Register<SampleRate>();
+using var opened = RingBuffer<float>.Open("sdr", new RingBufferOptions { TagSerializer = tags });
+using var reader = opened.CreateReader();
+var rate = reader.ReadLastTagValues().GetValueOrDefault("sample_rate") as SampleRate;   // the rate in effect where the reader starts
+reader.TryRead(100, out var chunk);
+foreach (ITag tag in chunk.Tags.Span) { }             // StartOffset <= tag.Offset < StartOffset + Length, in offset order
+reader.Advance(100);                                  // passing a persistent tag makes it the key's last value
+```
+
+* **Opt-in and sizing.** `TagCapacity` (creator) is the tag log in bytes: tags that are written but not yet read past by the slowest reader. 0, the
+  default, means no tags, and the buffer is laid out and behaves exactly as before. `PersistentTagCapacity` (default 16 KiB) holds the last persistent tag
+  of every key. `AddTag` throws when a bucket's tags could not fit.
+* **Exactly once, never early.** `chunk.Tags` holds the tags of the chunk's elements; `ReadLastTagValues()` holds the persistent tags *before*
+  `ReadCursor`. A tag is either ahead of the reader (it arrives in a chunk) or behind it (it is state), never both. `Commit(k)` publishes the tags of the
+  first `k` elements and drops the rest with the dropped elements; tags may be added in any order.
+* **Serialization.** `JsonTagSerializer` writes each tag's JSON with its type name (default: the full type name) next to the key, the offset and the
+  persistent flag. A reader turns a tag back into an object when a type is registered under that name in its own process, and otherwise delivers an
+  `UnknownTag` with the raw JSON (also when deserialization throws, with the exception). The parameterless constructor uses reflection; for trimming or
+  native AOT, pass `JsonSerializerOptions` with a source-generated resolver. `ITagSerializer` is the extension point for other formats.
+* **Back-pressure.** A commit whose tags do not fit waits, like `GetBucket` waits for space, until the slowest reader has read past older tags. Size the
+  log for the lag you allow, and at least for the tags of the largest chunk a reader waits for: when every reader that holds old tags is itself blocked
+  waiting for more elements than are published, nobody can move, and the commit throws `TagLogFullException` after one second instead of hanging.
+  `Dispose` on another thread ends a commit that waits for tag space with `ObjectDisposedException`, as it does for a blocked `GetBucket`.
+
+What tags cost (BenchmarkDotNet, one thread, buckets of 256 floats, payload untouched; `TagBenchmarks` and `HotPathBenchmarks.WriteRead_Protocol`,
+the base commit built in a second worktree and run interleaved with this one on the same laptop):
+
+| round (GetBucket + Commit + TryRead + Advance) | mean | allocated |
+|---|---:|---:|
+| buffer without tags, before tags existed (base commit) | 18.9-19.9 ns | 0 |
+| buffer without tags, now | 19.9-20.7 ns (about +1 ns) | 0 |
+| tag area configured, no tag published | 19.2 ns (no tag area in the same run: 17.9 ns) | 0 |
+| one non-persistent tag per bucket, end to end | 926 ns | 128 B |
+| one persistent tag per bucket, end to end | 1,113 ns | 96 B |
+| for reference: `JsonTagSerializer` serialize + deserialize of that tag alone | 577 ns | 128 B |
+
+The allocation is the deserialized tag object; JSON is about 60% of a tag's cost. A buffer that carries sparse tags pays one compare per round and a
+load of `TagEnd` per new write cursor between them. A binary `ITagSerializer` would remove most of the per-tag cost.
 
 ### Many buffers: `RingBufferPool`
 
@@ -105,7 +175,8 @@ as a reader, reads one element and releases it. What remains with a pool is the 
 
 ## How cross-process zero-copy works
 
-One pagefile-backed section of `64 KiB + D` bytes holds a 4 KiB control block (cursors, reader slots) followed by the data. Every process
+One pagefile-backed section of `64 KiB + D` bytes holds a 4 KiB control block (cursors, reader slots) followed by the data (a buffer with tags has
+its tag area between the two, and the first view grows by that much; the diagram shows a buffer without tags). Every process
 reserves **one placeholder** of `64 KiB + 2·D` with `VirtualAlloc2(MEM_RESERVE | MEM_RESERVE_PLACEHOLDER)`, splits it twice with
 `VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`, and replaces the three pieces with three `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`
 views of the same section. The data range is mapped *twice*, back to back:
@@ -338,7 +409,7 @@ Reading it:
 
 ```
 dotnet build E:\GitHub\photone-ipc\Photone.Ipc.slnx -c Release
-dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 328 tests, ~30 s
+dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 366 tests, ~33 s
 
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]
@@ -381,3 +452,6 @@ Repository layout: `src/Photone.Ipc` (library), `tests/` (xunit.v3 tests + test 
 * Cross-user / cross-session sharing (`Global\`) works but is untested beyond name handling; liveness falls back to polling when a peer's
   process handle cannot be opened.
 * Named events are the only signaling backend today; `--backend` switching in the harness arrives with the second backend.
+* Tags allocate (serialization, one object per tag per reader); only the element path is allocation-free. The tags of one bucket must fit in the tag
+  log, and the last persistent tag of every key in the persistent-tag table. A reader that polls or spins, instead of blocking, for more elements than
+  are published while the tag log is full stalls the writer without a `TagLogFullException`.

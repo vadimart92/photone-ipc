@@ -1,6 +1,7 @@
 // Photone.Ipc sample: READER. Opens the ring buffer created by the Writer sample (by name, from another process),
 // consumes the float stream and prints statistics once per second. Start as many instances as you like (up to 32):
 // every reader has its own cursor and sees the whole stream (broadcast, zero-copy, true shared memory).
+// It also follows the Writer's stream tags: the format in effect when it joins, format changes and per-second marks as it reads.
 //
 //   dotnet run --project samples/Photone.Ipc.Samples.Reader -c Release [-- --name sine]
 
@@ -19,13 +20,16 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
+// the same tag names as the Writer: this process's own StreamFormat / SecondMark types receive the Writer's tags
+var tagSerializer = new JsonTagSerializer().Register<StreamFormat>("sine.format").Register<SecondMark>("sine.second");
+
 // ---- open (retry until the writer exists) --------------------------------------------------------
 RingBuffer<float> buffer;
 while (true)
 {
     try
     {
-        buffer = RingBuffer<float>.Open(name);
+        buffer = RingBuffer<float>.Open(name, new RingBufferOptions { TagSerializer = tagSerializer });
         break;
     }
     catch (RingBufferNotFoundException)
@@ -42,6 +46,10 @@ using (buffer)
     // ---- the API sketch, reader side -------------------------------------------------------------
     using var reader = buffer.CreateReader();                   // independent cursor; starts at the current head of the stream
     Console.WriteLine($"          slot={reader.Slot}  cursor={reader.ReadCursor:N0}  (Ctrl+C stops)");
+    if (reader.ReadLastTagValues().GetValueOrDefault("format") is StreamFormat joined)   // written long before this reader existed
+    {
+        Console.WriteLine($"          format in effect: {joined.Frequency} Hz tone at {joined.SampleRate:N0} samples/s (set at sample {joined.Offset:N0})");
+    }
 
     if (await reader.Wait(100))                                 // async wait until >= 100 elements are readable
     {
@@ -61,6 +69,7 @@ using (buffer)
     const int BlockSize = 1024;
     long consumed = 90;
     long lastConsumed = consumed;
+    long marks = 0;
     double peak = 0;
     double sumSquares = 0;
     long sumCount = 0;
@@ -87,6 +96,19 @@ using (buffer)
                 }
 
                 sumCount += span.Length;
+                foreach (ITag tag in chunk.Tags.Span)               // the tags attached to these 1024 samples, in offset order
+                {
+                    switch (tag)
+                    {
+                        case StreamFormat f:
+                            Console.WriteLine($"          format change at sample {f.Offset:N0}: {f.Frequency} Hz tone");
+                            break;
+                        case SecondMark:
+                            marks++;
+                            break;
+                    }
+                }
+
                 reader.Advance(BlockSize);
                 consumed += BlockSize;
             }
@@ -96,7 +118,8 @@ using (buffer)
             {
                 double perSec = (consumed - lastConsumed) / (now - lastReport);
                 double rms = Math.Sqrt(sumSquares / Math.Max(1, sumCount));
-                Console.WriteLine($"[{now,7:F1} s] consumed={consumed:N0}  {perSec:N0} samples/s  rms={rms:F4} peak={peak:F4}  lag={buffer.WriteCursor - reader.ReadCursor:N0}  status={reader.Status}");
+                double tone = reader.ReadLastTagValues().GetValueOrDefault("format") is StreamFormat current ? current.Frequency : double.NaN;
+                Console.WriteLine($"[{now,7:F1} s] consumed={consumed:N0}  {perSec:N0} samples/s  rms={rms:F4} peak={peak:F4}  tone={tone} Hz  seconds marked={marks}  lag={buffer.WriteCursor - reader.ReadCursor:N0}  status={reader.Status}");
                 lastReport = now;
                 lastConsumed = consumed;
                 peak = 0;
@@ -122,4 +145,28 @@ using (buffer)
     }
 
     Console.WriteLine($"done: consumed={consumed:N0}  status={reader.Status}  completed={reader.IsCompleted}");
+}
+
+/// <summary>This process's view of the Writer's "sine.format" tag (persistent).</summary>
+public sealed class StreamFormat : ITag
+{
+    public static bool IsPersistent => true;
+
+    public ulong Offset { get; set; }
+
+    public string Key => "format";
+
+    public double SampleRate { get; set; }
+
+    public double Frequency { get; set; }
+}
+
+/// <summary>This process's view of the Writer's "sine.second" tag.</summary>
+public sealed class SecondMark : ITag
+{
+    public ulong Offset { get; set; }
+
+    public string Key => "second";
+
+    public long Second { get; set; }
 }

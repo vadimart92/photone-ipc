@@ -6,6 +6,7 @@ namespace Photone.Ipc.Internal;
 /// One placeholder of <c>G + 2D</c> bytes carrying three views of one pagefile-backed section:
 /// <c>[Header (section 0..G)][Data (section G..G+D)][Mirror (section G..G+D again)]</c>, so <c>Mirror == Data + D</c>
 /// and a span starting anywhere in <c>Data</c> may run up to <c>D</c> bytes past its end without copying.
+/// <c>G</c> is the 64 KiB control view plus the tag area, if any (a multiple of 64 KiB; DESIGN §16.2).
 /// This is the ONLY code in the library that maps or unmaps memory (DESIGN §3.2–§3.5).
 /// The handle is the placeholder base; releasing it unmaps the three views (which frees the VA outright, verified) and closes the section.
 /// A pooled opener mapping may keep its views without a section handle while it is parked (<see cref="DetachSection"/>, DESIGN §15).
@@ -18,18 +19,20 @@ internal sealed unsafe class MirroredSection : SafeHandle
     private const string PoolNamePart = "photone.pool.";
 
     private SafeSectionHandle? _section;
+    private readonly nuint _headerBytes;
     private readonly nuint _dataBytes;
     private readonly byte* _header;
     private readonly byte* _data;
     private readonly bool _atRequestedAddress;
 
-    private MirroredSection(SafeSectionHandle section, nuint dataBytes, byte* basePtr, bool atRequestedAddress)
+    private MirroredSection(SafeSectionHandle section, nuint headerBytes, nuint dataBytes, byte* basePtr, bool atRequestedAddress)
         : base(invalidHandleValue: 0, ownsHandle: true)
     {
         _section = section;
+        _headerBytes = headerBytes;
         _dataBytes = dataBytes;
         _header = basePtr;
-        _data = basePtr + Layout.HeaderViewBytes;
+        _data = basePtr + headerBytes;
         _atRequestedAddress = atRequestedAddress;
         SetHandle((nint)basePtr);
     }
@@ -61,8 +64,11 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <summary>Size of the data region in bytes (a multiple of 64 KiB).</summary>
     public nuint DataBytes => _dataBytes;
 
+    /// <summary>Size of the header view <c>G</c> (the control view and the tag area; a multiple of 64 KiB).</summary>
+    public nuint HeaderBytes => _headerBytes;
+
     /// <summary>Size of the whole placeholder: <c>G + 2D</c>.</summary>
-    public nuint ReservationBytes => Layout.HeaderViewBytes + 2 * _dataBytes;
+    public nuint ReservationBytes => _headerBytes + 2 * _dataBytes;
 
     /// <summary>Placeholder base (== <see cref="Header"/>).</summary>
     public byte* Base => _header;
@@ -118,17 +124,22 @@ internal sealed unsafe class MirroredSection : SafeHandle
 
     // ------------------------------------------------------------------ sections
 
+    /// <summary>Creates a new pagefile-backed section of <c>64 KiB + dataBytes</c> bytes (no tag area).</summary>
+    public static SafeSectionHandle CreateSection(long dataBytes, string? sectionName) => CreateSection(Layout.HeaderViewBytes, dataBytes, sectionName);
+
     /// <summary>
-    /// Creates a new pagefile-backed section of <c>G + dataBytes</c> bytes (<c>PAGE_READWRITE | SEC_COMMIT</c>).
+    /// Creates a new pagefile-backed section of <c>headerBytes + dataBytes</c> bytes (<c>PAGE_READWRITE | SEC_COMMIT</c>).
     /// </summary>
+    /// <param name="headerBytes">Header view size <c>G</c>: a multiple of 64 KiB, at least 64 KiB.</param>
     /// <param name="dataBytes">Data region size; a positive multiple of 64 KiB.</param>
     /// <param name="sectionName">Already-normalised object name, or <see langword="null"/> for an anonymous section.</param>
     /// <exception cref="RingBufferAlreadyExistsException">An object with that name already exists.</exception>
-    public static SafeSectionHandle CreateSection(long dataBytes, string? sectionName)
+    public static SafeSectionHandle CreateSection(long headerBytes, long dataBytes, string? sectionName)
     {
         Kernel.EnsurePlatform();
+        ValidateHeaderBytes(headerBytes);
         ValidateDataBytes(dataBytes);
-        return CreateSectionCore(Layout.HeaderViewBytes + (ulong)dataBytes, sectionName);
+        return CreateSectionCore((ulong)headerBytes + (ulong)dataBytes, sectionName);
     }
 
     /// <summary>
@@ -238,7 +249,11 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <param name="candidates">64 KiB-aligned base addresses to try first; may be empty.</param>
     /// <exception cref="RingBufferLayoutException">The mirror does not alias the data region.</exception>
     public static MirroredSection Create(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates)
-        => Map(section, dataBytes, candidates, selfTest: true);
+        => Map(section, Layout.HeaderViewBytes, dataBytes, candidates, selfTest: true);
+
+    /// <summary><see cref="Create(SafeSectionHandle, long, ReadOnlySpan{ulong})"/> with a header view of <paramref name="headerBytes"/> (control view and tag area).</summary>
+    public static MirroredSection Create(SafeSectionHandle section, long headerBytes, long dataBytes, ReadOnlySpan<ulong> candidates)
+        => Map(section, headerBytes, dataBytes, candidates, selfTest: true);
 
     /// <summary>
     /// Opener side: reserves the placeholder (trying <paramref name="candidates"/> — normally the creator's base — then a system-chosen address)
@@ -249,15 +264,20 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <param name="candidates">64 KiB-aligned base addresses to try first; may be empty.</param>
     /// <exception cref="RingBufferLayoutException">The section is smaller than the header claims.</exception>
     public static MirroredSection Open(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates)
-        => Map(section, dataBytes, candidates, selfTest: false);
+        => Map(section, Layout.HeaderViewBytes, dataBytes, candidates, selfTest: false);
 
-    private static MirroredSection Map(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates, bool selfTest)
+    /// <summary><see cref="Open(SafeSectionHandle, long, ReadOnlySpan{ulong})"/> with a header view of <paramref name="headerBytes"/> (control view and tag area).</summary>
+    public static MirroredSection Open(SafeSectionHandle section, long headerBytes, long dataBytes, ReadOnlySpan<ulong> candidates)
+        => Map(section, headerBytes, dataBytes, candidates, selfTest: false);
+
+    private static MirroredSection Map(SafeSectionHandle section, long headerBytes, long dataBytes, ReadOnlySpan<ulong> candidates, bool selfTest)
     {
         ArgumentNullException.ThrowIfNull(section);
         try
         {
             Kernel.EnsurePlatform();
             Layout.EnsureInitialized();
+            ValidateHeaderBytes(headerBytes);
             ValidateDataBytes(dataBytes);
             if (section.IsInvalid)
             {
@@ -272,7 +292,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
                 }
             }
 
-            nuint g = Layout.HeaderViewBytes;
+            nuint g = (nuint)headerBytes;
             nuint d = (nuint)dataBytes;
             nuint total = g + 2 * d;
 
@@ -356,7 +376,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
                 throw Kernel.Fail("MapViewOfFile3", err, i switch { 0 => "header view", 1 => "data view", _ => "mirror view" });
             }
 
-            var result = new MirroredSection(section, d, basePtr, atRequested);
+            var result = new MirroredSection(section, g, d, basePtr, atRequested);
             if (selfTest)
             {
                 try
@@ -416,6 +436,14 @@ internal sealed unsafe class MirroredSection : SafeHandle
         if (!ok)
         {
             throw new RingBufferLayoutException("Mirror mismatch: the second data view does not alias the first.");
+        }
+    }
+
+    private static void ValidateHeaderBytes(long headerBytes)
+    {
+        if (headerBytes < Layout.HeaderViewBytes || headerBytes % Layout.HeaderViewBytes != 0 || headerBytes > Capacity.MaxHeaderBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(headerBytes), headerBytes, $"headerBytes must be a multiple of 65536 between 65536 and {Capacity.MaxHeaderBytes}.");
         }
     }
 

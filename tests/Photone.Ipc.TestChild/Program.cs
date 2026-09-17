@@ -35,6 +35,8 @@ internal static unsafe class Program
                 "slow-init" => SlowInit(args),
                 "hold-name" => HoldName(args),
                 "pool-reader-loop" => PoolReaderLoop(),
+                "tag-writer" => WriteTags(args),
+                "tag-reader" => ReadTags(args),
                 _ => Unknown(args[0]),
             };
         }
@@ -205,6 +207,104 @@ internal static unsafe class Program
 
         buffer.Dispose();
         Print("closed");
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ tags (DESIGN §16)
+
+    /// <summary>
+    /// <c>tag-writer &lt;name&gt; &lt;count&gt; [--tag-capacity bytes]</c>: creates a buffer with tags, prints "ready", waits for "go", writes count elements with
+    /// the <see cref="TagPlan"/> tags, prints "committed written=N tagWaits=W", disposes and prints "closed".
+    /// </summary>
+    private static int WriteTags(string[] args)
+    {
+        string name = args[1];
+        long count = long.Parse(args[2], CultureInfo.InvariantCulture);
+        long tagCapacity = 1 << 16;
+        for (int i = 3; i < args.Length; i++)
+        {
+            tagCapacity = args[i] == "--tag-capacity" ? long.Parse(args[++i], CultureInfo.InvariantCulture) : throw new ArgumentException("unknown option " + args[i]);
+        }
+
+        var options = new RingBufferOptions { TagCapacity = tagCapacity, TagSerializer = TagPlan.CreateSerializer() };
+        RingBuffer<long> buffer = RingBuffer<long>.Create(1 << 16, name, options);
+        Print(Inv($"ready pid={Environment.ProcessId} tagCapacity={buffer.TagCapacity}"));
+        string? line = Console.In.ReadLine();
+        if (line != "go")
+        {
+            Print("error expected go, got " + line);
+            return 3;
+        }
+
+        long written = TagPlan.Write(buffer, count, 128, new Random(4242));   // ~0.3 tags of ~100 bytes per element: a bucket of 128 fits a 16 KiB log easily
+        Print(Inv($"committed written={written} tagWaits={buffer.Counters.TagWaits}"));
+        buffer.Dispose();
+        Print("closed");
+        return 0;
+    }
+
+    /// <summary>
+    /// <c>tag-reader &lt;name&gt; &lt;count&gt;</c>: opens the buffer, joins, checks <c>ReadLastTagValues</c> at the start cursor against the plan and prints
+    /// "ready cursor=R stateKeys=K", then reads count elements in random chunks, checking data, tags and state after every advance; prints "done ok tags=T"
+    /// or "mismatch ...".
+    /// </summary>
+    private static int ReadTags(string[] args)
+    {
+        string name = args[1];
+        long count = long.Parse(args[2], CultureInfo.InvariantCulture);
+        using RingBuffer<long> buffer = RingBuffer<long>.Open(name, new RingBufferOptions { TagSerializer = TagPlan.CreateSerializer() });
+        using RingReader<long> reader = buffer.CreateReader();
+        IReadOnlyDictionary<string, ITag> start = reader.ReadLastTagValues();
+        string? error = TagPlan.CheckState(start, reader.ReadCursor);
+        if (error is not null)
+        {
+            Print("mismatch " + error);
+            return 4;
+        }
+
+        Print(Inv($"ready cursor={reader.ReadCursor} stateKeys={start.Count}"));
+        var rng = new Random(99);
+        long remaining = count;
+        long tags = 0;
+        while (remaining > 0)
+        {
+            if (!reader.WaitSync(1))
+            {
+                Print(Inv($"eof status={reader.Status} remaining={remaining}"));
+                return 3;
+            }
+
+            int n = (int)Math.Min(Math.Min(remaining, reader.Available), rng.Next(1, 700));
+            if (!reader.TryRead(n, out Chunk<long> chunk))
+            {
+                Print("error TryRead returned false");
+                return 3;
+            }
+
+            error = TagPlan.CheckChunk(chunk);
+            if (error is not null)
+            {
+                Print("mismatch " + error);
+                return 4;
+            }
+
+            tags += chunk.Tags.Length;
+            int advance = rng.Next(3) == 0 ? rng.Next(1, n + 1) : n;
+            reader.Advance(advance);
+            if (tags % 7 == 0 || remaining - advance <= 0)
+            {
+                error = TagPlan.CheckState(reader.ReadLastTagValues(), reader.ReadCursor);
+                if (error is not null)
+                {
+                    Print("mismatch " + error);
+                    return 4;
+                }
+            }
+
+            remaining -= advance;
+        }
+
+        Print(Inv($"done ok tags={tags} cursor={reader.ReadCursor}"));
         return 0;
     }
 

@@ -587,7 +587,7 @@ The 16 TiB window `[0x4000_0000_0000, 0x5000_0000_0000)` is far from heaps/DLLs/
 
 ## 4. Shared-memory layout (`Internal\Layout.cs`)
 
-Constants: `Magic = 0x31454E4F544F4850` ("PHOTONE1" LE), `Version = 2`, `ControlBytes = 4096`, `HeaderViewBytes = 65536`, `DataOffset = 65536`, `MaxReaders = 32`, `SlotBase = 512`, `SlotBytes = 64`, `BackendAreaOffset = 2560`, `BackendAreaBytes = 128`.
+Constants: `Magic = 0x31454E4F544F4850` ("PHOTONE1" LE), `Version = 3` (§16), `ControlBytes = 4096`, `HeaderViewBytes = 65536` (the control view; the tag area follows it, §16.2), `MaxReaders = 32`, `SlotBase = 512`, `SlotBytes = 64`, `BackendAreaOffset = 2560`, `BackendAreaBytes = 128`.
 
 Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.SizeOf<ReaderSlot>() == 64`, every `Interlocked`/`Volatile` field offset `% 8 == 0`, `WriteCursor` offset `% 128 == 0`. All accesses go through `ref ControlBlock Hdr => ref Unsafe.AsRef<ControlBlock>(_hdr)` and `ref ReaderSlot SlotRef(int i) => ref Unsafe.AsRef<ReaderSlot>(_hdr + 512 + 64 * i)`.
 
@@ -602,7 +602,7 @@ Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.Siz
 | 20 | u32 | `MaxReaders` = 32 | 0 | | |
 | 24 | i64 | `Capacity` (C) | 0 | | |
 | 32 | i64 | `DataBytes` (D) | 0 | | |
-| 40 | i64 | `DataOffset` = 65536 | 0 | | |
+| 40 | i64 | `DataOffset` = G = 65536 + tag area (§16.2) | 0 | | |
 | 48 | u32 | `TypeHash` (FNV-1a 32 of UTF-16 `typeof(T).FullName`) | 0 | | |
 | 52 | i32 | `InitState` (0 initializing, 1 ready; `Volatile.Write` last) | 0 | creator | opener spin (acquire) |
 | 56 | u32 | `SignalBackendId` (1 = NamedEvent) | 0 | creator | opener |
@@ -614,9 +614,12 @@ Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.Siz
 | 88 | u64 | `InstanceId` (random ≠ 0; identifies the buffer: a pooled section gets a new one on every reuse) | 1 | creator | opener |
 | 96 | u64 | `ReservationBytes` = G + 2D | 1 | | diagnostics |
 | 104 | u64 | `SectionId` (random ≠ 0; identifies the section for its whole life; names the events) | 1 | creator | opener |
-| 112..127 | | reserved | 1 | | |
+| 112 | i64 | `TagLogBytes` (power of two ≥ 4 KiB; 0 = no tags, §16) | 1 | creator | opener |
+| 120 | i32 | `TagStateBytes` (persistent-tag table) | 1 | creator | opener |
+| 124..127 | | reserved | 1 | | |
 | **128** | **i64** | **`WriteCursor` (W)** | **2** | **writer, `Interlocked.Exchange` per Commit** | **readers, `Volatile.Read` (polled)** — nothing else on this line |
-| 136..191 | | reserved (never written) | 2 | | |
+| 136 | i64 | `TagEnd` (§16.4) | 2 | writer, `Volatile.Write` before `WriteCursor` on a commit that carries tags | readers, after loading `W` |
+| 144..191 | | reserved (never written) | 2 | | |
 | 192..255 | | **empty** — prefetch-pair partner of line 2 | 3 | | |
 | 256 | i64 | `ReserveEnd` (E, informational) | 4 | writer per GetBucket/Commit | diagnostics |
 | 264 | i32 | `WriterState` (0 None, 1 Active, 2 Closed) | 4 | writer | reader slow path |
@@ -639,7 +642,12 @@ Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.Siz
 | 476..511 | | reserved | 7 | | |
 | 512 + 64·i | `ReaderSlot` | `Slots[0..31]` | 8..39 | slot owner; evictor CAS | writer `ScanMin` |
 | 2560..2687 | | **SignalBackend area** (backend-private, zero for NamedEvent) | 40..41 | backends | backends |
-| 2688..4095 | | reserved (zero) | 42..63 | | |
+| 2688 | u64 | `TagVersion` (seqlock, §16.5) | 42 | writer after a commit that carries tags | joining readers |
+| 2696 | i64 | `TagSnapshotEnd` | 42 | writer (odd version) | joining readers |
+| 2704 | i64 | `TagSnapshotW` | 42 | writer (odd version) | joining readers |
+| 2712 | i32 | `TagStateUsed` | 42 | writer (odd version) | joining readers |
+| 2716 | i32 | `TagStateCount` | 42 | writer (odd version) | diagnostics |
+| 2720..4095 | | reserved (zero) | 42..63 | | |
 
 Line-pair rule (x64 adjacent-line prefetcher pairs 128-byte-aligned line pairs): lines stored on the writer's fast path (2: per Commit, 4: per GetBucket) have empty partners (3, 5), so a reader polling `W` never pulls a line the writer is about to store, and vice versa. Lines 6/7 are a pair but both change only on block/join/evict.
 
@@ -869,13 +877,21 @@ CreateReader(opts):
             Volatile.Write(ref Slot(i).ReadCursor, w2)                                             // (d) adopt the newest head (monotone bump)
             Interlocked.Or(ref Hdr.ActiveMask, 1UL << i); Interlocked.Increment(ref Hdr.ReaderGeneration)
             Interlocked.Increment(ref _localRefs)
-            var reader = new RingReader<T>(this, i, active, cursor: w2, opts)
+            start = w2; if the buffer has tags: tags = TagReader.Join(w2, out start)                  // (e) §16.5: start = max(w2, TagSnapshotW)
+            Interlocked.Exchange(ref Slot(i).ReadCursor, start)                                    // (f) publish [full fence] ...
+            if (WriterWaiting != 0 && start >= WriterWaitFor && Exchange(WriterWaiting, 0) == 1) WakeWriter()   // ... then wake a writer this join unblocked
+            var reader = new RingReader<T>(this, i, active, cursor: start, opts, tags)
             reader.ResolveWriterProcess()                                                          // §5.7 (dead-at-join / poll mode)
             return reader
         if (attempt == 0) SweepDeadSlots()                                                         // §5.7; any process may run it
     throw new TooManyReadersException()
 ```
 Why (c)/(d) (the writer never laps a joiner): the writer reserves against `_min` from some `ScanMin`. If that scan saw the slot Active it read `ReadCursor ≥ w1`, so `_min ≤ R_new`. If it did not, the scan's loads follow the full fence of the writer's last Commit (`Exchange(W)`) and the reader's load (c) follows the full fence of (b); by Dekker (c) sees the `W` store that preceded the scan, so `w2 ≥ W_at_scan ≥ every old cursor ≥ _min`. Either way `E ≤ _min + C ≤ R_new + C`. The scan reads all 32 slot words; `ActiveMask` is not load-bearing.
+
+Why (f) (post-review, 2026-09-17): a writer blocked in `BlockForMin` may have scanned the provisional cursor of (a), and a commit made after that load can
+leave it below the writer's target (a space target `E + count - C`, or a tag-space target up to `W`, §16.4), while (d) and the tag bump store more
+without waking anybody: the writer would sleep a liveness slice. The fenced store followed by the flag load is the `Advance` side of the Dekker pair
+(§5.10).
 
 ### 5.7 Liveness, eviction, dead writer
 
@@ -1499,7 +1515,7 @@ Reading the expected random 64-bit `InstanceId` through the parked views, after 
 
 ### 15.6 Expiry, bounds, disposal
 
-Idle entries (creator sections and parked opener mappings) are kept in return order. `IdleTimeout` (default 30 s; zero = keep nothing; infinite = until `Trim`/`Dispose`) is enforced by one `System.Threading.Timer` armed for the oldest entry's expiry and re-armed after every expiry pass. Nothing runs while the pool is empty, and a return never moves the wake-up earlier. The timer holds the pool through a weak reference and captures no execution context. `MaxIdleBytes` (data-region bytes, default unbounded) releases the longest-idle entries when a return exceeds it; an entry larger than the bound is released at once. Unmapping always happens outside the lock. `Trim()` releases every idle entry; `Dispose()` also stops pooling (later returns are released, `Create` with a disposed pool maps a new section every time); a pool that is never disposed releases its idle entries from its finalizer. `RingBufferPool.Shared` is a process-wide pool with the defaults whose `Dispose` only trims.
+Idle entries (creator sections and parked opener mappings) are kept in return order. `IdleTimeout` (default 30 s; zero = keep nothing; infinite = until `Trim`/`Dispose`) is enforced by one `System.Threading.Timer` armed for the oldest entry's expiry and re-armed after every expiry pass. Nothing runs while the pool is empty, and a return never moves the wake-up earlier. The timer holds the pool through a weak reference and captures no execution context. `MaxIdleBytes` (data-region and tag-area bytes, default unbounded) releases the longest-idle entries when a return exceeds it; an entry larger than the bound is released at once. Unmapping always happens outside the lock. `Trim()` releases every idle entry; `Dispose()` also stops pooling (later returns are released, `Create` with a disposed pool maps a new section every time); a pool that is never disposed releases its idle entries from its finalizer. `RingBufferPool.Shared` is a process-wide pool with the defaults whose `Dispose` only trims.
 
 ### 15.7 Limits
 
@@ -1509,3 +1525,204 @@ Idle entries (creator sections and parked opener mappings) are kept in return or
 * The pool does not isolate the users of successive buffers from each other, with or without `ClearOnReuse`: a process that mapped an earlier buffer can keep a view of the section without holding a handle (a parked opener mapping does exactly that), which the handle count cannot see, and would see the later buffers. Buffers that serve parties who must not see each other's data must not share a pool.
 * Idle memory stays committed and mostly resident; `IdleTimeout` and `MaxIdleBytes` bound it. A parked opener mapping keeps the section's pages alive in the system even after the creator's pool released its own side.
 * Only a disposed buffer returns its mapping; a finalized one does not (§15.2).
+
+## 16. Stream tags (`ITag.cs`, `JsonTagSerializer.cs`, `RingBuffer.Tags.cs`, `RingReader.Tags.cs`, `Internal\TagWriter.cs`, `Internal\TagReader.cs`, `Internal\TagFormat.cs`)
+
+Requested 2026-09-17: the writer attaches tags (messages) to elements while it writes; tags cross processes serialized (JSON for a start); a chunk
+carries the tags of its elements; a tag type declares itself persistent, and a reader can ask for the last persistent tag of every key.
+
+### 16.1 API
+
+```csharp
+public interface ITag
+{
+    static virtual bool IsPersistent => false;   // a persistent tag is state: the last one per key stays readable (ReadLastTagValues)
+    ulong Offset { get; }                        // absolute element index (Chunk.StartOffset / Bucket.StartOffset space)
+    string Key { get; }
+}
+
+var options = new RingBufferOptions { TagCapacity = 1 << 20, TagSerializer = new JsonTagSerializer() };   // writer
+using var buffer = RingBuffer<float>.Create(1 << 20, "sdr", options);
+using (var bucket = buffer.GetBucket(1024))
+{
+    bucket.AddTag(new SampleRate { Offset = bucket.StartOffset, Hz = 48_000 });   // serialized now, published by Commit
+    bucket.Commit(1024);
+}
+
+var tags = new JsonTagSerializer().Register<SampleRate>();                         // reader process
+using var opened = RingBuffer<float>.Open("sdr", new RingBufferOptions { TagSerializer = tags });
+using var reader = opened.CreateReader();
+reader.TryRead(100, out var chunk);
+foreach (ITag tag in chunk.Tags.Span) { }                                          // StartOffset <= Offset < StartOffset + Length, offset order
+reader.Advance(100);
+IReadOnlyDictionary<string, ITag> state = reader.ReadLastTagValues();              // last persistent tag per key with Offset < ReadCursor
+```
+
+| Call | Rule |
+|---|---|
+| `RingBufferOptions.TagCapacity` | creator; bytes of the tag log, rounded up to a power of two ≥ 4 KiB; **0 (default) = no tags** |
+| `RingBufferOptions.PersistentTagCapacity` | creator; bytes of the persistent-tag table (default 16 KiB), plus the slack that rounds the tag area to 64 KiB |
+| `RingBufferOptions.TagSerializer` | per process; `null`: the writer cannot add tags, readers deliver `UnknownTag`s |
+| `Bucket.AddTag<TTag>(tag)` | `StartOffset <= tag.Offset < StartOffset + Length`; `TTag` concrete (it decides persistence and the type name); serializes at once; throws if the bucket's tags exceed the log, one tag exceeds the log, or the last persistent tag of every key could exceed the table |
+| `Bucket.Commit(k)` | publishes the tags with `Offset < StartOffset + k` with the elements, drops the rest; waits while the log is full (§16.4) |
+| `Chunk.Tags` | `ReadOnlyMemory<ITag>`: the chunk's tags, in offset order, equal offsets in add order; reader-owned memory, valid until `Advance` passes it |
+| `RingReader.ReadLastTagValues()` | a copy; the last persistent tag of every key with `Offset < ReadCursor`, including tags written before the reader joined |
+| `JsonTagSerializer` | `Register<TTag>(name?)` (default name: full type name); the parameterless constructor is reflection-based (`RequiresUnreferencedCode`/`RequiresDynamicCode`); `JsonTagSerializer(JsonSerializerOptions)` with a source-generated resolver is AOT-safe |
+| `UnknownTag` | a tag whose type name the reader does not know, or whose payload failed to deserialize (`Error`); keeps `Offset`, `Key`, `Persistent`, `Payload` |
+
+Deviations from the requested sketch: `IsPersistent` is `static virtual` with a default (an interface with a `static abstract` member cannot be a type
+argument, so `ReadOnlyMemory<ITag>` would not compile); `ReadLastTagValues` returns `IReadOnlyDictionary<string, ITag>` keyed by `Key`; the chunk's
+tags are those of its own elements (`StartOffset <= Offset < StartOffset + Length`), so a tag is delivered exactly once per pass and never ahead of its
+element. `Chunk.StartOffset` / `Bucket.StartOffset` are `Cursor` as `ulong`.
+
+### 16.2 Layout (version 3)
+
+```
+ section:  [control view 64 KiB][persistent-tag table S][tag log L][data D]          G = 64 KiB + S + L = ControlBlock.DataOffset
+ views:    [header view G                               ][data D][mirror D]           (MirroredSection: the header view is G bytes)
+```
+
+`L` is a power of two ≥ 4 KiB, `S + L` a multiple of 64 KiB (`S` takes the slack). Without tags `S = L = 0` and `G = 64 KiB`: the version-2 layout apart
+from the version number. The control-block fields are in the §4.1 table (`TagLogBytes` 112, `TagStateBytes` 120, `TagEnd` 136, snapshot line 42 at
+2688). `Validate` checks `TagFormat.IsValidArea(L, S)` and `DataOffset == 64 KiB + S + L` on the peek. After mapping, `ReadTagArea` loads `L` and `S`
+once more and accepts them only if they are valid and `64 KiB + S + L` equals the header view actually mapped; the buffer keeps those values (the creator
+its own) and never reads the sizes from shared memory again, so the tag pointers stay inside the mapping whatever the header says later. A pool reuses a
+section only for the same `G` and `D`, counts `D + S + L` against `MaxIdleBytes`, and `TryRevive` compares `DataOffset` with the parked mapping.
+
+`TagEnd` shares line 2 with `WriteCursor` (the only field that does): the writer stores it right before `WriteCursor` and only on commits that carry
+tags, readers load it right after `WriteCursor`, so the line sees no traffic pattern it did not already have.
+
+### 16.3 Records
+
+One record = 24-byte `TagRecordHeader` { `RecordBytes` i32 (multiple of 8), `Flags` u16 (bit 0 persistent), `KeyBytes` u16, `Offset` u64,
+`TypeNameBytes` u16, reserved u16, `PayloadBytes` i32 } + key (UTF-8) + type name (UTF-8) + payload + zero padding. The log and the table hold the same
+records. Log positions are absolute byte counts that only grow (`TagEnd`); the physical offset is `position & (L - 1)`; a record may wrap and is
+copied in two parts (the log is not double-mapped: tags are not the zero-copy path). Records in the log are in offset order: a commit appends the
+tags of its prefix sorted by offset (stable), after every earlier commit's.
+
+### 16.4 Writer: publishing and reusing the log
+
+Writer-local (`TagWriter`): the staged records of the outstanding bucket; a queue of published records `(position, length, AppendW)` covering
+`[tail, end)`; the last persistent record of every key; the snapshot state.
+
+```
+EndWrite(k):                                                         // unchanged (§5.2) unless tags were added to the bucket:
+EndWriteWithTags(k):                                                 // NoInlining
+  Interlocked.Exchange(_committing, 1); if _disposed: throw ObjectDisposedException   // touch nothing: the closing thread drops the bucket
+  try:
+      select the staged tags with Offset < W + k, sorted by (Offset, add order)
+      if they do not fit behind [tail, end): Free(_min); if still not: MakeTagSpace   // local ref; ScanMin; Free; WaitForMin(oldest.AppendW + 1, tagWait)
+      copy them to the log at end; queue (position, length, AppendW = W); persistent ones replace their key in the table (writer-local)
+      Volatile.Write(TagEnd, end)                                    // BEFORE the write cursor
+      (on any exception: forget the staged tags, _e = W, the bucket is no longer outstanding; nothing was published)
+      W += k; Interlocked.Exchange(WriteCursor, W); signal readers (§5.2)
+      if records were appended: PublishSnapshot(W)                   // AFTER the write cursor (§16.5)
+  finally: _committing = 0
+
+Free(min): drop queued records with AppendW < min; tail = oldest remaining position (or end)
+```
+
+**Reuse rule.** The bytes of a record appended while the published write cursor was `A` may be overwritten once the minimum reader cursor exceeds `A`.
+Proof: let reader `r` not have loaded record `X` of commit `j` (`A = W(j-1)`, `W(j)` stored after `TagEnd(j)`). `r` publishes a cursor `R` only after
+`LoadTags` with `_tagLoadedW ≥ R` (§16.6), where `_tagLoadedW` is a write cursor `r` loaded before a `TagEnd` load. That `TagEnd` load did not see `X`,
+so it came before `TagEnd(j)` was stored, and so did the write-cursor load before it; that load cannot have seen `W(j)`, hence `R ≤ _tagLoadedW ≤ A`.
+A joining reader's `R ≥ w2 ≥ _min` holds as in §5.6, and its own loads follow §16.5. The cached `_min` only under-estimates. So no reader that can
+still load `X` has a cursor above `A`, and `Free` never releases bytes somebody may still read. Freeing is writer-local: nothing is published.
+
+**Waiting.** A commit whose tags do not fit waits exactly like `GetBucket` for space (`WaitForMin`: adaptive spin, then the kernel wait with the laggard
+process handles; readers' `Advance` wakes it on crossing `WriterWaitFor`). With no readers `ScanMin` returns `W`, and every published record has
+`AppendW < W` (a commit that publishes tags publishes elements), so a writer alone never waits.
+
+**The tag deadlock.** Unlike the data ring (a wait is bounded by `Capacity`, which a full ring always satisfies), the log can fill while fewer elements are
+published than a reader waits for: the reader waits for elements, the commit waits for the reader. `BlockForMin(tagWait: true)` checks on every
+liveness slice, and `SpinForMin` every millisecond (a writer with an unbounded spin budget never reaches the kernel phase), whether every reader below the
+target is parked (`WaitersMask` bit set) waiting for a write cursor beyond `W`; if that holds without interruption for 1 s the commit throws
+`TagLogFullException` and the bucket is dropped. A reader that polls or spins forever instead of parking is not detected (the writer waits, as for a
+reader that never advances). A reader parked with a timeout or a cancellation longer than 1 s counts as stuck.
+
+**Dispose during a commit with tags.** Such a commit can wait, so `Dispose` on another thread must be kept from dropping the bucket under it (both threads
+would run `EndWrite`: the write cursor could go back, the tags be lost, the mapping be released under the copy). Dekker pair: the commit stores
+`_committing = 1` with a full fence and then loads `_disposed`; `Dispose` stores `_disposed` with a full fence and then, in `CloseWriter`, loads
+`_committing`. Either the commit sees the disposal and leaves without touching anything (the closing thread drops the bucket), or `CloseWriter` sees the
+commit and waits, waking the writer every millisecond, until it has left: completed (then there is no bucket to drop), or woken by the wake and ended
+with `ObjectDisposedException` after dropping the bucket itself. `MakeTagSpace` also holds a local reference, as `SlowGetBucket` does.
+
+### 16.5 Joining readers: the snapshot
+
+After the write cursor of a commit that appended records, the writer publishes, as a seqlock:
+
+```
+PublishSnapshot(W):  Interlocked.Exchange(TagVersion, odd); [if the table changed: rewrite it, TagStateUsed, TagStateCount];
+                     TagSnapshotEnd = end; TagSnapshotW = W; Volatile.Write(TagVersion, even)
+```
+
+The odd store is fenced: a large table copy may use non-temporal stores, which are not ordered with earlier stores until they are flushed.
+
+`CreateReader` (after claim step (d), §5.6, with `w2` published as its cursor):
+
+```
+loop:
+  v1 = TagVersion; odd → back off
+  TS = TagSnapshotEnd; WS = TagSnapshotW; used = TagStateUsed; E = TagEnd
+  copy table[0, used) and log[TS, E)                                 // bounds-checked first
+  if TagVersion == v1: break                                         // stable (and malformed ⇒ RingBufferLayoutException)
+  back off (spin, yield, sleep); every 10 ms: writer closed or dead ⇒ position = TagEnd, then R = max(w2, W) (W loaded after TagEnd), no state
+R = max(w2, WS)                                                      // CreateReader then publishes R with a fence and wakes a waiting writer (§5.6 (f))
+state = the table's records; copied records with Offset < R: state (persistent ones), the rest: the first queued tags
+position = E; _tagLoadedW = R
+```
+
+Why it is exact:
+
+* **Consistent copies.** Writer stores `odd`, data, `even` in that order; the joiner loads `v1`, data, `v2`. On TSO an unchanged even version means no
+  writer store fell between the two loads.
+* **The copied log bytes are intact.** Records in `[TS, E)` belong to commits after the snapshot's commit. Their bytes are reused only by a later commit,
+  after those commits published their own snapshot, which changes the version first.
+* **Nothing is missed or doubled.** The table holds the last persistent record of every key among all records before `TS`, whose offsets are all below
+  `WS ≤ R`. Records in `[TS, E)` are split at `R`. A record after `E` belongs to a commit whose `TagEnd` store follows the joiner's `E` load, and
+  `w2` and `WS` were loaded before it, so its offset is at least `R`: `_tagLoadedW = R` is right, and so is the reuse rule for this reader.
+* **Start cursor.** `WS` is published after the write cursor, so `R ≤ W`; `R ≥ w2` keeps the claim protocol's cursor monotone.
+* **Livelock.** A retry needs another tagged commit to republish the snapshot; the copy is short (the table plus at most the records of a commit or two).
+  A join that keeps losing to tagged commits holds the writer back through its cursor `w2` until the writer waits; the join then succeeds, and its bump
+  wakes the writer (fenced cursor store, then the flag, as in `Advance`) instead of leaving it asleep for a liveness slice.
+* **Writer gone.** A writer that died inside `PublishSnapshot` leaves the version odd. The joiner starts at the final write cursor, loaded after `TagEnd`:
+  every record before that `TagEnd` with a lower offset is behind it, a record with a higher offset belongs to elements that were never published.
+
+### 16.6 Readers
+
+```
+_tagThreshold = min(_tagLoadedW, first queued Offset)                // long.MaxValue without tags
+TryRead(n): ...data as §5.4...; if _tagThreshold < R + n:
+                if no queued Offset < R + n and TagEnd == position: _tagLoadedW = _wc (inline: sparse tags, nothing new)
+                else tags = TagsForRead(R + n)
+            chunk = (span, R, tags)
+            TagsForRead(end): if _tagLoadedW < end: RefreshTags(); return first queued Offset < end ? the reader's TagReader : null
+Advance(k): ...checks...; if _tagThreshold < R + k: TagsForAdvance(R + k); then store the cursor (§5.4)
+            TagsForAdvance(R'): if _tagLoadedW < R': RefreshTags(); if first queued Offset < R': Consume(R')
+RefreshTags(): w = _wc (loaded earlier); E = TagEnd; if E != position: Load(E); _tagLoadedW = w
+Load(E): E − position > L ⇒ RingBufferLayoutException; records [position, E) → queue (Offset ≥ R) or state (defensive)
+Consume(R'): queued tags with Offset < R' leave the queue (entries are not cleared); persistent ones become the key's last value
+chunk.Tags (on access): the queued tags with Offset < StartOffset + Length
+```
+
+Loading happens at most once per new write cursor and always before the cursor store that passes the tags, which is what §16.4 relies on. Records are
+parsed in place (a wrapping record is copied first), validated (`RingBufferLayoutException` when malformed), and deserialized by the reader's
+serializer; an unknown type name or a serializer exception yields an `UnknownTag`. Records a reader has not loaded are never released (§16.4), so they span
+at most `L` bytes: a larger `TagEnd − position`, or a record longer than what remains, is corruption and is reported rather than followed (no copy can reach
+beyond the mapping). Key and type-name strings are interned per reader. The queue is never compacted in place and consumed entries are not cleared: a new
+array replaces the queue when its end is reached, so `ReadOnlyMemory<ITag>` handed out in a chunk keeps its contents, also when the reader advanced into the
+chunk only partly.
+
+Cost without tags: `_tagThreshold = long.MaxValue`, so `TryRead` and `Advance` pay one load and one compare each and never call into the tag code, and
+a chunk carries one extra reference (null); a commit tests `_tagWork` once. Measured against the base commit, interleaved: about 1 ns on a 19-20 ns
+GetBucket + Commit + TryRead + Advance round. With tags enabled and none published since the last load, a new write cursor costs an inline load of
+`TagEnd` (on the line already loaded) and two compares: 19.2 ns against 17.9 ns without a tag area in the same run. A tag costs about 0.9 µs end to end
+with `JsonTagSerializer` (0.58 µs of it JSON), 1.1 µs when persistent.
+
+### 16.7 Limits
+
+* The tags of one bucket, and every single tag, must fit in the log; the last persistent tag of every key must fit in the table (`AddTag` throws).
+* Size the log for the tags of the slowest reader's lag, and at least for the tags of the largest chunk a reader waits for (§16.4).
+* Tags allocate: serialization on the writer, one object per tag per reader, a dictionary copy per `ReadLastTagValues`. Only the element path is zero-allocation.
+* A writer that dies in the middle of `PublishSnapshot` leaves joining readers without persistent state; readers already attached keep theirs.
+* Keys and type names: at most 65535 UTF-8 bytes; log at most 1 GiB; table at most 64 MiB (plus slack).
