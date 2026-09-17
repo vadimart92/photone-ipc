@@ -12,9 +12,6 @@ internal static class Capacity
     /// <summary>Largest supported data region (1 TiB).</summary>
     public const long MaxDataBytes = 1L << 40;
 
-    /// <summary>Largest header view: the 64 KiB control view plus the largest tag area (1 GiB log, 64 MiB table, 64 KiB of rounding).</summary>
-    public const long MaxHeaderBytes = Layout.HeaderViewBytes + TagFormat.MaxLogBytes + TagFormat.MaxStateBytes + Layout.HeaderViewBytes;
-
     /// <summary>
     /// Chooses the smallest power-of-two capacity ≥ <paramref name="minCapacity"/> such that <c>capacity * elementSize</c> is a multiple of 64 KiB.
     /// </summary>

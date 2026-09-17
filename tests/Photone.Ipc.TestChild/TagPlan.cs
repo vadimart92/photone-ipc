@@ -66,10 +66,13 @@ public static class TagPlan
 
     public static double RateValue(long offset) => 1000 + offset;
 
+    /// <summary>The planned text of the label at <paramref name="offset"/>, padded with <paramref name="padding"/> dots (larger tags, same plan).</summary>
+    public static string LabelText(long offset, int padding) => "at " + offset.ToString(CultureInfo.InvariantCulture) + new string('.', padding);
+
     public static int CountAt(long offset) => (StateAt(offset) >= 0 ? 1 : 0) + (LabelAt(offset) ? 1 : 0) + (RateAt(offset) ? 1 : 0);
 
     /// <summary>Adds the planned tags of every element of <paramref name="bucket"/>; <paramref name="reverse"/> visits the offsets backwards (tags of one offset keep their order).</summary>
-    public static int AddPlannedTags(Bucket<long> bucket, bool reverse)
+    public static int AddPlannedTags(Bucket<long> bucket, bool reverse, int labelPadding = 0)
     {
         int added = 0;
         long start = bucket.Cursor;
@@ -85,7 +88,7 @@ public static class TagPlan
 
             if (LabelAt(o))
             {
-                bucket.AddTag(new LabelTag { Text = "at " + o.ToString(CultureInfo.InvariantCulture) }, (int)(o - start));
+                bucket.AddTag(new LabelTag { Text = LabelText(o, labelPadding) }, (int)(o - start));
                 added++;
             }
 
@@ -100,7 +103,7 @@ public static class TagPlan
     }
 
     /// <summary>Writes <paramref name="count"/> elements with their planned tags in random buckets; sometimes commits only a prefix (the rest is written again).</summary>
-    public static long Write(RingBuffer<long> buffer, long count, int maxBucket, Random rng)
+    public static long Write(RingBuffer<long> buffer, long count, int maxBucket, Random rng, int labelPadding = 0)
     {
         long written = 0;
         while (written < count)
@@ -113,7 +116,7 @@ public static class TagPlan
                 span[j] = bucket.Cursor + j;
             }
 
-            AddPlannedTags(bucket, reverse: rng.Next(4) == 0);
+            AddPlannedTags(bucket, reverse: rng.Next(4) == 0, labelPadding);
             int commit = rng.Next(8) == 0 ? rng.Next(0, n + 1) : n;
             bucket.Commit(commit);
             written += commit;
@@ -123,7 +126,7 @@ public static class TagPlan
     }
 
     /// <summary>Checks the data and the tags of a chunk against the plan; <see langword="null"/> when they match.</summary>
-    public static string? CheckChunk(Chunk<long> chunk)
+    public static string? CheckChunk(Chunk<long> chunk, int labelPadding = 0)
     {
         ReadOnlySpan<long> span = chunk.Span;
         for (int j = 0; j < span.Length; j++)
@@ -151,7 +154,7 @@ public static class TagPlan
 
             if (LabelAt(o))
             {
-                if (t >= tags.Length || tags[t] is not LabelTag l || l.Offset != (ulong)o || l.Key != "label" || l.Text != "at " + o.ToString(CultureInfo.InvariantCulture))
+                if (t >= tags.Length || tags[t] is not LabelTag l || l.Offset != (ulong)o || l.Key != "label" || l.Text != LabelText(o, labelPadding))
                 {
                     return Describe(chunk, t, o, "LabelTag");
                 }

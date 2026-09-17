@@ -34,9 +34,9 @@ double nominalRate = rate > 0 ? rate : 48_000;
 
 // ---- the API sketch, writer side ----------------------------------------------------------------
 using RingBuffer<float> buffer = RingBuffer<float>.Create(1 << 20, name,     // 2^20 floats = 4 MiB, section "Local\photone.<name>"
-    new RingBufferOptions { TagCapacity = 1 << 16, TagSerializer = tagSerializer });
+    new RingBufferOptions { Tags = TagMode.CrossProcess, TagSerializer = tagSerializer });
 
-Console.WriteLine($"writer  : {buffer.Name}  capacity={buffer.Capacity:N0} floats ({buffer.DataBytes / 1024 / 1024} MiB)  tags={buffer.TagCapacity / 1024} KiB  base=0x{buffer.BaseAddress:X}  pid={Environment.ProcessId}");
+Console.WriteLine($"writer  : {buffer.Name}  capacity={buffer.Capacity:N0} floats ({buffer.DataBytes / 1024 / 1024} MiB)  tags={buffer.Tags}  base=0x{buffer.BaseAddress:X}  pid={Environment.ProcessId}");
 Console.WriteLine($"          rate={rate:N0} samples/s ({(rate == 0 ? "unpaced" : "paced")}); start readers now; Ctrl+C stops");
 
 const double LowTone = 440.0;

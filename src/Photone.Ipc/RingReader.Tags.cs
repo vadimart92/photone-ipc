@@ -5,18 +5,19 @@ namespace Photone.Ipc;
 
 public sealed unsafe partial class RingReader<T>
 {
-    private readonly TagReader? _tags;  // null when the buffer carries no tags
-    private long _tagLoadedW;           // every record of a tag with an offset below this is loaded
+    private readonly TagReader? _tags;  // null when the buffer carries no tags this reader can see
+    private readonly long* _tagEnd;     // the published end of the tags: TagEnd in shared memory, or the writer's pinned entry count (DESIGN §16.7)
+    private long _tagLoadedW;           // every tag with an offset below this is loaded
     private long _tagNextOffset;        // offset of the first queued tag (long.MaxValue when none)
-    private long _tagPosition;          // log position loaded up to (== _tags.Position): an unchanged TagEnd means nothing new to load
+    private long _tagPosition;          // position loaded up to (== _tags.Position): an unchanged end means nothing new to load
     private long _tagThreshold;         // min(_tagLoadedW, _tagNextOffset): TryRead and Advance below it skip the tag code (long.MaxValue without tags)
 
     /// <summary>
     /// The last persistent tag (<see cref="ITag.IsPersistent"/>) of every key whose offset lies before <see cref="ReadCursor"/>: the state in effect at the
     /// reader's position, one tag per <see cref="ITag.Key"/>, in the order the keys first appeared. It includes tags written before the reader joined (from
-    /// the writer's persistent-tag table) and advances with <see cref="Advance"/>; the tags at or after <see cref="ReadCursor"/> arrive in
+    /// the writer's snapshot) and advances with <see cref="Advance"/>; the tags at or after <see cref="ReadCursor"/> arrive in
     /// <see cref="Chunk{T}.Tags"/> instead. A view of the reader's own array, without a copy: valid until the next <see cref="TryRead"/> or
-    /// <see cref="Advance"/>. Empty when the buffer carries no tags.
+    /// <see cref="Advance"/>. Empty when the buffer carries no tags, or only tags of another process (<see cref="TagMode.InProcess"/>).
     /// </summary>
     /// <exception cref="ObjectDisposedException">The reader was disposed.</exception>
     public ReadOnlySpan<ITag> ReadLastTagValues()
@@ -66,14 +67,13 @@ public sealed unsafe partial class RingReader<T>
     }
 
     /// <summary>
-    /// Makes every tag with an offset below <c>_wc</c> loaded. <c>_wc</c> was loaded before <c>TagEnd</c> is loaded here, and a commit publishes its records
-    /// before its write cursor, so they are all before that <c>TagEnd</c> (DESIGN §16.6). When <c>TagEnd</c> has not moved since the last load there is
-    /// nothing to parse.
+    /// Makes every tag with an offset below <c>_wc</c> loaded. <c>_wc</c> was loaded before the end is loaded here, and a commit publishes its tags before
+    /// its write cursor, so they are all before that end (DESIGN §16.7). When the end has not moved since the last load there is nothing to load.
     /// </summary>
     private void RefreshTags()
     {
         long w = _wc;
-        long end = Volatile.Read(ref Hdr.TagEnd);
+        long end = Volatile.Read(ref *_tagEnd);
         if (end != _tagPosition)
         {
             _tagNextOffset = _tags!.Load(end, _r);

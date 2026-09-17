@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Photone.Ipc.Internal;
 
@@ -5,25 +6,24 @@ namespace Photone.Ipc;
 
 public sealed unsafe partial class RingBuffer<T>
 {
-    private bool _tagWork;              // tags are staged: from the first AddTag until a commit has published all of them and the tag snapshot
-    private int _committing;            // 1 while EndWriteWithTags runs (it may wait for tag space): CloseWriter waits for it to leave
+    private bool _tagWork;              // tags are staged: from the first AddTag until a commit has published all of them and the snapshots
+    private int _committing;            // 1 while EndWriteWithTags runs (it may map and commit tag memory): CloseWriter waits for it to leave
+
+    private long _nextTagSweep;         // Stopwatch timestamp before which a growing shared tag log does not look for dead readers again
 
     /// <summary>The writer's tag state (tests).</summary>
     internal TagWriter? TagWriter => _tagWriter;
 
     /// <summary>
     /// Attaches <paramref name="tag"/> to the next element this writer publishes, without a bucket: sets <c>tag.Offset</c> to the current
-    /// <see cref="WriteCursor"/> (the first element of the outstanding bucket, if there is one) and serializes the tag now. It is published with the
-    /// first commit that publishes at least one element, and stays pending through commits that publish none; it is dropped if the writer is disposed
-    /// first. Readers see it in the <see cref="Chunk{T}.Tags"/> of that element. Writer thread only, like <see cref="GetBucket"/>.
+    /// <see cref="WriteCursor"/> (the first element of the outstanding bucket, if there is one); with <see cref="TagMode.CrossProcess"/> the tag is serialized
+    /// now. It is published with the first commit that publishes at least one element, and stays pending through commits that publish none; it is dropped
+    /// if the writer is disposed first. Readers see it in the <see cref="Chunk{T}.Tags"/> of that element. Writer thread only, like <see cref="GetBucket"/>.
     /// </summary>
     /// <typeparam name="TTag">The concrete tag type: it decides <see cref="ITag.IsPersistent"/> and the serializer's type name.</typeparam>
-    /// <param name="tag">The tag; its <see cref="ITag.Offset"/> is overwritten.</param>
-    /// <exception cref="InvalidOperationException">
-    /// Not the writer, or the writer is closed; the buffer carries no tags or has no <see cref="RingBufferOptions.TagSerializer"/>; the pending tags exceed
-    /// the tag log, or the last persistent tag of every key would exceed the persistent-tag table.
-    /// </exception>
-    /// <exception cref="ArgumentException"><typeparamref name="TTag"/> is an interface, the key is <see langword="null"/> or too long, or the tag alone exceeds the tag log.</exception>
+    /// <param name="tag">The tag; its <see cref="ITag.Offset"/> is overwritten. Readers of this buffer receive this instance: do not change or add it again.</param>
+    /// <exception cref="InvalidOperationException">Not the writer, or the writer is closed; the buffer carries no tags (<see cref="RingBufferOptions.Tags"/>).</exception>
+    /// <exception cref="ArgumentException"><typeparamref name="TTag"/> is an interface, or the key is <see langword="null"/> or too long.</exception>
     /// <exception cref="ObjectDisposedException">The buffer was disposed.</exception>
     public void AddTag<TTag>(TTag tag) where TTag : ITag
     {
@@ -56,9 +56,7 @@ public sealed unsafe partial class RingBuffer<T>
     private void StageTag<TTag>(TTag tag, long offset, bool sticky) where TTag : ITag
     {
         TagWriter tags = _tagWriter
-            ?? throw new InvalidOperationException("This buffer carries no tags: create it with RingBufferOptions.TagCapacity greater than 0.");
-        ITagSerializer serializer = _options.TagSerializer
-            ?? throw new InvalidOperationException("RingBufferOptions.TagSerializer is not set: the writer cannot serialize tags (for example new JsonTagSerializer()).");
+            ?? throw new InvalidOperationException("This buffer carries no tags: create it with RingBufferOptions.Tags set to TagMode.InProcess or TagMode.CrossProcess.");
         ArgumentNullException.ThrowIfNull(tag);
         if (typeof(TTag).IsInterface)
         {
@@ -67,15 +65,15 @@ public sealed unsafe partial class RingBuffer<T>
 
         string key = tag.Key ?? throw new ArgumentException("The tag's Key is null.", nameof(tag));
         tag.Offset = (ulong)offset;
-        tags.Stage(serializer, tag, offset, key, sticky);
+        tags.Stage(tag, offset, key, sticky);
         _tagWork = true;
     }
 
     /// <summary>
-    /// <see cref="EndWrite"/> of a bucket with tags (DESIGN §16.4): the records and <c>TagEnd</c> before the write cursor, the snapshot after it.
+    /// <see cref="EndWrite"/> of a bucket with tags (DESIGN §16.4): the tags and their end before the write cursor, the snapshots after it.
     /// <para>
-    /// It may wait for tag space, and <see cref="Dispose"/> on another thread must neither drop the bucket under it nor release the mapping. Dekker pair:
-    /// this stores <c>_committing</c> (full fence) and then loads <c>_disposed</c>; <c>Dispose</c> stores <c>_disposed</c> (full fence) and then, in
+    /// It may map and commit tag memory, and <see cref="Dispose"/> on another thread must neither drop the bucket under it nor release the mapping. Dekker
+    /// pair: this stores <c>_committing</c> (full fence) and then loads <c>_disposed</c>; <c>Dispose</c> stores <c>_disposed</c> (full fence) and then, in
     /// <see cref="CloseWriter"/>, loads <c>_committing</c>. So either this sees the disposal and leaves without touching anything (the closing thread drops
     /// the bucket), or the closing thread sees this commit and waits until it has completed or given up.
     /// </para>
@@ -91,7 +89,7 @@ public sealed unsafe partial class RingBuffer<T>
                 throw new ObjectDisposedException(GetType().FullName);
             }
 
-            PublishTags(count);                                     // records and TagEnd BEFORE the write cursor: a reader that sees W finds the tags below it
+            PublishTags(count);                                     // tags and their end BEFORE the write cursor: a reader that sees W finds the tags below it
             _w += count;
             _e = _w;
             Interlocked.Exchange(ref Hdr.WriteCursor, _w);
@@ -103,7 +101,8 @@ public sealed unsafe partial class RingBuffer<T>
             }
 
             _tagWork = _tagWriter!.PendingCount != 0;               // tags added to the buffer wait for a commit that publishes an element
-            _tagWriter.PublishSnapshot(_w);                         // AFTER the write cursor: a snapshot never names a cursor that is not published
+            TestHooks.BeforeTagSnapshot?.Invoke(this);
+            _tagWriter.PublishSnapshots(_w);                        // AFTER the write cursor: a snapshot never names a cursor that is not published
             _outstanding = false;
         }
         finally
@@ -113,27 +112,57 @@ public sealed unsafe partial class RingBuffer<T>
     }
 
     /// <summary>
-    /// Commit, before the write cursor is published: appends the records of the committed prefix to the log and publishes <c>TagEnd</c> (DESIGN §16.4).
-    /// Waits while the log is full. If it fails (the buffer disposed meanwhile, <see cref="TagLogFullException"/>), the whole bucket is dropped: nothing
-    /// of it is published. Tags added to the buffer rather than to the bucket stay pending in both cases until an element is published.
-    /// Runs only inside <see cref="EndWriteWithTags"/>, after its disposal check, so no closing thread touches the bucket meanwhile.
+    /// Commit, before the write cursor is published: publishes the tags of the committed prefix (DESIGN §16.4). With shared memory it first releases what
+    /// the readers passed if the records do not fit, then moves to another ring or commits memory as needed; it never waits. If that fails (the commit limit,
+    /// tag memory exhausted), the whole bucket is dropped: nothing of it is published. Tags added to the buffer rather than to the bucket stay pending in both
+    /// cases until an element is published. Runs only inside <see cref="EndWriteWithTags"/>, after its disposal check.
     /// </summary>
+    /// <summary>
+    /// The shared tags do not fit and the log would move to a larger ring: evicts readers whose process died first. Nothing else would while the data ring
+    /// still has space, and a dead reader's cursor keeps every later record reserved (DESIGN §16.4). At most once per liveness interval: a sweep checks
+    /// the process of every reader.
+    /// </summary>
+    /// <returns><see langword="true"/> when a reader was evicted.</returns>
+    private bool SweepBeforeGrowing()
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (now < _nextTagSweep)
+        {
+            return false;
+        }
+
+        _nextTagSweep = now + SpinClock.ToTicks(TimeSpan.FromMilliseconds(_livenessMs));
+        return SweepDeadSlots() != 0;
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void PublishTags(int count)
     {
         TagWriter tags = _tagWriter!;
         try
         {
-            long bytes = tags.SelectForCommit(_w + count);
-            if (bytes != 0)
+            if (tags.SelectForCommit(_w + count) != 0)
             {
-                if (!tags.Fits(bytes))
+                tags.PrepareLocal();                                // everything that can fail comes first; the appends cannot
+                if (tags.Shared is SharedTagLog shared)
                 {
-                    tags.Free(_min);
-                    if (!tags.Fits(bytes))
+                    long bytes = tags.SelectedBytes;
+                    if (shared.NeedsFree(bytes))
                     {
-                        MakeTagSpace(tags, bytes);
+                        shared.Free(_min);
+                        if (shared.NeedsFree(bytes))
+                        {
+                            _min = ScanMin();                       // a record is reusable once every reader cursor is past the write cursor it was appended at
+                            shared.Free(_min);
+                            if (!shared.Fits(bytes) && SweepBeforeGrowing())
+                            {
+                                _min = ScanMin();
+                                shared.Free(_min);
+                            }
+                        }
                     }
+
+                    shared.Prepare(bytes, tags.StateChanges, appendW: _w);
                 }
 
                 TestHooks.BeforeTagAppend?.Invoke(this);
@@ -149,41 +178,6 @@ public sealed unsafe partial class RingBuffer<T>
             _e = _w;
             _outstanding = false;
             throw;
-        }
-    }
-
-    /// <summary>
-    /// The tag log is full: rescans the reader cursors, releases what they passed, and otherwise waits (spin, then kernel) until the slowest reader passes
-    /// the write cursor of the oldest record. Holds a local reference like <see cref="SlowGetBucket"/>, so a <see cref="Dispose"/> on another thread ends
-    /// the wait with <see cref="ObjectDisposedException"/>.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private void MakeTagSpace(TagWriter tags, long bytes)
-    {
-        if (!TryAddLocalRef())
-        {
-            throw new ObjectDisposedException(GetType().FullName);
-        }
-
-        try
-        {
-            while (true)
-            {
-                ThrowIfDisposed();
-                _min = ScanMin();
-                tags.Free(_min);
-                if (tags.Fits(bytes))
-                {
-                    return;
-                }
-
-                _counters.TagWaits++;
-                WaitForMin(tags.OldestAppendW + 1, tagWait: true);   // a record is reusable once every reader cursor is past the write cursor it was appended at
-            }
-        }
-        finally
-        {
-            ReleaseLocalRef();
         }
     }
 }

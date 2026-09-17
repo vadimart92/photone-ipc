@@ -1,4 +1,3 @@
-using System.Numerics;
 using System.Runtime.InteropServices;
 
 namespace Photone.Ipc.Internal;
@@ -8,6 +7,12 @@ internal static class TagFlags
 {
     /// <summary>The tag type declared <see cref="ITag.IsPersistent"/>.</summary>
     public const ushort Persistent = 1;
+
+    /// <summary>
+    /// Not a tag: the last record of a ring generation. The log continues right after it, at physical offset 0 of ring <see cref="TagRecordHeader.NextRing"/>
+    /// (DESIGN §16.4). Its <see cref="TagRecordHeader.RecordBytes"/> is <see cref="TagRecordHeader.Bytes"/>, and it has no key, type name or payload.
+    /// </summary>
+    public const ushort Jump = 2;
 }
 
 /// <summary>
@@ -32,122 +37,123 @@ internal struct TagRecordHeader
 
     [FieldOffset(16)] public ushort TypeNameBytes;
 
-    [FieldOffset(18)] public ushort Reserved;
+    /// <summary>The ring size class the log continues in (<see cref="TagFlags.Jump"/> records only).</summary>
+    [FieldOffset(18)] public ushort NextRing;
 
     [FieldOffset(20)] public int PayloadBytes;
 
     public readonly bool IsPersistent => (Flags & TagFlags.Persistent) != 0;
+
+    public readonly bool IsJump => (Flags & TagFlags.Jump) != 0;
+
+    /// <summary>The marker that ends a ring generation and continues the log in ring <paramref name="nextRing"/>.</summary>
+    public static TagRecordHeader Jump(int nextRing) => new() { RecordBytes = Bytes, Flags = TagFlags.Jump, NextRing = (ushort)nextRing };
 }
 
-/// <summary>The tag area of a buffer: <c>[persistent-tag table][tag log]</c> at section offset 64 KiB, followed by the data (DESIGN §16.2).</summary>
-internal readonly record struct TagArea(long LogBytes, int StateBytes)
-{
-    /// <summary>The header view: the 64 KiB control view and the tag area (<c>ControlBlock.DataOffset</c>).</summary>
-    public long HeaderBytes => Layout.HeaderViewBytes + StateBytes + LogBytes;
-
-    /// <summary>The area requested by creator options.</summary>
-    /// <exception cref="ArgumentOutOfRangeException">A tag capacity is out of range.</exception>
-    public static TagArea Choose(RingBufferOptions options)
-    {
-        (long log, int state) = TagFormat.ChooseArea(options.TagCapacity, options.PersistentTagCapacity);
-        return new TagArea(log, state);
-    }
-}
-
-/// <summary>Sizes of the tag area, record validation and wrap-aware copies into and out of the tag log (DESIGN §16).</summary>
+/// <summary>
+/// The geometry of the tag reserve, record validation, and wrap-aware copies into and out of a ring (DESIGN §16.2-§16.3).
+/// <code>
+/// tag reserve (section offset 64 KiB + D):  [table region 2 GiB][ring 0: 64 KiB][ring 1: 128 KiB] ... [ring 18: 16 GiB]
+/// </code>
+/// </summary>
 internal static unsafe class TagFormat
 {
-    public const long MinLogBytes = 4096;
-    public const long MaxLogBytes = 1L << 30;
-    public const int MaxStateBytes = 64 << 20;
-    public const int DefaultStateBytes = 16 << 10;
     public const int MaxNameBytes = ushort.MaxValue;
 
-    /// <summary>
-    /// The tag area for the requested capacities: a power-of-two log of at least <paramref name="tagCapacity"/> bytes (at least 4 KiB), and a persistent-tag table
-    /// of at least <paramref name="persistentCapacity"/> bytes that also takes the rounding slack, so that the area is a multiple of 64 KiB.
-    /// <c>(0, 0)</c> when <paramref name="tagCapacity"/> is 0 (no tags).
-    /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">A capacity is negative or too large.</exception>
-    public static (long LogBytes, int StateBytes) ChooseArea(long tagCapacity, int persistentCapacity)
+    /// <summary>Size of the smallest ring (size class 0); ring <c>c</c> holds <c>MinRingBytes &lt;&lt; c</c> bytes.</summary>
+    public const long MinRingBytes = 1L << 16;
+
+    /// <summary>Ring size classes: the largest ring holds 16 GiB.</summary>
+    public const int RingClasses = 19;
+
+    /// <summary>The region of the persistent-tag table (<see cref="ControlBlock.TagStateUsed"/> is an <see cref="int"/>).</summary>
+    public const long TableReserveBytes = 1L << 31;
+
+    /// <summary>The whole tag reserve: only reserved, so it costs no memory until the writer commits parts of it.</summary>
+    public const long ReserveBytes = TableReserveBytes + (MinRingBytes * ((1L << RingClasses) - 1));
+
+    /// <summary>Size of ring <paramref name="ring"/>.</summary>
+    public static long RingBytes(int ring) => MinRingBytes << ring;
+
+    /// <summary>Offset of ring <paramref name="ring"/> within the tag reserve.</summary>
+    public static long RingOffset(int ring) => TableReserveBytes + (MinRingBytes * ((1L << ring) - 1));
+
+    /// <summary>The smallest ring class of at least <paramref name="bytes"/> bytes, or -1 when even the largest is smaller.</summary>
+    public static int RingFor(long bytes)
     {
-        if (tagCapacity < 0 || tagCapacity > MaxLogBytes)
+        for (int ring = 0; ring < RingClasses; ring++)
         {
-            throw new ArgumentOutOfRangeException(nameof(tagCapacity), tagCapacity, $"TagCapacity must be between 0 and {MaxLogBytes} bytes.");
+            if (RingBytes(ring) >= bytes)
+            {
+                return ring;
+            }
         }
 
-        if (persistentCapacity < 0 || persistentCapacity > MaxStateBytes)
-        {
-            throw new ArgumentOutOfRangeException(nameof(persistentCapacity), persistentCapacity, $"PersistentTagCapacity must be between 0 and {MaxStateBytes} bytes.");
-        }
-
-        if (tagCapacity == 0)
-        {
-            return (0, 0);
-        }
-
-        long log = Math.Max(MinLogBytes, (long)BitOperations.RoundUpToPowerOf2((ulong)tagCapacity));
-        long granularity = Layout.HeaderViewBytes;
-        long area = (log + persistentCapacity + granularity - 1) / granularity * granularity;
-        return (log, (int)(area - log));
+        return -1;
     }
 
-    /// <summary><see langword="true"/> for a sane tag area as stored in a control block (either both sizes zero, or a power-of-two log and a 64 KiB-aligned area).</summary>
-    public static bool IsValidArea(long logBytes, int stateBytes)
-    {
-        if (logBytes == 0)
-        {
-            return stateBytes == 0;
-        }
-
-        return logBytes >= MinLogBytes && logBytes <= MaxLogBytes && BitOperations.IsPow2(logBytes)
-            && stateBytes >= 0 && stateBytes <= MaxStateBytes + Layout.HeaderViewBytes && (logBytes + stateBytes) % Layout.HeaderViewBytes == 0;
-    }
+    /// <summary>Rounds up to the view granularity (64 KiB).</summary>
+    public static long AlignView(long bytes) => (bytes + Layout.HeaderViewBytes - 1) & ~(Layout.HeaderViewBytes - 1L);
 
     public static int Align(int bytes) => (bytes + 7) & ~7;
 
-    /// <summary>Validates a record header against the bytes that can belong to it.</summary>
-    public static bool IsValid(in TagRecordHeader h, long availableBytes)
+    /// <summary>Validates a record header against the bytes that can belong to it (at most the rest of the log and the ring).</summary>
+    public static bool IsValid(in TagRecordHeader h, long availableBytes, long ringBytes)
     {
         long record = h.RecordBytes;
-        return record >= TagRecordHeader.Bytes && (record & 7) == 0 && record <= availableBytes && h.PayloadBytes >= 0
-            && (long)TagRecordHeader.Bytes + h.KeyBytes + h.TypeNameBytes + h.PayloadBytes <= record;
-    }
-
-    /// <summary>Copies <paramref name="source"/> into the log at absolute position <paramref name="position"/>, wrapping at the end of the log.</summary>
-    public static void Write(byte* log, long logBytes, long position, ReadOnlySpan<byte> source)
-    {
-        if (source.Length > logBytes)
+        if (record < TagRecordHeader.Bytes || (record & 7) != 0 || record > availableBytes || record > ringBytes)
         {
-            throw new ArgumentOutOfRangeException(nameof(source), source.Length, "A copy into the tag log cannot be longer than the log.");
+            return false;
         }
 
-        long start = position & (logBytes - 1);
-        int first = (int)Math.Min(source.Length, logBytes - start);
-        source[..first].CopyTo(new Span<byte>(log + start, first));
+        if (h.IsJump)
+        {
+            return record == TagRecordHeader.Bytes && h.NextRing < RingClasses && h.KeyBytes == 0 && h.TypeNameBytes == 0 && h.PayloadBytes == 0;
+        }
+
+        return h.PayloadBytes >= 0 && (long)TagRecordHeader.Bytes + h.KeyBytes + h.TypeNameBytes + h.PayloadBytes <= record;
+    }
+
+    /// <summary>
+    /// <see langword="true"/> when <paramref name="length"/> bytes at physical offset <paramref name="physical"/> of a ring lie in committed memory: below
+    /// <paramref name="committed"/>, or anywhere once the whole ring is committed (a range that wraps needs that).
+    /// </summary>
+    public static bool IsCommitted(long ringBytes, long committed, long physical, long length)
+        => committed >= ringBytes || (physical + length <= committed && physical + length <= ringBytes);
+
+    /// <summary>Copies <paramref name="source"/> into a ring at physical offset <paramref name="physical"/>, wrapping at the end of the ring.</summary>
+    public static void Write(byte* ring, long ringBytes, long physical, ReadOnlySpan<byte> source)
+    {
+        if (source.Length > ringBytes || (ulong)physical >= (ulong)ringBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(source), source.Length, $"A copy into a {ringBytes}-byte ring cannot be longer than the ring or start outside it.");
+        }
+
+        int first = (int)Math.Min(source.Length, ringBytes - physical);
+        source[..first].CopyTo(new Span<byte>(ring + physical, first));
         if (first < source.Length)
         {
-            source[first..].CopyTo(new Span<byte>(log, source.Length - first));
+            source[first..].CopyTo(new Span<byte>(ring, source.Length - first));
         }
     }
 
-    /// <summary>Copies bytes out of the log starting at absolute position <paramref name="position"/>, wrapping at the end of the log.</summary>
-    public static void Read(byte* log, long logBytes, long position, Span<byte> destination)
+    /// <summary>Copies bytes out of a ring starting at physical offset <paramref name="physical"/>, wrapping at the end of the ring.</summary>
+    /// <exception cref="RingBufferLayoutException">The copy is longer than the ring or starts outside it.</exception>
+    public static void Read(byte* ring, long ringBytes, long physical, Span<byte> destination)
     {
-        if (destination.Length > logBytes)
+        if (destination.Length > ringBytes || (ulong)physical >= (ulong)ringBytes)
         {
-            throw new RingBufferLayoutException($"A tag record of {destination.Length} bytes cannot come from a {logBytes}-byte tag log.");
+            throw new RingBufferLayoutException($"A tag record of {destination.Length} bytes at physical offset {physical} cannot come from a {ringBytes}-byte ring.");
         }
 
-        long start = position & (logBytes - 1);
-        int first = (int)Math.Min(destination.Length, logBytes - start);
-        new ReadOnlySpan<byte>(log + start, first).CopyTo(destination);
+        int first = (int)Math.Min(destination.Length, ringBytes - physical);
+        new ReadOnlySpan<byte>(ring + physical, first).CopyTo(destination);
         if (first < destination.Length)
         {
-            new ReadOnlySpan<byte>(log, destination.Length - first).CopyTo(destination[first..]);
+            new ReadOnlySpan<byte>(ring, destination.Length - first).CopyTo(destination[first..]);
         }
     }
 
-    /// <summary><see langword="true"/> when <paramref name="length"/> bytes at <paramref name="position"/> do not cross the end of the log.</summary>
-    public static bool IsContiguous(long logBytes, long position, int length) => (position & (logBytes - 1)) + length <= logBytes;
+    /// <summary><see langword="true"/> when <paramref name="length"/> bytes at physical offset <paramref name="physical"/> do not cross the end of the ring.</summary>
+    public static bool IsContiguous(long ringBytes, long physical, long length) => physical + length <= ringBytes;
 }

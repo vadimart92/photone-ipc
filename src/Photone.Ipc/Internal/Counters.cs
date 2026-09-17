@@ -32,7 +32,4 @@ internal struct Counters
 
     /// <summary>System calls made to wake a parked async waiter thread (reader; zero while the waiter keeps up by spinning).</summary>
     public long ArmSignals;
-
-    /// <summary>Commits that had to wait for readers to pass older tags before their tags fit in the tag log (writer).</summary>
-    public long TagWaits;
 }

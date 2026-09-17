@@ -3,8 +3,9 @@ namespace Photone.Ipc;
 /// <summary>
 /// A stream tag: metadata attached to one element of a <see cref="RingBuffer{T}"/> (a burst start, a timestamp, a change of sample rate).
 /// The writer attaches tags with <see cref="Bucket{T}.AddTag{TTag}"/> (to an element of a bucket) or <see cref="RingBuffer{T}.AddTag{TTag}"/> (to the next
-/// element written); every reader sees them in <see cref="Chunk{T}.Tags"/> when it reads the element they belong to. Tags cross processes through the
-/// buffer's <see cref="ITagSerializer"/> (JSON by default), so a tag type must be serializable by it.
+/// element written); every reader sees them in <see cref="Chunk{T}.Tags"/> when it reads the element they belong to. Readers created by the writer's own
+/// buffer receive the instances that were added (<see cref="TagMode"/>), so treat a tag as immutable once added. With <see cref="TagMode.CrossProcess"/>
+/// tags also cross processes through an <see cref="ITagSerializer"/> (for example <see cref="JsonTagSerializer"/>), so a tag type must be serializable by it.
 /// </summary>
 public interface ITag
 {
@@ -17,7 +18,7 @@ public interface ITag
 
     /// <summary>
     /// Absolute element index the tag is attached to (the same space as <see cref="Chunk{T}.StartOffset"/> and <see cref="Bucket{T}.StartOffset"/>).
-    /// Set by <c>AddTag</c> on the writer and from the tag record on every reader, so a tag type need not serialize it.
+    /// Set by <c>AddTag</c> on the writer and, in other processes, from the tag record, so a tag type need not serialize it.
     /// </summary>
     ulong Offset { get; set; }
 

@@ -213,22 +213,22 @@ internal static unsafe class Program
     // ------------------------------------------------------------------ tags (DESIGN §16)
 
     /// <summary>
-    /// <c>tag-writer &lt;name&gt; &lt;count&gt; [--tag-capacity bytes]</c>: creates a buffer with tags, prints "ready", waits for "go", writes count elements with
-    /// the <see cref="TagPlan"/> tags, prints "committed written=N tagWaits=W", disposes and prints "closed".
+    /// <c>tag-writer &lt;name&gt; &lt;count&gt; [--label-padding chars]</c>: creates a buffer with cross-process tags, prints "ready", waits for "go", writes count
+    /// elements with the <see cref="TagPlan"/> tags (labels padded), prints "committed written=N ringSwitches=S committedTagBytes=B", disposes and prints "closed".
     /// </summary>
     private static int WriteTags(string[] args)
     {
         string name = args[1];
         long count = long.Parse(args[2], CultureInfo.InvariantCulture);
-        long tagCapacity = 1 << 16;
+        int padding = 0;
         for (int i = 3; i < args.Length; i++)
         {
-            tagCapacity = args[i] == "--tag-capacity" ? long.Parse(args[++i], CultureInfo.InvariantCulture) : throw new ArgumentException("unknown option " + args[i]);
+            padding = args[i] == "--label-padding" ? int.Parse(args[++i], CultureInfo.InvariantCulture) : throw new ArgumentException("unknown option " + args[i]);
         }
 
-        var options = new RingBufferOptions { TagCapacity = tagCapacity, TagSerializer = TagPlan.CreateSerializer() };
+        var options = new RingBufferOptions { Tags = TagMode.CrossProcess, TagSerializer = TagPlan.CreateSerializer() };
         RingBuffer<long> buffer = RingBuffer<long>.Create(1 << 16, name, options);
-        Print(Inv($"ready pid={Environment.ProcessId} tagCapacity={buffer.TagCapacity}"));
+        Print(Inv($"ready pid={Environment.ProcessId} tags={buffer.Tags}"));
         string? line = Console.In.ReadLine();
         if (line != "go")
         {
@@ -236,8 +236,9 @@ internal static unsafe class Program
             return 3;
         }
 
-        long written = TagPlan.Write(buffer, count, 128, new Random(4242));   // ~0.3 tags of ~100 bytes per element: a bucket of 128 fits a 16 KiB log easily
-        Print(Inv($"committed written={written} tagWaits={buffer.Counters.TagWaits}"));
+        long written = TagPlan.Write(buffer, count, 128, new Random(4242), padding);
+        SharedTagLog shared = buffer.TagWriter!.Shared!;
+        Print(Inv($"committed written={written} ringSwitches={shared.RingSwitches} committedTagBytes={shared.CommittedBytes}"));
         buffer.Dispose();
         Print("closed");
         return 0;

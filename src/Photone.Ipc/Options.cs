@@ -1,5 +1,3 @@
-using Photone.Ipc.Internal;
-
 namespace Photone.Ipc;
 
 /// <summary>Options for <see cref="RingBuffer{T}.Create"/> and <see cref="RingBuffer{T}.Open(string, RingBufferOptions?)"/>.</summary>
@@ -36,21 +34,17 @@ public sealed class RingBufferOptions
     public RingBufferPool? Pool { get; init; }
 
     /// <summary>
-    /// Creator only: bytes of tag records that can be written but not yet read past by the slowest reader (rounded up to a power of two, at least 4 KiB).
-    /// 0 (default) = the buffer carries no tags. A commit whose tags do not fit waits, like <see cref="RingBuffer{T}.GetBucket"/> waits for space, until the
-    /// slowest reader has read past older tags. See <see cref="Bucket{T}.AddTag{TTag}"/>.
+    /// Creator only: whether the buffer carries stream tags, and who can read them. <see cref="TagMode.None"/> (default): no tags.
+    /// <see cref="TagMode.InProcess"/>: tag objects for the readers of the writer's own <see cref="RingBuffer{T}"/>, never serialized.
+    /// <see cref="TagMode.CrossProcess"/>: also serialized with <see cref="TagSerializer"/> for readers in every process (it must be set). Tag memory grows
+    /// with the tags that readers have not read past yet; there is no capacity to choose. See <see cref="Bucket{T}.AddTag{TTag}"/>.
     /// </summary>
-    public long TagCapacity { get; init; }
+    public TagMode Tags { get; init; }
 
     /// <summary>
-    /// Creator only: bytes for the last persistent tag of every key (the state a joining reader starts from, see <see cref="ITag.IsPersistent"/>).
-    /// Used only with <see cref="TagCapacity"/> &gt; 0; the tag area is rounded up to 64 KiB and the slack goes here. Default 16 KiB.
-    /// </summary>
-    public int PersistentTagCapacity { get; init; } = TagFormat.DefaultStateBytes;
-
-    /// <summary>
-    /// How this process turns tags into bytes and back (writer and readers). <see langword="null"/> (default): the writer cannot add tags, and readers
-    /// deliver every tag as an <see cref="UnknownTag"/>. Typically <c>new JsonTagSerializer().Register&lt;MyTag&gt;()</c>.
+    /// How this process turns tags into bytes and back: the writer of a <see cref="TagMode.CrossProcess"/> buffer serializes with it, and readers of a buffer
+    /// opened from another process deserialize with it. <see langword="null"/> (default): such readers deliver every tag as an <see cref="UnknownTag"/>.
+    /// Typically <c>new JsonTagSerializer().Register&lt;MyTag&gt;()</c>. Not used with <see cref="TagMode.InProcess"/>.
     /// </summary>
     public ITagSerializer? TagSerializer { get; init; }
 

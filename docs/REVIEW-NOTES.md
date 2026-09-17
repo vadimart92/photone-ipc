@@ -64,3 +64,23 @@ which `Chunk.Tags` is computed on access.
 
 Deliberately not changed: the deadlock detector treats a reader parked with a timeout or a cancellation longer than 1 s as stuck (documented). Out of scope
 and reported separately: the same class of race as T1 exists, much narrower, between a blocked `GetBucket` that stops waiting and `Dispose` (pre-existing).
+
+# Review notes: stream tags without a capacity (2026-09-17, second round)
+
+The follow-up replaced the fixed tag log with ring generations in a reserved, commit-on-demand region of the section, and added in-process delivery of the
+tag objects (DESIGN §16). One read-only adversarial reviewer checked the new code (generations and reuse, both joins, memory safety against torn and
+corrupt snapshots, failure atomicity, lifetime of views and pooled sections). It found no critical defect and confirmed the reuse rule across generations,
+both join arguments and the committed-size checks; each finding below was verified by hand and fixed.
+
+| # | Finding | Fix |
+|---|---|---|
+| R1 | Major. A reader whose process died was evicted only when the writer blocked for space. Its cursor kept every later record reserved, so dense tags made the log grow for it, up to "no free ring" (every later tagged commit throwing), long before the data ring filled. | Before the log moves to a larger ring, the writer sweeps for dead readers (at most once per liveness interval) and frees again. Test: `SharedTags_ADeadReaderIsEvicted_BeforeTheLogGrowsForIt` (fails with the sweep disabled). |
+| R2 | A joiner gave up on the snapshot (no state) whenever the writer was closed after a failed attempt, although a writer that closes normally always leaves a stable snapshot. | The no-state fallback needs an odd version that persists; a changed even version means a live writer and is retried. Test: `JoiningReader_WhenTheWriterClosesWhileItRetries_StillCopiesTheState`. |
+| R3 | `AppendSelected` could still allocate (state record copies, record queue growth, object-log chunks, dictionary growth); an `OutOfMemoryException` in the middle left records appended but not accounted, and the next commit could publish tags twice. | Everything the appends need is allocated in the prepare phase (object-log chunks and key slots, group slots, buffers for new or grown state records, dictionary capacity); the appends allocate nothing. Test: `Appends_AllocateNothing_OnceTheCommitIsPrepared`. |
+| R4 | `PrepareReuse` zeroed tag memory by the committed sizes in the shared control block, which any process that maps the section can write: an access violation in the writer's process. | The pool keeps its own record of the committed sizes per ring and table. Test: `PooledSection_ClearOnReuse_TrustsOnlyItsOwnRecordOfTheCommittedTagMemory`. |
+| R5 | The pool counted the largest amount one buffer committed, not the union across the buffers that used a section (pages stay committed). | The per-ring record of R4 is a union. Test: `Pool_ReusesOnlySectionsWithTheSameTagReserve_AndCountsCommittedTagMemory`. |
+| R6 | `LargerRing` never considered free rings below its starting class, so it could throw while a smaller free ring held the commit. | It falls back to the smallest free ring that holds the commit. |
+| R7 | Performance: the table was rewritten completely on every commit with a persistent tag (quadratic with many keys); a key's record allocated whenever its size changed; the writer kept 24 bytes of bookkeeping per record. | Records that keep their size are rewritten in place, the table is laid out again only from the first record that changed size, new keys are appended; state buffers are sized in powers of two; the bookkeeping is one group per commit per ring. Test: `PersistentTable_GrowsAsKeysArrive_AndReusesTheSpaceOfAKey`. |
+| R8 | Pre-existing, now reachable through a malformed tag snapshot: a claim that failed after activation freed its slot without zeroing the identity fields (a sweeper could evict the next claimant) and without waking a writer blocked on it. | `ReleaseFailedClaim` releases the slot as a disposed reader does. Test: `CorruptRecords_AreReportedInsteadOfFollowed`. |
+| R9 | Hardening: a table between `Array.MaxLength` and `int.MaxValue` bytes made every join throw `OutOfMemoryException`; the join did not bound `TagEnd - TagSnapshotEnd` (hostile jump records could keep it walking) nor check `TagSnapshotW` against the write cursor. | The table is limited to `Array.MaxLength`; the join checks both bounds. Test: `CorruptRecords_AreReportedInsteadOfFollowed`. |
+| R10 | `Layout.Version` was still 3, the number of the unreleased first revision with a different layout; a comment still spoke of tag-space waits. | Version 4; comment fixed. |

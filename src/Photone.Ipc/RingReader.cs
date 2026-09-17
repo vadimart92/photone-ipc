@@ -47,6 +47,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
     internal RingReader(RingBuffer<T> owner, int slot, long word, long cursor, ReaderOptions options, TagReader? tags = null)
     {
         _tags = tags;
+        _tagEnd = tags is null ? &owner.Header->TagEnd : tags.EndPointer;
         _tagLoadedW = tags is null ? long.MaxValue : cursor;
         _tagNextOffset = tags?.NextOffset ?? long.MaxValue;
         _tagPosition = tags?.Position ?? 0;
@@ -204,7 +205,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         long end = _r + count;
         if (_tagThreshold < end)                                    // never without tags
         {
-            if (_tagNextOffset >= end && Volatile.Read(ref Hdr.TagEnd) == _tagPosition)
+            if (_tagNextOffset >= end && Volatile.Read(ref *_tagEnd) == _tagPosition)
             {
                 _tagLoadedW = _wc;                                  // nothing published since the last load and nothing queued here: the common case of sparse tags
                 _tagThreshold = Math.Min(_wc, _tagNextOffset);

@@ -34,21 +34,17 @@ public ref struct Bucket<T> : IDisposable where T : unmanaged
     public readonly ulong StartOffset => (ulong)_cursor;
 
     /// <summary>
-    /// Attaches <paramref name="tag"/> to element <paramref name="index"/> of this bucket: sets <c>tag.Offset = StartOffset + index</c>, serializes the tag now
-    /// and publishes it with <see cref="Commit"/>, together with the elements it belongs to; a tag beyond the committed prefix is dropped with them.
-    /// Readers see it in <see cref="Chunk{T}.Tags"/>; tags may be added in any order and are delivered in offset order (equal offsets in the order added).
-    /// <see cref="Commit"/> waits while the buffer's tag log is full, until the slowest reader has read past older tags.
+    /// Attaches <paramref name="tag"/> to element <paramref name="index"/> of this bucket: sets <c>tag.Offset = StartOffset + index</c> and publishes the tag
+    /// with <see cref="Commit"/>, together with the elements it belongs to; a tag beyond the committed prefix is dropped with them. With
+    /// <see cref="TagMode.CrossProcess"/> it is serialized now. Readers see it in <see cref="Chunk{T}.Tags"/>; tags may be added in any order and are delivered
+    /// in offset order (equal offsets in the order added). Tags never make <see cref="Commit"/> wait: their memory grows with what readers have not read yet.
     /// </summary>
     /// <typeparam name="TTag">The concrete tag type: it decides <see cref="ITag.IsPersistent"/> and the serializer's type name.</typeparam>
-    /// <param name="tag">The tag; its <see cref="ITag.Offset"/> is overwritten.</param>
+    /// <param name="tag">The tag; its <see cref="ITag.Offset"/> is overwritten. Readers of the writer's buffer receive this instance: do not change or add it again.</param>
     /// <param name="index">The element within the bucket, <c>0 &lt;= index &lt; Length</c>; the first by default.</param>
-    /// <exception cref="InvalidOperationException">
-    /// The bucket was committed or disposed; the buffer carries no tags (<see cref="RingBufferOptions.TagCapacity"/> is 0) or has no
-    /// <see cref="RingBufferOptions.TagSerializer"/>; the bucket's tags exceed the tag log, or the last persistent tag of every key would exceed the
-    /// persistent-tag table.
-    /// </exception>
+    /// <exception cref="InvalidOperationException">The bucket was committed or disposed; the buffer carries no tags (<see cref="RingBufferOptions.Tags"/>).</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> lies outside the bucket.</exception>
-    /// <exception cref="ArgumentException"><typeparamref name="TTag"/> is an interface, the key is <see langword="null"/> or too long, or the tag alone exceeds the tag log.</exception>
+    /// <exception cref="ArgumentException"><typeparamref name="TTag"/> is an interface, or the key is <see langword="null"/> or too long.</exception>
     public readonly void AddTag<TTag>(TTag tag, int index = 0) where TTag : ITag
     {
         if (_committed >= 0 || _owner is null)

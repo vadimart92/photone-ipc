@@ -10,21 +10,25 @@ internal static class Layout
     public const ulong Magic = 0x31454E4F544F4850;
 
     /// <summary>
-    /// 3: the tag area between the control view and the data (<see cref="ControlBlock.TagLogBytes"/>, <see cref="ControlBlock.TagEnd"/>, the tag snapshot,
-    /// a variable <see cref="ControlBlock.DataOffset"/>; DESIGN §16). 2: <see cref="ControlBlock.SectionId"/>, <see cref="LayoutFlag.Pooled"/>, events named
-    /// from the section id, name aliases (DESIGN §15).
+    /// 4: stream tags (<see cref="ControlBlock.TagMode"/>, the tag reserve after the data, <see cref="ControlBlock.TagEnd"/>, the tag snapshot and the
+    /// committed sizes of the tag memory; DESIGN §16). 3 was an unreleased first revision of the tags (a fixed tag area before the data).
+    /// 2: <see cref="ControlBlock.SectionId"/>, <see cref="LayoutFlag.Pooled"/>, events named from the section id, name aliases (DESIGN §15).
     /// </summary>
-    public const uint Version = 3;
+    public const uint Version = 4;
     public const uint ControlBytes = 4096;
 
-    /// <summary>Size of the control view (the control block and reserved space); the tag area, if any, follows it, then the data.</summary>
+    /// <summary>Size of the control view (the control block and reserved space); the data follows it, then the tag reserve, if any.</summary>
     public const uint HeaderViewBytes = 65536;
+
+    /// <summary>Section offset of the data region.</summary>
+    public const long DataOffset = 65536;
     public const int MaxReaders = 32;
     public const int SlotBase = 512;
     public const int SlotBytes = 64;
     public const int BackendAreaOffset = 2560;
     public const int BackendAreaBytes = 128;
     public const int TagSnapshotOffset = 2688;
+    public const int TagRingCommittedOffset = 2752;
 
     static Layout()
     {
@@ -69,8 +73,8 @@ internal static class Layout
         Check((byte*)&cb.InstanceId - p, 88, nameof(ControlBlock.InstanceId));
         Check((byte*)&cb.ReservationBytes - p, 96, nameof(ControlBlock.ReservationBytes));
         Check((byte*)&cb.SectionId - p, 104, nameof(ControlBlock.SectionId));
-        Check((byte*)&cb.TagLogBytes - p, 112, nameof(ControlBlock.TagLogBytes));
-        Check((byte*)&cb.TagStateBytes - p, 120, nameof(ControlBlock.TagStateBytes));
+        Check((byte*)&cb.TagMode - p, 112, nameof(ControlBlock.TagMode));
+        Check((byte*)&cb.TagReserveBytes - p, 120, nameof(ControlBlock.TagReserveBytes));
         Check((byte*)&cb.WriteCursor - p, 128, nameof(ControlBlock.WriteCursor));
         Check((byte*)&cb.TagEnd - p, 136, nameof(ControlBlock.TagEnd));
         Check((byte*)&cb.ReserveEnd - p, 256, nameof(ControlBlock.ReserveEnd));
@@ -95,6 +99,14 @@ internal static class Layout
         Check((byte*)&cb.TagSnapshotW - p, TagSnapshotOffset + 16, nameof(ControlBlock.TagSnapshotW));
         Check((byte*)&cb.TagStateUsed - p, TagSnapshotOffset + 24, nameof(ControlBlock.TagStateUsed));
         Check((byte*)&cb.TagStateCount - p, TagSnapshotOffset + 28, nameof(ControlBlock.TagStateCount));
+        Check((byte*)&cb.TagSnapshotRing - p, TagSnapshotOffset + 32, nameof(ControlBlock.TagSnapshotRing));
+        Check((byte*)&cb.TagSnapshotRingStart - p, TagSnapshotOffset + 40, nameof(ControlBlock.TagSnapshotRingStart));
+        Check((byte*)&cb.TagTableCommitted - p, TagSnapshotOffset + 48, nameof(ControlBlock.TagTableCommitted));
+        Check((byte*)cb.TagRingCommitted - p, TagRingCommittedOffset, nameof(ControlBlock.TagRingCommitted));   // fixed buffer: the expression is already the element pointer
+        if (TagRingCommittedOffset + (8 * TagFormat.RingClasses) > ControlBytes)
+        {
+            throw new InvalidOperationException("ControlBlock.TagRingCommitted does not fit in the control block.");
+        }
 
         ReaderSlot rs = default;
         byte* q = (byte*)&rs;
@@ -232,14 +244,14 @@ internal unsafe struct ControlBlock
     [FieldOffset(96)] public ulong ReservationBytes;
     /// <summary>Random per section, constant for its whole life (also across pooled reuse); names the signaling objects.</summary>
     [FieldOffset(104)] public ulong SectionId;
-    /// <summary>Size of the tag log in bytes (a power of two), 0 when the buffer has no tags (DESIGN §16).</summary>
-    [FieldOffset(112)] public long TagLogBytes;
-    /// <summary>Size of the persistent-tag table in bytes; the tag area is <c>TagStateBytes + TagLogBytes</c> at section offset 64 KiB.</summary>
-    [FieldOffset(120)] public int TagStateBytes;
+    /// <summary><see cref="Photone.Ipc.TagMode"/> of the buffer (DESIGN §16).</summary>
+    [FieldOffset(112)] public int TagMode;
+    /// <summary>Size of the tag reserve at section offset <c>64 KiB + DataBytes</c>: <see cref="TagFormat.ReserveBytes"/> with cross-process tags, otherwise 0.</summary>
+    [FieldOffset(120)] public long TagReserveBytes;
 
     // ---- line 2: the message (writer Interlocked.Exchange per Commit; readers poll). Line 3 (192..255) is deliberately empty. ----
     [FieldOffset(128)] public long WriteCursor;
-    /// <summary>Absolute log position (bytes) after the last published tag record; stored before <see cref="WriteCursor"/> by a commit that carries tags.</summary>
+    /// <summary>Absolute log position (bytes) after the last published tag record; stored before <see cref="WriteCursor"/> by a commit that carries tags (cross-process tags).</summary>
     [FieldOffset(136)] public long TagEnd;
 
     // ---- line 4: writer state (line 5 (320..383) is deliberately empty) ----
@@ -270,7 +282,7 @@ internal unsafe struct ControlBlock
     // ---- lines 40..41: backend-private area ----
     [FieldOffset(2560)] public fixed byte BackendArea[128];
 
-    // ---- line 42: tag snapshot for joining readers (seqlock; stored after WriteCursor by a commit that carries tags, DESIGN §16.5) ----
+    // ---- line 42: tag snapshot for joining readers (seqlock; stored after WriteCursor by a commit that carries tags, DESIGN §16.6) ----
     /// <summary>Even when stable; the writer makes it odd before it changes the snapshot or the persistent-tag table and even again afterwards.</summary>
     [FieldOffset(2688)] public ulong TagVersion;
     /// <summary>Log position up to which the persistent-tag table includes every persistent record.</summary>
@@ -281,6 +293,15 @@ internal unsafe struct ControlBlock
     [FieldOffset(2712)] public int TagStateUsed;
     /// <summary>Records in the persistent-tag table (one per key).</summary>
     [FieldOffset(2716)] public int TagStateCount;
+    /// <summary>Size class of the ring that holds log position <see cref="TagSnapshotEnd"/>.</summary>
+    [FieldOffset(2720)] public int TagSnapshotRing;
+    /// <summary>Log position at which that ring's generation starts (its physical offset 0).</summary>
+    [FieldOffset(2728)] public long TagSnapshotRingStart;
+    /// <summary>Committed bytes of the persistent-tag table region (only grows; stored after the commit, before the table uses them).</summary>
+    [FieldOffset(2736)] public long TagTableCommitted;
+
+    // ---- lines 43..45: committed bytes of every ring size class (only grow; stored after the commit, before any record lies there) ----
+    [FieldOffset(2752)] public fixed long TagRingCommitted[TagFormat.RingClasses];
 
     /// <summary>Returns a reference to slot <paramref name="i"/> (0..31) of the control block at <paramref name="hdr"/>.</summary>
     public static ref ReaderSlot SlotRef(ControlBlock* hdr, int i)

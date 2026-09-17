@@ -177,7 +177,7 @@ public sealed class RingBufferPool : IDisposable
         }
     }
 
-    /// <summary>Sum of the data-region and tag-area sizes of the mappings currently held idle.</summary>
+    /// <summary>Sum of the data-region sizes and the committed tag memory of the mappings currently held idle.</summary>
     public long IdleBytes
     {
         get
@@ -251,11 +251,11 @@ public sealed class RingBufferPool : IDisposable
     // ------------------------------------------------------------------ used by RingBuffer<T>
 
     /// <summary>
-    /// Takes the most recently returned idle creator section with a header view of <paramref name="headerBytes"/> and a data region of <paramref name="dataBytes"/>
+    /// Takes the most recently returned idle creator section with a data region of <paramref name="dataBytes"/> and a tag reserve of <paramref name="tagReserveBytes"/>
     /// that nobody else holds open, with its <c>InitState</c> left at 0 for the caller to re-initialise; <see langword="null"/> when there is none (the caller
     /// maps a new section).
     /// </summary>
-    internal PooledMapping? RentForCreate(long headerBytes, long dataBytes, bool global, ulong? preferredBase)
+    internal PooledMapping? RentForCreate(long dataBytes, long tagReserveBytes, bool global, ulong? preferredBase)
     {
         lock (_gate)
         {
@@ -265,7 +265,7 @@ public sealed class RingBufferPool : IDisposable
                 for (int i = _idle.Count - 1; i >= 0 && candidates < MaxReuseCandidates; i--)        // newest first: its pages are the warmest
                 {
                     PooledMapping e = _idle[i];
-                    if (!e.IsCreator || e.DataBytes != dataBytes || e.HeaderBytes != headerBytes || e.Global != global
+                    if (!e.IsCreator || e.DataBytes != dataBytes || e.TagReserveBytes != tagReserveBytes || e.Global != global
                         || (preferredBase is ulong b && b != 0 && e.Mapping.BaseAddress != b))
                     {
                         continue;
