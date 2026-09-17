@@ -205,5 +205,7 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
     The fast path (`GetBucket` without a wait, `TryGetBucket`) is unchanged, and so is its race with a `Dispose` of a writer that is not blocked
     (DESIGN §5.3). BenchmarkDotNet `WriteRead_Protocol`, one series in the order base, a, b, c, c, b, a, base (two runs each, 256 / 4096 / 65536
     floats): unchanged code 18.2 / 18.3 / 20.4 ns; (a) (b) plus `SlowGetBucket` returning the bucket 20.0 / 20.2 / 21.9 ns; (b) the fast path
-    storing `_outstanding` before loading `_closed` (without a fence) 18.9 / 19.1 / 21.6 ns; (c) this change 18.5 / 18.6 / 20.7 ns, within the
-    unchanged code's run-to-run spread today (17.7-18.7 / 18.0-20.8 / 19.9-20.8 ns over five runs).
+    storing `_outstanding` before loading `_closed` (without a fence) 18.9 / 19.1 / 21.6 ns; (c) this change 18.5 / 18.6 / 20.7 ns. With (c), the
+    Tier1 code of `GetBucket` is identical to the unchanged code's (`DOTNET_JitDisasm`). A second series (base, c, c, base, base, c; three runs
+    each) measured 18.6 / 18.5 / 20.2 ns for the unchanged code and 19.0 / 19.0 / 20.7 ns for (c), whose last run gave 18.2 / 18.7 / 20.3 ns: with
+    the same machine code, the difference can only come from code placement (the larger `SlowGetBucket` moves later JIT allocations).
