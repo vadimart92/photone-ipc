@@ -189,6 +189,27 @@ public sealed class RingBufferPool : IDisposable
         }
     }
 
+    /// <summary>
+    /// Of <see cref="IdleBytes"/>: the committed tag memory those mappings hold. Pages of a section cannot be decommitted, so this memory goes away only
+    /// with the mapping — when it expires, or with <see cref="Trim"/>, <see cref="RingBufferPoolOptions.MaxIdleBytes"/> or <see cref="Dispose"/>.
+    /// </summary>
+    public long IdleTagBytes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                long bytes = 0;
+                foreach (PooledMapping entry in _idle)
+                {
+                    bytes += entry.TagBytes;
+                }
+
+                return bytes;
+            }
+        }
+    }
+
     /// <summary><c>Create</c> calls served by an idle section.</summary>
     internal long ReusedCount => Interlocked.Read(ref _reused);
 

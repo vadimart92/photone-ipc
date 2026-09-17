@@ -1896,6 +1896,11 @@ Cost: COSTS
 * With `MaxUnreadTags` / `MaxUnreadTagBytes`, tags become back-pressure: sized too small for the chunks readers wait for, writer and readers deadlock
   until something is disposed (§16.4). A commit whose own tags exceed the limit throws `InvalidOperationException` and is dropped.
 * Committed tag memory is never decommitted while the section exists; it counts against the system commit limit, and a pool keeps it with the section.
+  `RingBuffer.TagMemory` reports it (`TagMemoryInfo`: the committed sizes, the current ring, the ring switches, the unread tags and bytes the writer holds,
+  and the persistent keys); a pooled section's total includes what the buffers before this one committed, and `RingBufferPool.IdleTagBytes` reports what
+  idle mappings keep. An opener reads the committed sizes and the key count from the control block; the writer's own counters are 0 there.
+* The persistent-tag table is the one part that only grows: a key never gives its slot back while the buffer lives. An unbounded set of keys fills the
+  2 GiB region and the commit is then dropped with `InvalidOperationException`.
 * The writer's readers share the tag instances: a tag changed or added again after `AddTag` is seen changed by all of them.
 * `InProcess` tags are invisible to every opener, also an opener in the writer's process.
 * A writer that dies in the middle of `PublishSnapshot` leaves joining readers without persistent state; readers already attached keep theirs.

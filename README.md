@@ -115,6 +115,10 @@ reader.Advance(100);                                  // passing a persistent ta
   slowest reader has not read yet, and the data ring's back-pressure bounds those elements. Committed pages stay with the section until it is destroyed
   (Windows cannot decommit pages of a shared section), so a buffer keeps its high-water mark. Tag memory lives in the section, so a reader can drain every
   tag after the writer's process has exited.
+* **What it costs, at any moment.** `buffer.TagMemory` reports that high-water mark (`CommittedBytes`, split into the ring generations and the persistent-tag
+  table), what still holds it (`UnreadTags` / `UnreadBytes`, the tags the slowest reader has not passed), the ring the log is in and how often it has moved,
+  and `PersistentKeys` — the one number that only grows, one table slot per distinct key for the buffer's life. A process that opened the buffer sees the
+  committed sizes and the keys; the writer's own bookkeeping is writer-side only. `pool.IdleTagBytes` reports what the pool's idle mappings still hold.
 * **Optional limit.** `MaxUnreadTags` (and, for `CrossProcess`, `MaxUnreadTagBytes`) bound what the writer keeps for the slowest reader: a commit that
   would exceed the limit waits for readers, exactly as `GetBucket` waits for space, and `Dispose` ends that wait. Both default to 0, no limit. Nothing
   breaks a deadlock: if a reader waits for more elements than are published while the writer waits for that reader to read past tags, both stop, so size
@@ -473,5 +477,7 @@ Repository layout: `src/Photone.Ipc` (library), `tests/` (xunit.v3 tests + test 
 * Tags allocate (in process: the tag objects and the object log's chunks; across processes: serialization and one object per tag per reader); only
   the element path is allocation-free. Shared tag memory is committed as tags need it and never decommitted while the buffer's section exists (Windows
   cannot decommit shared pages); one ring holds at most 16 GiB of tags that readers have not read past, and the last persistent tag of every key
-  takes just under 2 GiB at most. A reader that dies holds tag memory until a sweep evicts it (before the log grows, or when the writer blocks for
+  takes just under 2 GiB at most. It is a commit charge against the system limit, not private bytes, and it goes away only with the section — watch it
+  with `buffer.TagMemory` and `pool.IdleTagBytes`, bound it with `MaxUnreadTags` / `MaxUnreadTagBytes`, and keep the set of persistent keys bounded (a key
+  per message fills the table). A reader that dies holds tag memory until a sweep evicts it (before the log grows, or when the writer blocks for
   space). Readers of the writer's own buffer share the tag instances: treat tags as immutable once added.
