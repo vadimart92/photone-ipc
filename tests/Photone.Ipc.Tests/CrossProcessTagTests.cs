@@ -43,7 +43,7 @@ public sealed class CrossProcessTagTests
         using var buffer = RingBuffer<long>.Open(name, new RingBufferOptions { TagSerializer = TagPlan.CreateSerializer() });
         using RingReader<long> reader = buffer.CreateReader();
         Assert.Equal(1 << 14, buffer.TagCapacity);
-        Assert.Empty(reader.ReadLastTagValues());
+        Assert.Equal(0, reader.ReadLastTagValues().Length);
         child.WriteLine("go");
 
         var rng = new Random(8);

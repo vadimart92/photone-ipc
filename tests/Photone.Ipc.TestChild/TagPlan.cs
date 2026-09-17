@@ -79,19 +79,19 @@ public static class TagPlan
             int k = StateAt(o);
             if (k >= 0)
             {
-                bucket.AddTag(new StateTag { Offset = (ulong)o, Key = StateKey(k), Value = o });
+                bucket.AddTag(new StateTag { Key = StateKey(k), Value = o }, (int)(o - start));
                 added++;
             }
 
             if (LabelAt(o))
             {
-                bucket.AddTag(new LabelTag { Offset = (ulong)o, Text = "at " + o.ToString(CultureInfo.InvariantCulture) });
+                bucket.AddTag(new LabelTag { Text = "at " + o.ToString(CultureInfo.InvariantCulture) }, (int)(o - start));
                 added++;
             }
 
             if (RateAt(o))
             {
-                bucket.AddTag(new SampleRateTag { Offset = (ulong)o, Rate = RateValue(o) });
+                bucket.AddTag(new SampleRateTag { Rate = RateValue(o) }, (int)(o - start));
                 added++;
             }
         }
@@ -173,16 +173,31 @@ public static class TagPlan
         return t == tags.Length ? null : Inv($"chunk [{chunk.Cursor}, {chunk.Cursor + chunk.Length}) has {tags.Length} tags, the plan {t}");
     }
 
+    /// <summary>The tag with <paramref name="key"/> in <paramref name="tags"/>, or <see langword="null"/>.</summary>
+    public static ITag? Find(ReadOnlySpan<ITag> tags, string key)
+    {
+        foreach (ITag tag in tags)
+        {
+            if (tag.Key == key)
+            {
+                return tag;
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>Checks <see cref="RingReader{T}.ReadLastTagValues"/> of a reader at <paramref name="cursor"/>; <see langword="null"/> when it matches the plan.</summary>
-    public static string? CheckState(IReadOnlyDictionary<string, ITag> state, long cursor)
+    public static string? CheckState(ReadOnlySpan<ITag> state, long cursor)
     {
         int expectedCount = 0;
         for (int k = 0; k < StateKeys; k++)
         {
             long last = LastBefore(cursor, o => StateAt(o) == k);
+            ITag? tag = Find(state, StateKey(k));
             if (last < 0)
             {
-                if (state.ContainsKey(StateKey(k)))
+                if (tag is not null)
                 {
                     return Inv($"state at {cursor}: {StateKey(k)} present, the plan has none");
                 }
@@ -191,9 +206,9 @@ public static class TagPlan
             }
 
             expectedCount++;
-            if (!state.TryGetValue(StateKey(k), out ITag? tag) || tag is not StateTag s || s.Value != last || s.Offset != (ulong)last)
+            if (tag is not StateTag s || s.Value != last || s.Offset != (ulong)last)
             {
-                return Inv($"state at {cursor}: {StateKey(k)} = {Show(state.GetValueOrDefault(StateKey(k)))}, the plan {last}");
+                return Inv($"state at {cursor}: {StateKey(k)} = {Show(tag)}, the plan {last}");
             }
         }
 
@@ -201,13 +216,14 @@ public static class TagPlan
         if (rate >= 0)
         {
             expectedCount++;
-            if (!state.TryGetValue(SampleRateTag.TagKey, out ITag? tag) || tag is not SampleRateTag r || r.Rate != RateValue(rate))
+            ITag? tag = Find(state, SampleRateTag.TagKey);
+            if (tag is not SampleRateTag r || r.Rate != RateValue(rate) || r.Offset != (ulong)rate)
             {
-                return Inv($"state at {cursor}: sample_rate = {Show(state.GetValueOrDefault(SampleRateTag.TagKey))}, the plan {RateValue(rate)}");
+                return Inv($"state at {cursor}: sample_rate = {Show(tag)}, the plan {RateValue(rate)}");
             }
         }
 
-        return state.Count == expectedCount ? null : Inv($"state at {cursor} has {state.Count} keys, the plan {expectedCount}");
+        return state.Length == expectedCount ? null : Inv($"state at {cursor} has {state.Length} keys, the plan {expectedCount}");
     }
 
     private static long LastBefore(long cursor, Func<long, bool> planned)

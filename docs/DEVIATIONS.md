@@ -203,7 +203,8 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
     that throws `TagLogFullException`.
 
 45. **The requested tag API, adjusted** (DESIGN §16.1): `ITag.IsPersistent` is `static virtual` with a default of `false` (a `static abstract` member would make
-    `ReadOnlyMemory<ITag>` illegal, CS8920); `ReadLastTagValues` returns `IReadOnlyDictionary<string, ITag>`; a chunk's tags are the tags of its own elements
+    `ReadOnlyMemory<ITag>` illegal, CS8920); `Offset` has a setter and is set by `AddTag` (`bucket.AddTag(tag, index)`, `buffer.AddTag(tag)`);
+    `ReadLastTagValues` returns `ReadOnlySpan<ITag>` (no allocation, the key is in each tag); a chunk's tags are the tags of its own elements
     (`StartOffset <= Offset < StartOffset + Length`, not every tag at or after the start); `StartOffset` is added to `Chunk` and `Bucket`.
 
 46. **Join step (f): the start cursor is published with a full fence and a waiting writer is woken** (DESIGN §5.6 ended with the plain store of (d), and

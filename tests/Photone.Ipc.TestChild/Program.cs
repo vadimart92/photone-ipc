@@ -254,7 +254,7 @@ internal static unsafe class Program
         long count = long.Parse(args[2], CultureInfo.InvariantCulture);
         using RingBuffer<long> buffer = RingBuffer<long>.Open(name, new RingBufferOptions { TagSerializer = TagPlan.CreateSerializer() });
         using RingReader<long> reader = buffer.CreateReader();
-        IReadOnlyDictionary<string, ITag> start = reader.ReadLastTagValues();
+        ReadOnlySpan<ITag> start = reader.ReadLastTagValues();
         string? error = TagPlan.CheckState(start, reader.ReadCursor);
         if (error is not null)
         {
@@ -262,7 +262,7 @@ internal static unsafe class Program
             return 4;
         }
 
-        Print(Inv($"ready cursor={reader.ReadCursor} stateKeys={start.Count}"));
+        Print(Inv($"ready cursor={reader.ReadCursor} stateKeys={start.Length}"));
         var rng = new Random(99);
         long remaining = count;
         long tags = 0;

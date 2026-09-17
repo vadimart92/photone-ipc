@@ -55,9 +55,10 @@ Semantics in one table:
 | `RingBuffer.Dispose()` (writer) | commits `0` for an outstanding bucket, publishes *Closed*, wakes every reader; readers keep draining |
 | `RingReader.Dispose()` | releases the slot, wakes a blocked writer, completes a pending `Wait` with `ObjectDisposedException` |
 | `RingBufferOptions.Pool` | `Create`/`Open` take the shared memory from a `RingBufferPool` and give it back on release (see below) |
-| `Bucket.AddTag(tag)` | attaches a tag to the element at `tag.Offset` (inside the bucket); published by `Commit` with the elements (see "Stream tags") |
+| `Bucket.AddTag(tag, index = 0)` | attaches a tag to element `index` of the bucket (sets `tag.Offset`); published by `Commit` with the elements (see "Stream tags") |
+| `RingBuffer.AddTag(tag)` | attaches a tag to the next element the writer publishes, without a bucket |
 | `Chunk.Tags` | the tags of the chunk's elements, in offset order |
-| `RingReader.ReadLastTagValues()` | the last persistent tag of every key before `ReadCursor` |
+| `RingReader.ReadLastTagValues()` | `ReadOnlySpan<ITag>`: the last persistent tag of every key before `ReadCursor` |
 
 Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true, Pool = null, TagCapacity = 0, PersistentTagCapacity = 16 KiB, TagSerializer = null }`,
 `ReaderOptions { SpinTime = 20 µs, MaxSpinTime = null, AsyncSpinTime = 5 µs, AllowSynchronousContinuations = true }`,
@@ -75,26 +76,29 @@ the reader can ask for the last one of every key at any time, including right af
 public sealed class SampleRate : ITag                 // any serializable type; the reader's process needs a type of the same shape
 {
     public static bool IsPersistent => true;          // state: ReadLastTagValues keeps the last one per key
-    public ulong Offset { get; set; }                 // the absolute element index the tag belongs to
+    public ulong Offset { get; set; }                 // the absolute element index: set by AddTag, and on every reader from the record
     public string Key => "sample_rate";
     public double Hz { get; set; }
 }
 
+public sealed class BurstStart : ITag { public ulong Offset { get; set; } public string Key => "burst"; }   // an event: not persistent
+
 // writer process: tags are opt-in per buffer
 var writerOptions = new RingBufferOptions { TagCapacity = 1 << 20, TagSerializer = new JsonTagSerializer() };
 using var buffer = RingBuffer<float>.Create(1 << 20, "sdr", writerOptions);
+buffer.AddTag(new SampleRate { Hz = 48_000 });        // no bucket needed: attaches to the next element written
 using (var bucket = buffer.GetBucket(1024))
 {
     Fill(bucket.Span);
-    bucket.AddTag(new SampleRate { Offset = bucket.StartOffset, Hz = 48_000 });   // serialized now
-    bucket.Commit(1024);                                                           // published with the elements
+    bucket.AddTag(new BurstStart(), 100);             // element 100 of this bucket (index 0, the default, is its first element)
+    bucket.Commit(1024);                              // both tags are published with the elements
 }
 
 // reader process: register the tag types this process wants back as objects
-var tags = new JsonTagSerializer().Register<SampleRate>();
+var tags = new JsonTagSerializer().Register<SampleRate>().Register<BurstStart>();
 using var opened = RingBuffer<float>.Open("sdr", new RingBufferOptions { TagSerializer = tags });
 using var reader = opened.CreateReader();
-var rate = reader.ReadLastTagValues().GetValueOrDefault("sample_rate") as SampleRate;   // the rate in effect where the reader starts
+foreach (ITag tag in reader.ReadLastTagValues()) { }  // the state where the reader starts: one tag per key, no allocation
 reader.TryRead(100, out var chunk);
 foreach (ITag tag in chunk.Tags.Span) { }             // StartOffset <= tag.Offset < StartOffset + Length, in offset order
 reader.Advance(100);                                  // passing a persistent tag makes it the key's last value
@@ -103,9 +107,12 @@ reader.Advance(100);                                  // passing a persistent ta
 * **Opt-in and sizing.** `TagCapacity` (creator) is the tag log in bytes: tags that are written but not yet read past by the slowest reader. 0, the
   default, means no tags, and the buffer is laid out and behaves exactly as before. `PersistentTagCapacity` (default 16 KiB) holds the last persistent tag
   of every key. `AddTag` throws when a bucket's tags could not fit.
-* **Exactly once, never early.** `chunk.Tags` holds the tags of the chunk's elements; `ReadLastTagValues()` holds the persistent tags *before*
-  `ReadCursor`. A tag is either ahead of the reader (it arrives in a chunk) or behind it (it is state), never both. `Commit(k)` publishes the tags of the
-  first `k` elements and drops the rest with the dropped elements; tags may be added in any order.
+* **Where a tag goes.** `bucket.AddTag(tag, index)` puts it on element `index` of the bucket. `buffer.AddTag(tag)` puts it on the next element the writer
+  publishes: it waits through commits that publish nothing and is dropped only if the writer closes before publishing another element. Both set
+  `tag.Offset`; readers set it again from the record, so a tag type does not even need to serialize it.
+* **Exactly once, never early.** `chunk.Tags` holds the tags with `StartOffset <= Offset < StartOffset + Length`; `ReadLastTagValues()` holds, without
+  allocating, one persistent tag per key *before* `ReadCursor`. A tag is either ahead of the reader (it arrives in a chunk) or behind it (it is state),
+  never both. `Commit(k)` publishes the tags of the first `k` elements and drops the rest with the dropped elements; tags may be added in any order.
 * **Serialization.** `JsonTagSerializer` writes each tag's JSON with its type name (default: the full type name) next to the key, the offset and the
   persistent flag. A reader turns a tag back into an object when a type is registered under that name in its own process, and otherwise delivers an
   `UnknownTag` with the raw JSON (also when deserialization throws, with the exception). The parameterless constructor uses reflection; for trimming or
@@ -409,7 +416,7 @@ Reading it:
 
 ```
 dotnet build E:\GitHub\photone-ipc\Photone.Ipc.slnx -c Release
-dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 366 tests, ~33 s
+dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 371 tests, ~35 s
 
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]

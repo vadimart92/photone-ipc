@@ -46,7 +46,7 @@ using (buffer)
     // ---- the API sketch, reader side -------------------------------------------------------------
     using var reader = buffer.CreateReader();                   // independent cursor; starts at the current head of the stream
     Console.WriteLine($"          slot={reader.Slot}  cursor={reader.ReadCursor:N0}  (Ctrl+C stops)");
-    if (reader.ReadLastTagValues().GetValueOrDefault("format") is StreamFormat joined)   // written long before this reader existed
+    if (CurrentFormat(reader) is StreamFormat joined)            // written long before this reader existed
     {
         Console.WriteLine($"          format in effect: {joined.Frequency} Hz tone at {joined.SampleRate:N0} samples/s (set at sample {joined.Offset:N0})");
     }
@@ -118,7 +118,7 @@ using (buffer)
             {
                 double perSec = (consumed - lastConsumed) / (now - lastReport);
                 double rms = Math.Sqrt(sumSquares / Math.Max(1, sumCount));
-                double tone = reader.ReadLastTagValues().GetValueOrDefault("format") is StreamFormat current ? current.Frequency : double.NaN;
+                double tone = CurrentFormat(reader)?.Frequency ?? double.NaN;
                 Console.WriteLine($"[{now,7:F1} s] consumed={consumed:N0}  {perSec:N0} samples/s  rms={rms:F4} peak={peak:F4}  tone={tone} Hz  seconds marked={marks}  lag={buffer.WriteCursor - reader.ReadCursor:N0}  status={reader.Status}");
                 lastReport = now;
                 lastConsumed = consumed;
@@ -145,6 +145,20 @@ using (buffer)
     }
 
     Console.WriteLine($"done: consumed={consumed:N0}  status={reader.Status}  completed={reader.IsCompleted}");
+}
+
+// the format in effect at the reader's position: the last persistent "format" tag before it (ReadLastTagValues is a span over the reader's own array)
+static StreamFormat? CurrentFormat(RingReader<float> reader)
+{
+    foreach (ITag tag in reader.ReadLastTagValues())
+    {
+        if (tag is StreamFormat format)
+        {
+            return format;
+        }
+    }
+
+    return null;
 }
 
 /// <summary>This process's view of the Writer's "sine.format" tag (persistent).</summary>

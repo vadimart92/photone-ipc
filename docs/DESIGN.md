@@ -1537,15 +1537,16 @@ carries the tags of its elements; a tag type declares itself persistent, and a r
 public interface ITag
 {
     static virtual bool IsPersistent => false;   // a persistent tag is state: the last one per key stays readable (ReadLastTagValues)
-    ulong Offset { get; }                        // absolute element index (Chunk.StartOffset / Bucket.StartOffset space)
+    ulong Offset { get; set; }                   // absolute element index (Chunk.StartOffset / Bucket.StartOffset space); set by AddTag and from the record
     string Key { get; }
 }
 
 var options = new RingBufferOptions { TagCapacity = 1 << 20, TagSerializer = new JsonTagSerializer() };   // writer
 using var buffer = RingBuffer<float>.Create(1 << 20, "sdr", options);
+buffer.AddTag(new SampleRate { Hz = 48_000 });                                    // no bucket: the next element the writer publishes
 using (var bucket = buffer.GetBucket(1024))
 {
-    bucket.AddTag(new SampleRate { Offset = bucket.StartOffset, Hz = 48_000 });   // serialized now, published by Commit
+    bucket.AddTag(new BurstStart(), 100);                                          // element 100 of the bucket; serialized now, published by Commit
     bucket.Commit(1024);
 }
 
@@ -1555,7 +1556,7 @@ using var reader = opened.CreateReader();
 reader.TryRead(100, out var chunk);
 foreach (ITag tag in chunk.Tags.Span) { }                                          // StartOffset <= Offset < StartOffset + Length, offset order
 reader.Advance(100);
-IReadOnlyDictionary<string, ITag> state = reader.ReadLastTagValues();              // last persistent tag per key with Offset < ReadCursor
+ReadOnlySpan<ITag> state = reader.ReadLastTagValues();                             // last persistent tag per key with Offset < ReadCursor, no copy
 ```
 
 | Call | Rule |
@@ -1563,17 +1564,18 @@ IReadOnlyDictionary<string, ITag> state = reader.ReadLastTagValues();           
 | `RingBufferOptions.TagCapacity` | creator; bytes of the tag log, rounded up to a power of two ≥ 4 KiB; **0 (default) = no tags** |
 | `RingBufferOptions.PersistentTagCapacity` | creator; bytes of the persistent-tag table (default 16 KiB), plus the slack that rounds the tag area to 64 KiB |
 | `RingBufferOptions.TagSerializer` | per process; `null`: the writer cannot add tags, readers deliver `UnknownTag`s |
-| `Bucket.AddTag<TTag>(tag)` | `StartOffset <= tag.Offset < StartOffset + Length`; `TTag` concrete (it decides persistence and the type name); serializes at once; throws if the bucket's tags exceed the log, one tag exceeds the log, or the last persistent tag of every key could exceed the table |
+| `Bucket.AddTag<TTag>(tag, index = 0)` | `0 <= index < Length`; sets `tag.Offset = StartOffset + index`; `TTag` concrete (it decides persistence and the type name); serializes at once; throws if the pending tags exceed the log, one tag exceeds the log, or the last persistent tag of every key could exceed the table |
+| `RingBuffer.AddTag<TTag>(tag)` | writer; sets `tag.Offset = WriteCursor` (the first element of the outstanding bucket, if any); pending until a commit publishes at least one element, through commits that publish none; dropped if the writer closes first |
 | `Bucket.Commit(k)` | publishes the tags with `Offset < StartOffset + k` with the elements, drops the rest; waits while the log is full (§16.4) |
 | `Chunk.Tags` | `ReadOnlyMemory<ITag>`: the chunk's tags, in offset order, equal offsets in add order; reader-owned memory, valid until `Advance` passes it |
-| `RingReader.ReadLastTagValues()` | a copy; the last persistent tag of every key with `Offset < ReadCursor`, including tags written before the reader joined |
+| `RingReader.ReadLastTagValues()` | `ReadOnlySpan<ITag>` over the reader's own array (no allocation; valid until the next `TryRead`/`Advance`): the last persistent tag of every key with `Offset < ReadCursor`, one per key in first-seen order, including tags written before the reader joined |
 | `JsonTagSerializer` | `Register<TTag>(name?)` (default name: full type name); the parameterless constructor is reflection-based (`RequiresUnreferencedCode`/`RequiresDynamicCode`); `JsonTagSerializer(JsonSerializerOptions)` with a source-generated resolver is AOT-safe |
 | `UnknownTag` | a tag whose type name the reader does not know, or whose payload failed to deserialize (`Error`); keeps `Offset`, `Key`, `Persistent`, `Payload` |
 
 Deviations from the requested sketch: `IsPersistent` is `static virtual` with a default (an interface with a `static abstract` member cannot be a type
-argument, so `ReadOnlyMemory<ITag>` would not compile); `ReadLastTagValues` returns `IReadOnlyDictionary<string, ITag>` keyed by `Key`; the chunk's
-tags are those of its own elements (`StartOffset <= Offset < StartOffset + Length`), so a tag is delivered exactly once per pass and never ahead of its
-element. `Chunk.StartOffset` / `Bucket.StartOffset` are `Cursor` as `ulong`.
+argument, so `ReadOnlyMemory<ITag>` would not compile); `Offset` has a setter, because `AddTag` sets it; the chunk's tags are those of its own elements
+(`StartOffset <= Offset < StartOffset + Length`), so a tag is delivered exactly once per pass and never ahead of its element. `Chunk.StartOffset` /
+`Bucket.StartOffset` are `Cursor` as `ulong`.
 
 ### 16.2 Layout (version 3)
 
@@ -1628,6 +1630,12 @@ Proof: let reader `r` not have loaded record `X` of commit `j` (`A = W(j-1)`, `W
 so it came before `TagEnd(j)` was stored, and so did the write-cursor load before it; that load cannot have seen `W(j)`, hence `R ≤ _tagLoadedW ≤ A`.
 A joining reader's `R ≥ w2 ≥ _min` holds as in §5.6, and its own loads follow §16.5. The cached `_min` only under-estimates. So no reader that can
 still load `X` has a cursor above `A`, and `Free` never releases bytes somebody may still read. Freeing is writer-local: nothing is published.
+
+**Tags added to the buffer.** `RingBuffer.AddTag` stages a *sticky* record at `W`, the next element to be published (with a bucket outstanding, its
+first element). `W` moves only when a commit publishes elements, and that commit's selection (`Offset < W + k`, `k >= 1`) includes every sticky record,
+so its offset stays right. A commit that publishes nothing selects no record: it drops the bucket's own records and keeps the sticky ones, moved to the
+front of the staging area in the same order. A record cannot go out before its element: the snapshot requires every record before `TagSnapshotEnd` to have
+an offset below `TagSnapshotW`, and a joining reader would otherwise take state from an element that does not exist yet.
 
 **Waiting.** A commit whose tags do not fit waits exactly like `GetBucket` for space (`WaitForMin`: adaptive spin, then the kernel wait with the laggard
 process handles; readers' `Advance` wakes it on crossing `WriterWaitFor`). With no readers `ScanMin` returns `W`, and every published record has
@@ -1707,7 +1715,9 @@ chunk.Tags (on access): the queued tags with Offset < StartOffset + Length
 
 Loading happens at most once per new write cursor and always before the cursor store that passes the tags, which is what §16.4 relies on. Records are
 parsed in place (a wrapping record is copied first), validated (`RingBufferLayoutException` when malformed), and deserialized by the reader's
-serializer; an unknown type name or a serializer exception yields an `UnknownTag`. Records a reader has not loaded are never released (§16.4), so they span
+serializer, which gets `Offset` set from the record (so a tag type need not serialize it); an unknown type name or a serializer exception yields an
+`UnknownTag`. The last persistent tag of each key lives in an array (one slot per key, in first-seen order, a new array when it grows), which
+`ReadLastTagValues` returns as a span. Records a reader has not loaded are never released (§16.4), so they span
 at most `L` bytes: a larger `TagEnd − position`, or a record longer than what remains, is corruption and is reported rather than followed (no copy can reach
 beyond the mapping). Key and type-name strings are interned per reader. The queue is never compacted in place and consumed entries are not cleared: a new
 array replaces the queue when its end is reached, so `ReadOnlyMemory<ITag>` handed out in a chunk keeps its contents, also when the reader advanced into the
@@ -1723,6 +1733,6 @@ with `JsonTagSerializer` (0.58 µs of it JSON), 1.1 µs when persistent.
 
 * The tags of one bucket, and every single tag, must fit in the log; the last persistent tag of every key must fit in the table (`AddTag` throws).
 * Size the log for the tags of the slowest reader's lag, and at least for the tags of the largest chunk a reader waits for (§16.4).
-* Tags allocate: serialization on the writer, one object per tag per reader, a dictionary copy per `ReadLastTagValues`. Only the element path is zero-allocation.
+* Tags allocate: serialization on the writer, one object per tag per reader. `ReadLastTagValues` does not; the element path does not.
 * A writer that dies in the middle of `PublishSnapshot` leaves joining readers without persistent state; readers already attached keep theirs.
 * Keys and type names: at most 65535 UTF-8 bytes; log at most 1 GiB; table at most 64 MiB (plus slack).

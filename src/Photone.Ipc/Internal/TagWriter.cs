@@ -31,6 +31,7 @@ internal sealed unsafe class TagWriter : IBufferWriter<byte>
     private long _lastPendingOffset = long.MinValue;
     private bool _pendingSorted = true;
     private int _selectedCount;
+    private int _appendedCount;                                     // the selected tags AppendSelected published (0 until it completes)
     private long _projectedStateBytes;                              // upper bound of the table after the outstanding bucket commits
     private readonly Dictionary<string, int> _pendingStateMax = new(StringComparer.Ordinal);
 
@@ -77,11 +78,12 @@ internal sealed unsafe class TagWriter : IBufferWriter<byte>
     // ------------------------------------------------------------------ staging (AddTag)
 
     /// <summary>
-    /// Serializes <paramref name="tag"/> into a record of the outstanding bucket. On failure nothing is kept.
+    /// Serializes <paramref name="tag"/> into a pending record at <paramref name="offset"/>. On failure nothing is kept. A <paramref name="sticky"/> record
+    /// (added to the buffer, not to a bucket) stays pending through commits that do not publish its element.
     /// </summary>
     /// <exception cref="ArgumentException">The key is too long, or the record alone exceeds the log.</exception>
     /// <exception cref="InvalidOperationException">The bucket's tags exceed the log, or the persistent-tag table would overflow.</exception>
-    public void Stage<TTag>(ITagSerializer serializer, TTag tag, long offset, string key) where TTag : ITag
+    public void Stage<TTag>(ITagSerializer serializer, TTag tag, long offset, string key, bool sticky) where TTag : ITag
     {
         bool persistent = TTag.IsPersistent;
         byte[] typeName = TypeNameBytes(serializer.GetTypeName<TTag>());
@@ -149,7 +151,7 @@ internal sealed unsafe class TagWriter : IBufferWriter<byte>
             Array.Resize(ref _pending, _pending.Length * 2);
         }
 
-        _pending[_pendingCount] = new Pending { Offset = offset, Start = start, Length = recordBytes, Sequence = _pendingCount, Persistent = persistent, Key = key };
+        _pending[_pendingCount] = new Pending { Offset = offset, Start = start, Length = recordBytes, Sequence = _pendingCount, Persistent = persistent, Sticky = sticky, Key = key };
         _pendingCount++;
         _pendingBytes += recordBytes;
         if (offset < _lastPendingOffset)
@@ -314,6 +316,8 @@ internal sealed unsafe class TagWriter : IBufferWriter<byte>
             Volatile.Write(ref _hdr->TagEnd, _end);                   // after the bytes: a reader that loads the new end finds complete records
             _snapshotDirty = true;
         }
+
+        _appendedCount = _selectedCount;
     }
 
     private long SelectedBytes()
@@ -360,22 +364,62 @@ internal sealed unsafe class TagWriter : IBufferWriter<byte>
         _stateDirty = true;
     }
 
-    /// <summary>Forgets the outstanding bucket's tags (after publishing the selected ones, or when the bucket is dropped).</summary>
-    public void ClearPending()
+    /// <summary>
+    /// After a commit (or when its bucket is dropped): forgets the published tags and the unpublished tags of the bucket. With <paramref name="keepSticky"/>,
+    /// the unpublished tags that were added to the buffer stay pending, moved to the front of the staging area (in offset order, as they were).
+    /// </summary>
+    public void ClearPending(bool keepSticky)
     {
-        Array.Clear(_pending, 0, _pendingCount);
-        _pendingCount = 0;
-        _pendingBytes = 0;
-        _stagingLength = 0;
+        int kept = 0;
+        int length = 0;
+        if (keepSticky)
+        {
+            for (int i = _appendedCount; i < _pendingCount; i++)
+            {
+                Pending p = _pending[i];
+                if (!p.Sticky)
+                {
+                    continue;
+                }
+
+                _staging.AsSpan(p.Start, p.Length).CopyTo(_staging.AsSpan(length));   // overlapping copies move correctly
+                p.Start = length;
+                p.Sequence = kept;
+                _pending[kept++] = p;
+                length += p.Length;
+            }
+        }
+
+        Array.Clear(_pending, kept, _pendingCount - kept);
+        _pendingCount = kept;
+        _pendingBytes = length;
+        _stagingLength = length;
         _selectedCount = 0;
-        _pendingSorted = true;
-        _lastPendingOffset = long.MinValue;
+        _appendedCount = 0;
+        _pendingSorted = true;                                      // a sorted selection leaves its remainder sorted
+        _lastPendingOffset = kept == 0 ? long.MinValue : _pending[kept - 1].Offset;
         if (_pendingStateMax.Count != 0)
         {
             _pendingStateMax.Clear();
         }
 
         _projectedStateBytes = _stateUsed;
+        for (int i = 0; i < kept; i++)
+        {
+            if (_pending[i].Persistent)
+            {
+                // the same projection as Stage, without its limit: these records were accepted when they were staged
+                int committed = _stateRecords.TryGetValue(_pending[i].Key, out byte[]? current) ? current.Length : 0;
+                _pendingStateMax.TryGetValue(_pending[i].Key, out int pending);
+                int before = Math.Max(committed, pending);
+                int after = Math.Max(before, _pending[i].Length);
+                _projectedStateBytes += after - before;
+                if (_pending[i].Length > pending)
+                {
+                    _pendingStateMax[_pending[i].Key] = _pending[i].Length;
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -422,6 +466,7 @@ internal sealed unsafe class TagWriter : IBufferWriter<byte>
         public int Length;
         public int Sequence;
         public bool Persistent;
+        public bool Sticky;
         public string Key;
     }
 

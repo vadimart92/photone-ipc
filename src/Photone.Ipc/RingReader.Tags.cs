@@ -1,4 +1,3 @@
-using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 using Photone.Ipc.Internal;
 
@@ -14,14 +13,16 @@ public sealed unsafe partial class RingReader<T>
 
     /// <summary>
     /// The last persistent tag (<see cref="ITag.IsPersistent"/>) of every key whose offset lies before <see cref="ReadCursor"/>: the state in effect at the
-    /// reader's position. It includes tags written before the reader joined (from the writer's persistent-tag table) and advances with <see cref="Advance"/>;
-    /// the tags at or after <see cref="ReadCursor"/> arrive in <see cref="Chunk{T}.Tags"/> instead. Returns a copy; empty when the buffer carries no tags.
+    /// reader's position, one tag per <see cref="ITag.Key"/>, in the order the keys first appeared. It includes tags written before the reader joined (from
+    /// the writer's persistent-tag table) and advances with <see cref="Advance"/>; the tags at or after <see cref="ReadCursor"/> arrive in
+    /// <see cref="Chunk{T}.Tags"/> instead. A view of the reader's own array, without a copy: valid until the next <see cref="TryRead"/> or
+    /// <see cref="Advance"/>. Empty when the buffer carries no tags.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The reader was disposed.</exception>
-    public IReadOnlyDictionary<string, ITag> ReadLastTagValues()
+    public ReadOnlySpan<ITag> ReadLastTagValues()
     {
         ThrowIfDisposed();
-        return _tags is null ? ReadOnlyDictionary<string, ITag>.Empty : _tags.LastValues();
+        return _tags is null ? default : _tags.LastValues();
     }
 
     /// <summary>The reader's tag state (tests).</summary>

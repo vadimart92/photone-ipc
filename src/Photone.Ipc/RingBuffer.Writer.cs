@@ -560,7 +560,7 @@ public sealed unsafe partial class RingBuffer<T>
             _closedWithBucket = true;                               // its span may still be in use on another thread: the mapping is never pooled (ReleaseNative)
             if (_tagWork)
             {
-                _tagWriter!.ClearPending();                         // the bucket's tags go with it
+                _tagWriter!.ClearPending(keepSticky: false);        // the bucket's tags go with it, and so do tags waiting for an element
                 _tagWork = false;
             }
 

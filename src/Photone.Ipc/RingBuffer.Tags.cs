@@ -5,14 +5,44 @@ namespace Photone.Ipc;
 
 public sealed unsafe partial class RingBuffer<T>
 {
-    private bool _tagWork;              // from the first AddTag of a bucket until its commit has published the tag snapshot
+    private bool _tagWork;              // tags are staged: from the first AddTag until a commit has published all of them and the tag snapshot
     private int _committing;            // 1 while EndWriteWithTags runs (it may wait for tag space): CloseWriter waits for it to leave
 
     /// <summary>The writer's tag state (tests).</summary>
     internal TagWriter? TagWriter => _tagWriter;
 
-    /// <summary><see cref="Bucket{T}.AddTag{TTag}"/> of the bucket that starts at <paramref name="cursor"/> and holds <paramref name="length"/> elements.</summary>
-    internal void AddTag<TTag>(long cursor, int length, TTag tag) where TTag : ITag
+    /// <summary>
+    /// Attaches <paramref name="tag"/> to the next element this writer publishes, without a bucket: sets <c>tag.Offset</c> to the current
+    /// <see cref="WriteCursor"/> (the first element of the outstanding bucket, if there is one) and serializes the tag now. It is published with the
+    /// first commit that publishes at least one element, and stays pending through commits that publish none; it is dropped if the writer is disposed
+    /// first. Readers see it in the <see cref="Chunk{T}.Tags"/> of that element. Writer thread only, like <see cref="GetBucket"/>.
+    /// </summary>
+    /// <typeparam name="TTag">The concrete tag type: it decides <see cref="ITag.IsPersistent"/> and the serializer's type name.</typeparam>
+    /// <param name="tag">The tag; its <see cref="ITag.Offset"/> is overwritten.</param>
+    /// <exception cref="InvalidOperationException">
+    /// Not the writer, or the writer is closed; the buffer carries no tags or has no <see cref="RingBufferOptions.TagSerializer"/>; the pending tags exceed
+    /// the tag log, or the last persistent tag of every key would exceed the persistent-tag table.
+    /// </exception>
+    /// <exception cref="ArgumentException"><typeparamref name="TTag"/> is an interface, the key is <see langword="null"/> or too long, or the tag alone exceeds the tag log.</exception>
+    /// <exception cref="ObjectDisposedException">The buffer was disposed.</exception>
+    public void AddTag<TTag>(TTag tag) where TTag : ITag
+    {
+        ThrowIfDisposed();
+        if (!_isWriter)
+        {
+            throw new InvalidOperationException("Only the creating process can write tags; this buffer was opened in the reader role.");
+        }
+
+        if (Volatile.Read(ref _closed) != 0)
+        {
+            throw new InvalidOperationException("The writer has been closed.");
+        }
+
+        StageTag(tag, _w, sticky: true);
+    }
+
+    /// <summary><see cref="Bucket{T}.AddTag{TTag}"/>: element <paramref name="index"/> of the bucket that starts at <paramref name="cursor"/> and holds <paramref name="length"/> elements.</summary>
+    internal void AddBucketTag<TTag>(long cursor, int length, int index, TTag tag) where TTag : ITag
     {
         ThrowIfDisposed();
         if (!_outstanding || cursor != _w || cursor + length != _e || Volatile.Read(ref _closed) != 0)
@@ -20,6 +50,11 @@ public sealed unsafe partial class RingBuffer<T>
             throw new InvalidOperationException("The bucket is no longer outstanding.");
         }
 
+        StageTag(tag, cursor + index, sticky: false);
+    }
+
+    private void StageTag<TTag>(TTag tag, long offset, bool sticky) where TTag : ITag
+    {
         TagWriter tags = _tagWriter
             ?? throw new InvalidOperationException("This buffer carries no tags: create it with RingBufferOptions.TagCapacity greater than 0.");
         ITagSerializer serializer = _options.TagSerializer
@@ -30,14 +65,9 @@ public sealed unsafe partial class RingBuffer<T>
             throw new ArgumentException($"AddTag needs the concrete tag type, not {typeof(TTag)}: persistence and the serialized type name come from it.", nameof(tag));
         }
 
-        ulong offset = tag.Offset;
-        if (offset < (ulong)cursor || offset - (ulong)cursor >= (ulong)length)
-        {
-            throw new ArgumentOutOfRangeException(nameof(tag), offset, $"The tag's Offset must lie in the bucket, [{cursor}, {cursor + length}).");
-        }
-
         string key = tag.Key ?? throw new ArgumentException("The tag's Key is null.", nameof(tag));
-        tags.Stage(serializer, tag, (long)offset, key);
+        tag.Offset = (ulong)offset;
+        tags.Stage(serializer, tag, offset, key, sticky);
         _tagWork = true;
     }
 
@@ -72,8 +102,8 @@ public sealed unsafe partial class RingBuffer<T>
                 SignalReaders(m, _w);
             }
 
-            _tagWork = false;
-            _tagWriter!.PublishSnapshot(_w);                        // AFTER the write cursor: a snapshot never names a cursor that is not published
+            _tagWork = _tagWriter!.PendingCount != 0;               // tags added to the buffer wait for a commit that publishes an element
+            _tagWriter.PublishSnapshot(_w);                         // AFTER the write cursor: a snapshot never names a cursor that is not published
             _outstanding = false;
         }
         finally
@@ -85,7 +115,8 @@ public sealed unsafe partial class RingBuffer<T>
     /// <summary>
     /// Commit, before the write cursor is published: appends the records of the committed prefix to the log and publishes <c>TagEnd</c> (DESIGN §16.4).
     /// Waits while the log is full. If it fails (the buffer disposed meanwhile, <see cref="TagLogFullException"/>), the whole bucket is dropped: nothing
-    /// of it is published. Runs only inside <see cref="EndWriteWithTags"/>, after its disposal check, so no closing thread touches the bucket meanwhile.
+    /// of it is published. Tags added to the buffer rather than to the bucket stay pending in both cases until an element is published.
+    /// Runs only inside <see cref="EndWriteWithTags"/>, after its disposal check, so no closing thread touches the bucket meanwhile.
     /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void PublishTags(int count)
@@ -109,12 +140,12 @@ public sealed unsafe partial class RingBuffer<T>
                 tags.AppendSelected(appendW: _w);
             }
 
-            tags.ClearPending();
+            tags.ClearPending(keepSticky: true);
         }
         catch
         {
-            tags.ClearPending();
-            _tagWork = false;
+            tags.ClearPending(keepSticky: true);
+            _tagWork = tags.PendingCount != 0;
             _e = _w;
             _outstanding = false;
             throw;

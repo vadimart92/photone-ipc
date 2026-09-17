@@ -18,7 +18,7 @@ public sealed class UnknownTag : ITag
     }
 
     /// <inheritdoc/>
-    public ulong Offset { get; }
+    public ulong Offset { get; set; }
 
     /// <inheritdoc/>
     public string Key { get; }

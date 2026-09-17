@@ -61,7 +61,7 @@ public class TagBenchmarks
     {
         using (Bucket<float> b = _tagged.GetBucket(N))
         {
-            b.AddTag(new BenchLabel { Offset = b.StartOffset + 17, Text = "burst" });
+            b.AddTag(new BenchLabel { Text = "burst" }, 17);
             b.Commit(N);
         }
 
@@ -76,7 +76,7 @@ public class TagBenchmarks
     {
         using (Bucket<float> b = _tagged.GetBucket(N))
         {
-            b.AddTag(new BenchRate { Offset = b.StartOffset, Hz = 48_000 });
+            b.AddTag(new BenchRate { Hz = 48_000 });
             b.Commit(N);
         }
 

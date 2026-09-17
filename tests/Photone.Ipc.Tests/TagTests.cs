@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Photone.Ipc.Internal;
 using Photone.Ipc.TestChild;
 
@@ -9,11 +10,11 @@ namespace Photone.Ipc.Tests;
 public sealed unsafe class TagTests
 {
     /// <summary>AddTag on a bucket, returning what it threw (a ref struct cannot be captured by an Assert.Throws lambda).</summary>
-    private static Exception? AddTagError<TTag>(Bucket<long> bucket, TTag tag) where TTag : ITag
+    private static Exception? AddTagError<TTag>(Bucket<long> bucket, TTag tag, int index = 0) where TTag : ITag
     {
         try
         {
-            bucket.AddTag(tag);
+            bucket.AddTag(tag, index);
             return null;
         }
         catch (Exception ex)
@@ -37,9 +38,11 @@ public sealed unsafe class TagTests
         bucket.Commit(commit ?? n);
     }
 
-    private static LabelTag Label(long offset, string text) => new() { Offset = (ulong)offset, Text = text };
+    private static LabelTag Label(string text) => new() { Text = text };
 
     private static string[] Texts(Chunk<long> chunk) => chunk.Tags.ToArray().Select(t => ((LabelTag)t).Text).ToArray();
+
+    private static ITag? Last(RingReader<long> reader, string key) => TagPlan.Find(reader.ReadLastTagValues(), key);
 
     // ------------------------------------------------------------------ configuration
 
@@ -53,14 +56,15 @@ public sealed unsafe class TagTests
 
         using (Bucket<long> bucket = buffer.GetBucket(4))
         {
-            InvalidOperationException ex = Assert.IsType<InvalidOperationException>(AddTagError(bucket, Label(bucket.Cursor, "x")));
+            InvalidOperationException ex = Assert.IsType<InvalidOperationException>(AddTagError(bucket, Label("x")));
             Assert.Contains("TagCapacity", ex.Message, StringComparison.Ordinal);
             bucket.Commit(4);
         }
 
+        Assert.Throws<InvalidOperationException>(() => buffer.AddTag(Label("x")));
         Assert.True(reader.TryRead(4, out Chunk<long> chunk));
         Assert.True(chunk.Tags.IsEmpty);
-        Assert.Empty(reader.ReadLastTagValues());
+        Assert.Equal(0, reader.ReadLastTagValues().Length);
         Assert.Null(reader.Tags);
     }
 
@@ -69,7 +73,7 @@ public sealed unsafe class TagTests
     {
         using var buffer = RingBuffer<long>.Create(1 << 16, options: new RingBufferOptions { TagCapacity = 1 << 16 });
         using Bucket<long> bucket = buffer.GetBucket(4);
-        InvalidOperationException ex = Assert.IsType<InvalidOperationException>(AddTagError(bucket, Label(bucket.Cursor, "x")));
+        InvalidOperationException ex = Assert.IsType<InvalidOperationException>(AddTagError(bucket, Label("x")));
         Assert.Contains("TagSerializer", ex.Message, StringComparison.Ordinal);
     }
 
@@ -110,9 +114,9 @@ public sealed unsafe class TagTests
         using RingReader<long> reader = buffer.CreateReader();
         WriteBucket(buffer, 100, b =>
         {
-            b.AddTag(Label(b.Cursor, "first"));
-            b.AddTag(Label(b.Cursor + 10, "ten"));
-            b.AddTag(Label(b.Cursor + 99, "last"));
+            b.AddTag(Label("first"));
+            b.AddTag(Label("ten"), 10);
+            b.AddTag(Label("last"), 99);
         });
 
         Assert.True(reader.TryRead(10, out Chunk<long> head));
@@ -134,14 +138,32 @@ public sealed unsafe class TagTests
     }
 
     [Fact]
+    public void AddTag_SetsTheOffset_AndReadersTakeItFromTheRecord()
+    {
+        var serializer = new JsonTagSerializer().Register<QuietOffsetTag>();
+        using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions(serializer: serializer));
+        using RingReader<long> reader = buffer.CreateReader();
+        WriteBucket(buffer, 3);
+        var tag = new QuietOffsetTag { Offset = 12345, N = 7 };        // whatever the caller put there is replaced
+        WriteBucket(buffer, 10, b => b.AddTag(tag, 4));
+        Assert.Equal(7ul, tag.Offset);
+
+        Assert.True(reader.TryRead(13, out Chunk<long> chunk));
+        QuietOffsetTag received = Assert.IsType<QuietOffsetTag>(Assert.Single(chunk.Tags.ToArray()));
+        Assert.NotSame(tag, received);
+        Assert.Equal(7ul, received.Offset);                            // not in the JSON: set from the record header
+        Assert.Equal(7, received.N);
+    }
+
+    [Fact]
     public void PartiallyAdvancedChunk_KeepsTheTagsItStillCovers()
     {
         using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
         using RingReader<long> reader = buffer.CreateReader();
         WriteBucket(buffer, 10, b =>
         {
-            b.AddTag(Label(b.Cursor + 1, "one"));
-            b.AddTag(Label(b.Cursor + 5, "five"));
+            b.AddTag(Label("one"), 1);
+            b.AddTag(Label("five"), 5);
         });
 
         Assert.True(reader.TryRead(10, out Chunk<long> chunk));
@@ -149,7 +171,7 @@ public sealed unsafe class TagTests
         reader.Advance(3);                                              // past "one", not past "five"
         for (int i = 0; i < 20; i++)
         {
-            WriteBucket(buffer, 10, b => b.AddTag(Label(b.Cursor, "later")));   // more tags join the reader's queue (and grow it)
+            WriteBucket(buffer, 10, b => b.AddTag(Label("later")));     // more tags join the reader's queue (and grow it)
         }
 
         Assert.True(reader.TryRead(207, out Chunk<long> next));
@@ -166,11 +188,11 @@ public sealed unsafe class TagTests
         using RingReader<long> reader = buffer.CreateReader();
         WriteBucket(buffer, 10, b =>
         {
-            b.AddTag(Label(b.Cursor + 5, "b"));
-            b.AddTag(Label(b.Cursor + 2, "a"));
-            b.AddTag(Label(b.Cursor + 5, "c"));
-            b.AddTag(Label(b.Cursor + 9, "e"));
-            b.AddTag(Label(b.Cursor + 5, "d"));
+            b.AddTag(Label("b"), 5);
+            b.AddTag(Label("a"), 2);
+            b.AddTag(Label("c"), 5);
+            b.AddTag(Label("e"), 9);
+            b.AddTag(Label("d"), 5);
         });
 
         Assert.True(reader.TryRead(10, out Chunk<long> chunk));
@@ -184,12 +206,12 @@ public sealed unsafe class TagTests
         using RingReader<long> reader = buffer.CreateReader();
         WriteBucket(buffer, 10, b =>
         {
-            b.AddTag(Label(b.Cursor + 3, "kept"));
-            b.AddTag(Label(b.Cursor + 5, "dropped at 5"));
-            b.AddTag(Label(b.Cursor + 8, "dropped at 8"));
+            b.AddTag(Label("kept"), 3);
+            b.AddTag(Label("dropped at 5"), 5);
+            b.AddTag(Label("dropped at 8"), 8);
         }, commit: 5);
-        WriteBucket(buffer, 5, b => b.AddTag(Label(b.Cursor, "second bucket at 5")));
-        WriteBucket(buffer, 3, b => b.AddTag(Label(b.Cursor, "dropped entirely")), commit: 0);
+        WriteBucket(buffer, 5, b => b.AddTag(Label("second bucket at 5")));
+        WriteBucket(buffer, 3, b => b.AddTag(Label("dropped entirely")), commit: 0);
 
         Assert.Equal(10, buffer.WriteCursor);
         Assert.True(reader.TryRead(10, out Chunk<long> chunk));
@@ -204,10 +226,10 @@ public sealed unsafe class TagTests
         using RingReader<long> reader = buffer.CreateReader();
         using (Bucket<long> bucket = buffer.GetBucket(4))
         {
-            bucket.AddTag(Label(bucket.Cursor, "never"));
+            bucket.AddTag(Label("never"));
         }
 
-        WriteBucket(buffer, 4, b => b.AddTag(Label(b.Cursor + 1, "published")));
+        WriteBucket(buffer, 4, b => b.AddTag(Label("published"), 1));
         Assert.True(reader.TryRead(4, out Chunk<long> chunk));
         Assert.Equal(["published"], Texts(chunk));
         Assert.Equal(0, buffer.TagWriter!.PendingCount);
@@ -220,17 +242,17 @@ public sealed unsafe class TagTests
         WriteBucket(buffer, 7);
         using (Bucket<long> bucket = buffer.GetBucket(10))
         {
-            Assert.IsType<ArgumentOutOfRangeException>(AddTagError(bucket, Label(bucket.Cursor - 1, "before")));
-            Assert.IsType<ArgumentOutOfRangeException>(AddTagError(bucket, Label(bucket.Cursor + 10, "after")));
-            Assert.IsType<ArgumentException>(AddTagError<ITag>(bucket, Label(bucket.Cursor, "interface")));
-            Assert.IsType<ArgumentException>(AddTagError(bucket, new LabelTag { Offset = bucket.StartOffset, Key = null!, Text = "null key" }));
-            Assert.IsType<ArgumentException>(AddTagError(bucket, Label(bucket.Cursor, new string('x', 5000))));   // alone larger than the 4 KiB log
+            Assert.IsType<ArgumentOutOfRangeException>(AddTagError(bucket, Label("before"), -1));
+            Assert.IsType<ArgumentOutOfRangeException>(AddTagError(bucket, Label("after"), 10));
+            Assert.IsType<ArgumentException>(AddTagError<ITag>(bucket, Label("interface")));
+            Assert.IsType<ArgumentException>(AddTagError(bucket, new LabelTag { Key = null!, Text = "null key" }));
+            Assert.IsType<ArgumentException>(AddTagError(bucket, Label(new string('x', 5000))));   // alone larger than the 4 KiB log
 
             int accepted = 0;
             Exception? full = null;
             for (int i = 0; i < 100 && full is null; i++)
             {
-                full = AddTagError(bucket, Label(bucket.Cursor + (i % 10), new string('y', 60)));   // ~160 bytes each
+                full = AddTagError(bucket, Label(new string('y', 60)), i % 10);   // ~160 bytes each
                 accepted += full is null ? 1 : 0;
             }
 
@@ -238,13 +260,13 @@ public sealed unsafe class TagTests
             Assert.InRange(accepted, 20, 30);
             Assert.Equal(accepted, buffer.TagWriter!.PendingCount);        // the failed one left nothing behind
             bucket.Commit(10);
-            Assert.IsType<InvalidOperationException>(AddTagError(bucket, Label(bucket.Cursor, "after commit")));
+            Assert.IsType<InvalidOperationException>(AddTagError(bucket, Label("after commit")));
         }
 
         using RingReader<long> reader = buffer.CreateReader();
         using (Bucket<long> bucket = buffer.GetBucket(1))
         {
-            bucket.AddTag(Label(bucket.Cursor, "fine"));
+            bucket.AddTag(Label("fine"));
             bucket.Commit(1);
         }
 
@@ -260,8 +282,76 @@ public sealed unsafe class TagTests
         Bucket<long> copy = first;                                      // a copy keeps _committed = -1 after the original commits
         first.Commit(4);
         using Bucket<long> second = buffer.GetBucket(4);
-        Assert.IsType<InvalidOperationException>(AddTagError(copy, Label(copy.Cursor, "stale")));
+        Assert.IsType<InvalidOperationException>(AddTagError(copy, Label("stale")));
         second.Commit(0);
+    }
+
+    // ------------------------------------------------------------------ tags added to the buffer
+
+    [Fact]
+    public void BufferAddTag_AttachesToTheNextElementWritten()
+    {
+        using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
+        using RingReader<long> reader = buffer.CreateReader();
+        buffer.AddTag(Label("before the first bucket"));
+        WriteBucket(buffer, 10, b => b.AddTag(Label("bucket"), 3));
+        buffer.AddTag(Label("buffer at 10"));
+        WriteBucket(buffer, 5, b => b.AddTag(Label("bucket at 10")));
+
+        Assert.True(reader.TryRead(15, out Chunk<long> chunk));
+        Assert.Equal(["before the first bucket", "bucket", "buffer at 10", "bucket at 10"], Texts(chunk));
+        Assert.Equal([0ul, 3ul, 10ul, 10ul], chunk.Tags.ToArray().Select(t => t.Offset));
+        Assert.Equal(0, buffer.TagWriter!.PendingCount);
+    }
+
+    [Fact]
+    public void BufferAddTag_StaysPendingThroughCommitsThatPublishNothing()
+    {
+        using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
+        using RingReader<long> reader = buffer.CreateReader();
+        WriteBucket(buffer, 2);
+
+        buffer.AddTag(new SampleRateTag { Rate = 44_100 });
+        WriteBucket(buffer, 4, b => b.AddTag(Label("dropped with its element")), commit: 0);
+        using (Bucket<long> bucket = buffer.GetBucket(3))
+        {
+            var mid = new SampleRateTag { Rate = 48_000 };
+            buffer.AddTag(mid);                                         // during a bucket: the bucket's first element
+            Assert.Equal(bucket.StartOffset, mid.Offset);
+        }                                                               // disposed without a commit: still pending
+
+        Assert.Equal(2, buffer.TagWriter!.PendingCount);
+        Assert.Equal(2, buffer.WriteCursor);
+        WriteBucket(buffer, 1);
+
+        Assert.True(reader.TryRead(3, out Chunk<long> chunk));
+        Assert.Equal([2ul, 2ul], chunk.Tags.ToArray().Select(t => t.Offset));
+        reader.Advance(3);
+        Assert.Equal(48_000, Assert.IsType<SampleRateTag>(Last(reader, SampleRateTag.TagKey)).Rate);
+        Assert.Equal(0, buffer.TagWriter.PendingCount);
+    }
+
+    [Fact]
+    public void BufferAddTag_Validation_AndDroppedWhenTheWriterCloses()
+    {
+        string name = TestNames.UniqueSection();
+        var buffer = RingBuffer<long>.Create(1 << 16, name, TagOptions());
+        using (var opened = RingBuffer<long>.Open(name, TagOptions()))
+        {
+            Assert.Throws<InvalidOperationException>(() => opened.AddTag(Label("reader role")));
+        }
+
+        Assert.Throws<ArgumentException>(() => buffer.AddTag<ITag>(Label("interface")));
+        using RingReader<long> reader = buffer.CreateReader();
+        WriteBucket(buffer, 5);
+        buffer.AddTag(Label("never published"));
+        buffer.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => buffer.AddTag(Label("after dispose")));
+
+        Assert.True(reader.TryRead(5, out Chunk<long> chunk));
+        Assert.True(chunk.Tags.IsEmpty);
+        reader.Advance(5);
+        Assert.True(reader.IsCompleted);
     }
 
     // ------------------------------------------------------------------ persistent tags
@@ -273,24 +363,56 @@ public sealed unsafe class TagTests
         using RingReader<long> reader = buffer.CreateReader();
         WriteBucket(buffer, 100, b =>
         {
-            b.AddTag(new SampleRateTag { Offset = b.StartOffset, Rate = 1000 });
-            b.AddTag(Label(b.Cursor + 20, "not persistent"));
-            b.AddTag(new SampleRateTag { Offset = b.StartOffset + 50, Rate = 2000 });
+            b.AddTag(new SampleRateTag { Rate = 1000 });
+            b.AddTag(Label("not persistent"), 20);
+            b.AddTag(new SampleRateTag { Rate = 2000 }, 50);
         });
 
-        Assert.Empty(reader.ReadLastTagValues());
+        Assert.Equal(0, reader.ReadLastTagValues().Length);
         Assert.True(reader.TryRead(100, out Chunk<long> chunk));
         Assert.Equal(3, chunk.Tags.Length);
-        Assert.Empty(reader.ReadLastTagValues());                      // reading is not passing
+        Assert.Equal(0, reader.ReadLastTagValues().Length);            // reading is not passing
 
         reader.Advance(1);
-        Assert.Equal(1000, Assert.IsType<SampleRateTag>(Assert.Single(reader.ReadLastTagValues()).Value).Rate);
+        Assert.Equal(1000, Assert.IsType<SampleRateTag>(Assert.Single(reader.ReadLastTagValues().ToArray())).Rate);
         reader.Advance(49);                                             // at 50: the second rate applies to element 50, not before it
-        Assert.Equal(1000, ((SampleRateTag)reader.ReadLastTagValues()[SampleRateTag.TagKey]).Rate);
+        Assert.Equal(1000, ((SampleRateTag)Last(reader, SampleRateTag.TagKey)!).Rate);
         reader.Advance(1);
-        IReadOnlyDictionary<string, ITag> state = reader.ReadLastTagValues();
-        Assert.Equal(2000, ((SampleRateTag)state[SampleRateTag.TagKey]).Rate);
-        Assert.False(state.ContainsKey("label"));
+        Assert.Equal(2000, ((SampleRateTag)Last(reader, SampleRateTag.TagKey)!).Rate);
+        Assert.Equal(1, reader.ReadLastTagValues().Length);            // one per key; the label is not state
+        Assert.Null(Last(reader, "label"));
+    }
+
+    [Fact]
+    public void LastTagValues_AreOnePerKeyInFirstSeenOrder_WithoutAllocating()
+    {
+        using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
+        using RingReader<long> reader = buffer.CreateReader();
+        for (int i = 0; i < 50; i++)
+        {
+            WriteBucket(buffer, 2, b =>
+            {
+                b.AddTag(new StateTag { Key = "b", Value = i });
+                b.AddTag(new StateTag { Key = "a", Value = i }, 1);
+            });
+        }
+
+        reader.Advance((int)reader.Available);
+        Assert.Equal(["b", "a"], reader.ReadLastTagValues().ToArray().Select(t => t.Key));
+        Assert.Equal(49, ((StateTag)Last(reader, "a")!).Value);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        int total = 0;
+        for (int i = 0; i < 10_000; i++)
+        {
+            foreach (ITag tag in reader.ReadLastTagValues())
+            {
+                total += tag.Key.Length;
+            }
+        }
+
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+        Assert.Equal(20_000, total);
     }
 
     [Fact]
@@ -299,50 +421,50 @@ public sealed unsafe class TagTests
         using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
         WriteBucket(buffer, 10, b =>
         {
-            b.AddTag(new SampleRateTag { Offset = b.StartOffset + 1, Rate = 1 });
-            b.AddTag(new StateTag { Offset = b.StartOffset + 2, Key = "mode", Value = 7 });
-            b.AddTag(Label(b.Cursor + 3, "before join"));
+            b.AddTag(new SampleRateTag { Rate = 1 }, 1);
+            b.AddTag(new StateTag { Key = "mode", Value = 7 }, 2);
+            b.AddTag(Label("before join"), 3);
         });
-        WriteBucket(buffer, 10, b => b.AddTag(new SampleRateTag { Offset = b.StartOffset + 5, Rate = 2 }));
+        WriteBucket(buffer, 10, b => b.AddTag(new SampleRateTag { Rate = 2 }, 5));
 
         using RingReader<long> late = buffer.CreateReader();
         Assert.Equal(20, late.ReadCursor);
-        IReadOnlyDictionary<string, ITag> state = late.ReadLastTagValues();
-        Assert.Equal(2, state.Count);
-        Assert.Equal(2, ((SampleRateTag)state[SampleRateTag.TagKey]).Rate);
-        Assert.Equal(7, ((StateTag)state["mode"]).Value);
+        Assert.Equal(2, late.ReadLastTagValues().Length);
+        Assert.Equal(2, ((SampleRateTag)Last(late, SampleRateTag.TagKey)!).Rate);
+        Assert.Equal(15ul, Last(late, SampleRateTag.TagKey)!.Offset);
+        Assert.Equal(7, ((StateTag)Last(late, "mode")!).Value);
 
         WriteBucket(buffer, 10, b =>
         {
-            b.AddTag(Label(b.Cursor, "after join"));
-            b.AddTag(new StateTag { Offset = b.StartOffset + 4, Key = "mode", Value = 8 });
+            b.AddTag(Label("after join"));
+            b.AddTag(new StateTag { Key = "mode", Value = 8 }, 4);
         });
 
         Assert.True(late.TryRead(10, out Chunk<long> chunk));
         Assert.Equal(2, chunk.Tags.Length);
         Assert.Equal("after join", ((LabelTag)chunk.Tags.Span[0]).Text);
         late.Advance(10);
-        Assert.Equal(8, ((StateTag)late.ReadLastTagValues()["mode"]).Value);
-        Assert.Equal(2, ((SampleRateTag)late.ReadLastTagValues()[SampleRateTag.TagKey]).Rate);
+        Assert.Equal(8, ((StateTag)Last(late, "mode")!).Value);
+        Assert.Equal(2, ((SampleRateTag)Last(late, SampleRateTag.TagKey)!).Rate);
     }
 
     [Fact]
     public void JoiningReader_StartsAtTheSnapshotWhenItIsNewerThanTheCursorItJoinedAt()
     {
         using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
-        WriteBucket(buffer, 30, b => b.AddTag(new SampleRateTag { Offset = b.StartOffset + 20, Rate = 5 }));
-        WriteBucket(buffer, 30, b => b.AddTag(Label(b.Cursor + 1, "at 31")));
+        WriteBucket(buffer, 30, b => b.AddTag(new SampleRateTag { Rate = 5 }, 20));
+        WriteBucket(buffer, 30, b => b.AddTag(Label("at 31"), 1));
 
         // a reader that loaded W = 10 before the writer published up to 60: the table already holds the rate at 20, so it must start at 60
         TagReader tags = TagReader.Join(buffer.Header, buffer.TagState, buffer.PersistentTagCapacity, buffer.TagLog, buffer.TagCapacity, TagPlan.CreateSerializer(), joinW: 10, out long cursor);
         Assert.Equal(60, cursor);
-        Assert.Equal(5, ((SampleRateTag)tags.LastValues()[SampleRateTag.TagKey]).Rate);
+        Assert.Equal(5, ((SampleRateTag)TagPlan.Find(tags.LastValues(), SampleRateTag.TagKey)!).Rate);
         Assert.Equal(long.MaxValue, tags.NextOffset);
 
         // a reader that joined at the snapshot's cursor starts there, with nothing queued
         TagReader current = TagReader.Join(buffer.Header, buffer.TagState, buffer.PersistentTagCapacity, buffer.TagLog, buffer.TagCapacity, null, joinW: 60, out long at);
         Assert.Equal(60, at);
-        Assert.IsType<UnknownTag>(current.LastValues()[SampleRateTag.TagKey]);   // no serializer here
+        Assert.IsType<UnknownTag>(TagPlan.Find(current.LastValues(), SampleRateTag.TagKey));   // no serializer here
     }
 
     [Fact]
@@ -351,8 +473,8 @@ public sealed unsafe class TagTests
         using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions(tagCapacity: 1 << 16, persistentCapacity: 0));
         Assert.Equal(0, buffer.PersistentTagCapacity);
         using Bucket<long> bucket = buffer.GetBucket(4);
-        bucket.AddTag(Label(bucket.Cursor, "non-persistent tags need no table"));
-        InvalidOperationException ex = Assert.IsType<InvalidOperationException>(AddTagError(bucket, new SampleRateTag { Offset = bucket.StartOffset, Rate = 1 }));
+        bucket.AddTag(Label("non-persistent tags need no table"));
+        InvalidOperationException ex = Assert.IsType<InvalidOperationException>(AddTagError(bucket, new SampleRateTag { Rate = 1 }));
         Assert.Contains("PersistentTagCapacity", ex.Message, StringComparison.Ordinal);
         bucket.Commit(4);
     }
@@ -364,13 +486,13 @@ public sealed unsafe class TagTests
         int stateBytes = buffer.PersistentTagCapacity;
         for (int i = 0; i < 2000; i++)
         {
-            WriteBucket(buffer, 1, b => b.AddTag(new StateTag { Offset = b.StartOffset, Key = "only", Value = i }));
+            WriteBucket(buffer, 1, b => b.AddTag(new StateTag { Key = "only", Value = i }));
         }
 
         Assert.True(buffer.Header->TagStateUsed < stateBytes);
         Assert.Equal(1, buffer.Header->TagStateCount);
         using RingReader<long> reader = buffer.CreateReader();
-        Assert.Equal(1999, ((StateTag)reader.ReadLastTagValues()["only"]).Value);
+        Assert.Equal(1999, ((StateTag)Last(reader, "only")!).Value);
     }
 
     // ------------------------------------------------------------------ serializers
@@ -385,8 +507,8 @@ public sealed unsafe class TagTests
         using RingReader<long> raw = RingBuffer<long>.Open(name).CreateReader();   // no serializer at all
         WriteBucket(writer, 4, b =>
         {
-            b.AddTag(Label(b.Cursor + 1, "hello"));
-            b.AddTag(new SampleRateTag { Offset = b.StartOffset + 2, Rate = 44100 });
+            b.AddTag(Label("hello"), 1);
+            b.AddTag(new SampleRateTag { Rate = 44100 }, 2);
         });
 
         Assert.True(reader.TryRead(4, out Chunk<long> chunk));
@@ -401,7 +523,7 @@ public sealed unsafe class TagTests
         Assert.True(rate.Persistent);
 
         reader.Advance(4);
-        Assert.IsType<UnknownTag>(reader.ReadLastTagValues()[SampleRateTag.TagKey]);   // persistence comes from the writer's type
+        Assert.IsType<UnknownTag>(Last(reader, SampleRateTag.TagKey));  // persistence comes from the writer's type
         Assert.True(raw.TryRead(4, out Chunk<long> rawChunk));
         Assert.All(rawChunk.Tags.ToArray(), t => Assert.IsType<UnknownTag>(t));
     }
@@ -414,7 +536,7 @@ public sealed unsafe class TagTests
         var mismatched = new JsonTagSerializer().Register<IntLabelTag>(typeof(LabelTag).FullName);
         using var opened = RingBuffer<long>.Open(name, new RingBufferOptions { TagSerializer = mismatched });
         using RingReader<long> reader = opened.CreateReader();
-        WriteBucket(writer, 2, b => b.AddTag(Label(b.Cursor, "not a number")));
+        WriteBucket(writer, 2, b => b.AddTag(Label("not a number")));
 
         Assert.True(reader.TryRead(2, out Chunk<long> chunk));
         UnknownTag tag = Assert.IsType<UnknownTag>(Assert.Single(chunk.Tags.ToArray()));
@@ -478,7 +600,7 @@ public sealed unsafe class TagTests
         {
             for (int i = 0; i < 100; i++)
             {
-                WriteBucket(buffer, 1, b => b.AddTag(Label(b.Cursor, new string('w', 100))));   // ~150 bytes: 4 KiB holds ~27
+                WriteBucket(buffer, 1, b => b.AddTag(Label(new string('w', 100))));   // ~200 bytes: 4 KiB holds ~20
                 Interlocked.Increment(ref committed);
             }
         }, TaskCreationOptions.LongRunning);
@@ -517,7 +639,7 @@ public sealed unsafe class TagTests
         {
             for (int i = 0; i < 100; i++)
             {
-                WriteBucket(buffer, 1, b => b.AddTag(Label(b.Cursor, new string('w', 100))));
+                WriteBucket(buffer, 1, b => b.AddTag(Label(new string('w', 100))));
                 committed++;
             }
         }
@@ -547,7 +669,7 @@ public sealed unsafe class TagTests
         {
             for (int i = 0; i < 100; i++)
             {
-                WriteBucket(buffer, 1, b => b.AddTag(Label(b.Cursor, new string('w', 100))));
+                WriteBucket(buffer, 1, b => b.AddTag(Label(new string('w', 100))));
             }
         }, TaskCreationOptions.LongRunning);
 
@@ -577,7 +699,7 @@ public sealed unsafe class TagTests
 
         try
         {
-            WriteBucket(buffer, 10, b => b.AddTag(Label(b.Cursor + 2, "committed while disposing")));
+            WriteBucket(buffer, 10, b => b.AddTag(Label("committed while disposing"), 2));
         }
         finally
         {
@@ -622,8 +744,8 @@ public sealed unsafe class TagTests
         using var buffer = RingBuffer<long>.Create(1 << 16, options: TagOptions());
         WriteBucket(buffer, 20, b =>
         {
-            b.AddTag(new SampleRateTag { Offset = b.StartOffset + 3, Rate = 9 });
-            b.AddTag(Label(b.Cursor + 15, "published"));
+            b.AddTag(new SampleRateTag { Rate = 9 }, 3);
+            b.AddTag(Label("published"), 15);
         });
 
         buffer.Header->TagVersion |= 1;                                     // a snapshot that never completes ...
@@ -634,7 +756,7 @@ public sealed unsafe class TagTests
             TagReader tags = TagReader.Join(buffer.Header, buffer.TagState, buffer.PersistentTagCapacity, buffer.TagLog, buffer.TagCapacity, TagPlan.CreateSerializer(), joinW: 10, out long cursor);
             Assert.Equal(20, cursor);                                       // not 10: the tags of [10, 20) were published before TagEnd, and are skipped with their elements
             Assert.Equal(buffer.Header->TagEnd, tags.Position);
-            Assert.Empty(tags.LastValues());
+            Assert.Equal(0, tags.LastValues().Length);
             Assert.Equal(long.MaxValue, tags.NextOffset);
         }
         finally
@@ -673,7 +795,7 @@ public sealed unsafe class TagTests
         {
             for (int i = 0; i < 100; i++)
             {
-                WriteBucket(buffer, 1, b => b.AddTag(Label(b.Cursor, new string('w', 100))));
+                WriteBucket(buffer, 1, b => b.AddTag(Label(new string('w', 100))));
             }
         }, TaskCreationOptions.LongRunning);
 
@@ -696,8 +818,8 @@ public sealed unsafe class TagTests
         {
             WriteBucket(first, 10, b =>
             {
-                b.AddTag(new SampleRateTag { Offset = b.StartOffset, Rate = 1 });
-                b.AddTag(Label(b.Cursor + 5, "old"));
+                b.AddTag(new SampleRateTag { Rate = 1 });
+                b.AddTag(Label("old"), 5);
             });
         }
 
@@ -705,8 +827,8 @@ public sealed unsafe class TagTests
         using var second = RingBuffer<long>.Create(1 << 16, options: options);
         Assert.Equal(1, pool.ReusedCount);
         using RingReader<long> reader = second.CreateReader();
-        Assert.Empty(reader.ReadLastTagValues());
-        WriteBucket(second, 10, b => b.AddTag(Label(b.Cursor + 5, "new")));
+        Assert.Equal(0, reader.ReadLastTagValues().Length);
+        WriteBucket(second, 10, b => b.AddTag(Label("new"), 5));
         Assert.True(reader.TryRead(10, out Chunk<long> chunk));
         Assert.Equal(["new"], Texts(chunk));
 
@@ -830,4 +952,15 @@ public sealed class IntLabelTag : ITag
     public string Key { get; set; } = "";
 
     public int Text { get; set; }
+}
+
+/// <summary>A tag that leaves its offset out of the JSON: readers set it from the record.</summary>
+public sealed class QuietOffsetTag : ITag
+{
+    [JsonIgnore]
+    public ulong Offset { get; set; }
+
+    public string Key => "quiet";
+
+    public int N { get; set; }
 }

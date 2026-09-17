@@ -24,7 +24,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   RingReader.cs          TryRead / Advance / WaitSync / SpinUntil / BlockUntil / Status (liveness probe) / Dispose / finalizer
   RingReader.Async.cs    Wait(...) => ValueTask<bool> (IValueTaskSource, per-reader waiter thread with idle retirement)
   RingBufferPool.cs      RingBufferPool / RingBufferPoolOptions: reuse check (handle count + InitState handshake), parking, expiry timer, bounds
-  RingBuffer.Tags.cs     AddTag / EndWriteWithTags (Dekker pair with Dispose) / PublishTags (before the write cursor) / MakeTagSpace (waits like GetBucket)
+  RingBuffer.Tags.cs     AddTag (buffer: next element) / AddBucketTag / EndWriteWithTags (Dekker pair with Dispose) / PublishTags / MakeTagSpace (waits like GetBucket)
   RingReader.Tags.cs     ReadLastTagValues / TagsForRead, TagsForAdvance (behind one threshold compare; tags loaded once per new write cursor, before the cursor store)
   ITag.cs, UnknownTag.cs, ITagSerializer.cs, JsonTagSerializer.cs   the public tag model and the JSON serializer (registration by type name)
   Bucket.cs, Chunk.cs    ref structs (Span / Commit / Dispose; ReadOnlySpan)
@@ -39,7 +39,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   Internal/SpinPolicy.cs  adaptive spin budget (DESIGN §14)
   Internal/PooledMapping.cs     one mapping + its events as the pool hands it out and takes it back (DESIGN §15)
   Internal/Capacity.cs, AddressHint.cs, ProcessLiveness.cs, SpinClock.cs, Counters.cs, TestHooks.cs
-tests/Photone.Ipc.Tests/       366 xunit.v3 tests (unit, stress, and 27 cross-process tests via TestChild)
+tests/Photone.Ipc.Tests/       371 xunit.v3 tests (unit, stress, and 27 cross-process tests via TestChild)
 tests/Photone.Ipc.TestChild/   child-process verbs: reader, spin-reader, step-reader, writer [--crash], echo, crash-reader,
                                claim-and-die, slow-init, hold-name, join-storm, map-region, pool-reader-loop, tag-writer, tag-reader
                                (TagPlan.cs: the deterministic tag plan and oracle shared with the tag tests)
@@ -74,14 +74,14 @@ InitializationTimeout, PreferredBaseAddress, PreFault, Pool }`, `ReaderOptions {
 `RingBufferPool(RingBufferPoolOptions { IdleTimeout = 30 s, MaxIdleBytes, ClearOnReuse })`, `RingBufferPool.Shared`, `IdleCount`, `IdleBytes`,
 `Trim()`, `Dispose()`.
 
-Stream tags (DESIGN §16): `RingBufferOptions { TagCapacity = 0 (no tags), PersistentTagCapacity = 16 KiB, TagSerializer }`, `Bucket.AddTag<TTag>(tag)`,
-`Bucket.StartOffset`, `Chunk.Tags` (`ReadOnlyMemory<ITag>`), `Chunk.StartOffset`, `RingReader.ReadLastTagValues()`, `ITag { static virtual IsPersistent; Offset; Key }`,
+Stream tags (DESIGN §16): `RingBufferOptions { TagCapacity = 0 (no tags), PersistentTagCapacity = 16 KiB, TagSerializer }`, `Bucket.AddTag<TTag>(tag, index = 0)`, `RingBuffer.AddTag<TTag>(tag)`,
+`Bucket.StartOffset`, `Chunk.Tags` (`ReadOnlyMemory<ITag>`), `Chunk.StartOffset`, `RingReader.ReadLastTagValues()` (`ReadOnlySpan<ITag>`), `ITag { static virtual IsPersistent; Offset { get; set; }; Key }`,
 `JsonTagSerializer` (`Register<TTag>(name?)`), `ITagSerializer`, `UnknownTag`, `TagLogFullException`, `RingBuffer.TagCapacity`, `RingBuffer.PersistentTagCapacity`.
 
 ## Verification
 
 - `dotnet build Photone.Ipc.slnx -c Release`: 0 warnings, 0 errors (`TreatWarningsAsErrors`, `AnalysisLevel=latest`).
-- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 366/366, ~33 s.
+- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 371/371, ~35 s.
   Process-counter tests (handle count, virtual size) run in the non-parallel collection; 300 pooled create/open/reuse/revive cycles leave 0 handles behind.
 - Samples run cross-process at the same virtual address; killing the writer ends the reader with `WriterTerminated` after draining.
 - Zero allocations on every hot path (asserted by tests and by BenchmarkDotNet's `MemoryDiagnoser`).

@@ -1,4 +1,3 @@
-using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,7 +26,9 @@ internal sealed unsafe class TagReader
     private bool[] _persistent = new bool[8];
     private int _head;
     private int _count;
-    private Dictionary<string, ITag>? _last;
+    private ITag[] _lastValues = [];        // the last persistent tag of each key, in the order the keys first appeared
+    private int _lastCount;
+    private Dictionary<string, int>? _lastIndex;
     private byte[] _scratch = [];
 
     private TagReader(ControlBlock* hdr, byte* log, long logBytes, ITagSerializer? serializer, long position)
@@ -251,9 +252,11 @@ internal sealed unsafe class TagReader
         return NextOffset;
     }
 
-    /// <summary>A copy of the last persistent tag of every key before the reader's position.</summary>
-    public IReadOnlyDictionary<string, ITag> LastValues()
-        => _last is null || _last.Count == 0 ? ReadOnlyDictionary<string, ITag>.Empty : new Dictionary<string, ITag>(_last, StringComparer.Ordinal);
+    /// <summary>
+    /// The last persistent tag of every key before the reader's position, one per key, in the order the keys first appeared; a view of the reader's own array
+    /// (no copy), valid until the reader loads or passes more tags.
+    /// </summary>
+    public ReadOnlySpan<ITag> LastValues() => new(_lastValues, 0, _lastCount);
 
     private void Accept(in TagRecordHeader h, ReadOnlySpan<byte> record, long readCursor)
     {
@@ -285,6 +288,7 @@ internal sealed unsafe class TagReader
             {
                 if (_serializer.Deserialize(typeName, payload) is ITag tag)
                 {
+                    tag.Offset = h.Offset;                              // the record's offset is authoritative: a tag type need not serialize it
                     return tag;
                 }
             }
@@ -297,7 +301,25 @@ internal sealed unsafe class TagReader
         return new UnknownTag(h.Offset, key, typeName, h.IsPersistent, payload.ToArray(), error);
     }
 
-    private void Remember(string key, ITag tag) => (_last ??= new Dictionary<string, ITag>(StringComparer.Ordinal))[key] = tag;
+    private void Remember(string key, ITag tag)
+    {
+        _lastIndex ??= new Dictionary<string, int>(StringComparer.Ordinal);
+        if (_lastIndex.TryGetValue(key, out int index))
+        {
+            _lastValues[index] = tag;
+            return;
+        }
+
+        if (_lastCount == _lastValues.Length)
+        {
+            var grown = new ITag[Math.Max(4, _lastValues.Length * 2)];     // a new array: a span handed out earlier keeps showing the old one
+            Array.Copy(_lastValues, grown, _lastCount);
+            _lastValues = grown;
+        }
+
+        _lastIndex[key] = _lastCount;
+        _lastValues[_lastCount++] = tag;
+    }
 
     private void Enqueue(ITag tag, long offset, string key, bool persistent)
     {

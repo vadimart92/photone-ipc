@@ -40,10 +40,10 @@ Console.WriteLine($"writer  : {buffer.Name}  capacity={buffer.Capacity:N0} float
 Console.WriteLine($"          rate={rate:N0} samples/s ({(rate == 0 ? "unpaced" : "paced")}); start readers now; Ctrl+C stops");
 
 const double LowTone = 440.0;
+buffer.AddTag(new StreamFormat { SampleRate = nominalRate, Frequency = LowTone });   // no bucket needed: goes out with the next element written
 using (var bucket = buffer.GetBucket(1024))      // blocks if there is no space for 1024 elements (never with zero readers)
 {
     bucket.Span.Fill(0);                          // Span<float> of length 1024, contiguous even across the ring's end (double mapping)
-    bucket.AddTag(new StreamFormat { Offset = bucket.StartOffset, SampleRate = nominalRate, Frequency = LowTone });   // published with the elements
     bucket.Commit(1000);                          // publish the first 1000 elements only (a bucket may commit less than requested)
 }
 
@@ -75,13 +75,13 @@ while (!cts.IsCancellationRequested)
         {
             frequency = tone;
             phaseStep = 2 * Math.PI * frequency / nominalRate;
-            bucket.AddTag(new StreamFormat { Offset = bucket.StartOffset, SampleRate = nominalRate, Frequency = frequency });   // persistent: readers keep the last one
+            bucket.AddTag(new StreamFormat { SampleRate = nominalRate, Frequency = frequency });   // on the bucket's first element; persistent: readers keep the last one
         }
 
         long nextSecond = (second + 1) * samplesPerSecond;
         if (nextSecond < written + BucketSize)
         {
-            bucket.AddTag(new SecondMark { Offset = (ulong)nextSecond, Second = second + 1 });
+            bucket.AddTag(new SecondMark { Second = second + 1 }, (int)(nextSecond - bucket.Cursor));   // on element nextSecond
         }
 
         Span<float> span = bucket.Span;
