@@ -38,6 +38,9 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     private readonly RingBufferPool? _pool;
     private readonly PooledMapping? _pooled;        // non-null: the mapping goes back to _pool on release (DESIGN §15)
     private readonly SafeSectionHandle? _alias;     // the name object of a pooled buffer (created, or opened by name)
+    private readonly TagMode _tagMode;              // DESIGN §16
+    private readonly TagViews? _tagViews;           // the mapped parts of the tag reserve (cross-process tags)
+    private readonly TagWriter? _tagWriter;         // writer of a buffer with tags
 
     private int _disposed;
     private int _closed;
@@ -52,6 +55,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         long capacity,
         ulong instanceId,
         ulong creatorBase,
+        TagMode tagMode,
         RingBufferPool? pool = null,
         PooledMapping? pooled = null,
         SafeSectionHandle? alias = null)
@@ -80,6 +84,42 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         _pool = pooled is null ? null : pool;
         _pooled = pooled;
         _alias = alias;
+        _tagMode = tagMode;                                 // the creator's own, or the validated value loaded once by the opener
+        if (tagMode == TagMode.CrossProcess)
+        {
+            _tagViews = new TagViews(mapping.Section, _dataBytes, writable: isWriter);
+        }
+
+        if (isWriter && tagMode != TagMode.None)
+        {
+            _tagWriter = new TagWriter(
+                tagMode == TagMode.CrossProcess ? options.TagSerializer : null,
+                tagMode == TagMode.CrossProcess ? new SharedTagLog(_hdr, _tagViews!) : null);
+        }
+    }
+
+    /// <summary>The tag mode of creator options, validated; the size of the tag reserve it needs.</summary>
+    /// <exception cref="ArgumentOutOfRangeException">Not a <see cref="TagMode"/>.</exception>
+    /// <exception cref="ArgumentException">Cross-process tags without a serializer.</exception>
+    private static long ChooseTagReserve(RingBufferOptions options)
+    {
+        switch (options.Tags)
+        {
+            case TagMode.None:
+            case TagMode.InProcess:
+                return 0;
+            case TagMode.CrossProcess:
+                if (options.TagSerializer is null)
+                {
+                    throw new ArgumentException(
+                        "TagMode.CrossProcess needs RingBufferOptions.TagSerializer (for example new JsonTagSerializer()): the writer serializes every tag for readers in other processes.",
+                        nameof(options));
+                }
+
+                return TagFormat.ReserveBytes;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(options), options.Tags, "RingBufferOptions.Tags is not a TagMode.");
+        }
     }
 
     // ------------------------------------------------------------------ create / open
@@ -100,25 +140,26 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         Kernel.EnsurePlatform();
         Layout.EnsureInitialized();
         (long capacity, long dataBytes) = Internal.Capacity.Choose(minCapacity, sizeof(T));
+        long tagReserve = ChooseTagReserve(options);
         string sectionName = MirroredSection.NormalizeName(name);
         bool global = sectionName.StartsWith("Global\\", StringComparison.Ordinal);
         if (options.Pool is RingBufferPool pool)
         {
-            return CreatePooled(pool, capacity, dataBytes, sectionName, global, options);
+            return CreatePooled(pool, capacity, dataBytes, tagReserve, sectionName, global, options);
         }
 
         ulong instanceId = NewInstanceId();
         ulong sectionId = NewInstanceId();
-        (MirroredSection mapping, SignalBackend backend) = MapNewSection(sectionName, dataBytes, sectionId, global, options);
+        (MirroredSection mapping, SignalBackend backend) = MapNewSection(sectionName, dataBytes, tagReserve, sectionId, global, options);
         try
         {
             ControlBlock* hdr = (ControlBlock*)mapping.Header;
-            WriteHeader(hdr, capacity, dataBytes, instanceId, sectionId, mapping.BaseAddress, layoutFlags: 0);
+            WriteHeader(hdr, capacity, dataBytes, options.Tags, tagReserve, instanceId, sectionId, mapping.BaseAddress, layoutFlags: 0);
             TestHooks.BeforeInitState?.Invoke();
             Interlocked.MemoryBarrier();
             Volatile.Write(ref hdr->InitState, 1);                      // release: everything above becomes visible
 
-            return new RingBuffer<T>(mapping, backend, options, sectionName, isWriter: true, capacity, instanceId, mapping.BaseAddress);
+            return new RingBuffer<T>(mapping, backend, options, sectionName, isWriter: true, capacity, instanceId, mapping.BaseAddress, options.Tags);
         }
         catch
         {
@@ -132,7 +173,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     /// <see cref="Create"/> with a pool (DESIGN §15.2). The name becomes an alias record that names the pool-owned section and this buffer's instance id;
     /// the section is an idle one of this size that nobody else holds open (re-initialised in place), or a new one.
     /// </summary>
-    private static RingBuffer<T> CreatePooled(RingBufferPool pool, long capacity, long dataBytes, string name, bool global, RingBufferOptions options)
+    private static RingBuffer<T> CreatePooled(RingBufferPool pool, long capacity, long dataBytes, long tagReserve, string name, bool global, RingBufferOptions options)
     {
         SafeSectionHandle alias = MirroredSection.CreateAliasSection(name);            // claims the name before anything else is acquired
         byte* aliasView = null;
@@ -144,21 +185,21 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
             WriteCreatorIdentity((ControlBlock*)a);                     // same offsets as in the control block: an opener that finds the name early can tell a dead creator
 
             ulong instanceId = NewInstanceId();
-            entry = pool.RentForCreate(dataBytes, global, options.PreferredBaseAddress);
+            entry = pool.RentForCreate(dataBytes, tagReserve, global, options.PreferredBaseAddress);
             if (entry is null)
             {
                 ulong sectionId = NewInstanceId();
                 string sectionName = MirroredSection.NewPoolSectionName(global);
-                (MirroredSection mapping, SignalBackend backend) = MapNewSection(sectionName, dataBytes, sectionId, global, options);
-                entry = new PooledMapping(mapping, backend, dataBytes, sectionId, sectionName, global, isCreator: true);
+                (MirroredSection mapping, SignalBackend backend) = MapNewSection(sectionName, dataBytes, tagReserve, sectionId, global, options);
+                entry = new PooledMapping(mapping, backend, dataBytes, tagReserve, sectionId, sectionName, global, isCreator: true);
             }
             else
             {
-                PrepareReuse((ControlBlock*)entry.Mapping.Header, entry.Mapping.Data, dataBytes, instanceId, pool.ClearOnReuse, options.PreFault);
+                PrepareReuse(entry, dataBytes, instanceId, pool.ClearOnReuse, options.PreFault);
             }
 
             ControlBlock* hdr = (ControlBlock*)entry.Mapping.Header;
-            WriteHeader(hdr, capacity, dataBytes, instanceId, entry.SectionId, entry.Mapping.BaseAddress, LayoutFlag.Pooled);
+            WriteHeader(hdr, capacity, dataBytes, options.Tags, tagReserve, instanceId, entry.SectionId, entry.Mapping.BaseAddress, LayoutFlag.Pooled);
 
             string target = entry.SectionName!;
             a->Magic = AliasBlock.MagicValue;
@@ -176,7 +217,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
             MirroredSection.UnmapPeek(aliasView);
             aliasView = null;
 
-            return new RingBuffer<T>(entry.Mapping, entry.Backend, options, name, isWriter: true, capacity, instanceId, entry.Mapping.BaseAddress, pool, entry, alias);
+            return new RingBuffer<T>(entry.Mapping, entry.Backend, options, name, isWriter: true, capacity, instanceId, entry.Mapping.BaseAddress, options.Tags, pool, entry, alias);
         }
         catch
         {
@@ -202,14 +243,14 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     /// Creates and maps a new section and its signaling objects: creator identity first, then the optional pre-fault. The rest of the header is
     /// <see cref="WriteHeader"/>'s.
     /// </summary>
-    private static (MirroredSection Mapping, SignalBackend Backend) MapNewSection(string sectionName, long dataBytes, ulong sectionId, bool global, RingBufferOptions options)
+    private static (MirroredSection Mapping, SignalBackend Backend) MapNewSection(string sectionName, long dataBytes, long tagReserve, ulong sectionId, bool global, RingBufferOptions options)
     {
         ulong total = Layout.HeaderViewBytes + 2 * (ulong)dataBytes;
         Span<ulong> candidates = stackalloc ulong[AddressHint.MaxProbes];
         int candidateCount = AddressHint.Candidates(sectionId, total, options.PreferredBaseAddress, candidates);
 
-        SafeSectionHandle section = MirroredSection.CreateSection(dataBytes, sectionName);
-        MirroredSection mapping = MirroredSection.Create(section, dataBytes, candidates[..candidateCount]);   // owns the section; self-tests the mirror
+        SafeSectionHandle section = MirroredSection.CreateSection(dataBytes, tagReserve, sectionName);   // with a tag reserve: only reserved (DESIGN §16.2)
+        MirroredSection mapping = MirroredSection.Create(section, dataBytes, candidates[..candidateCount], commit: tagReserve != 0);   // owns the section; self-tests the mirror
         try
         {
             ControlBlock* hdr = (ControlBlock*)mapping.Header;
@@ -241,7 +282,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     }
 
     /// <summary>Every control-block field except the creator identity, <c>InitState</c> and the backend area (DESIGN §3.3 step 5).</summary>
-    private static void WriteHeader(ControlBlock* hdr, long capacity, long dataBytes, ulong instanceId, ulong sectionId, ulong baseAddress, uint layoutFlags)
+    private static void WriteHeader(ControlBlock* hdr, long capacity, long dataBytes, TagMode tagMode, long tagReserve, ulong instanceId, ulong sectionId, ulong baseAddress, uint layoutFlags)
     {
         hdr->Magic = Layout.Magic;
         hdr->Version = Layout.Version;
@@ -258,6 +299,21 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         hdr->InstanceId = instanceId;
         hdr->ReservationBytes = Layout.HeaderViewBytes + 2 * (ulong)dataBytes;
         hdr->SectionId = sectionId;
+        hdr->TagMode = (int)tagMode;
+        hdr->TagReserveBytes = tagReserve;
+        hdr->TagEnd = 0;
+        hdr->TagVersion = 0;
+        hdr->TagSnapshotEnd = 0;
+        hdr->TagSnapshotW = 0;
+        hdr->TagStateUsed = 0;
+        hdr->TagStateCount = 0;
+        hdr->TagSnapshotRing = 0;
+        hdr->TagSnapshotRingStart = 0;
+        hdr->TagTableCommitted = 0;
+        for (int i = 0; i < TagFormat.RingClasses; i++)
+        {
+            hdr->TagRingCommitted[i] = 0;
+        }
         hdr->WriteCursor = 0;
         hdr->ReserveEnd = 0;
         hdr->WriterState = WriterStateActive;
@@ -281,25 +337,63 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     /// stores the new instance id and the creator identity, zeroes the data if the pool says so, and re-touches the pages (an idle mapping may have been
     /// trimmed from the working set; the pages themselves are still there, so this costs a pass over memory, not a fault per page).
     /// The instance id goes in before the slow parts, so an opener still waiting for the previous buffer gives up at once instead of waiting them out.
+    /// With <paramref name="clearData"/>, the tag memory the previous buffers committed is zeroed too (DESIGN §16.2; it stays committed).
     /// </summary>
-    private static void PrepareReuse(ControlBlock* hdr, byte* data, long dataBytes, ulong instanceId, bool clearData, bool preFault)
+    private static void PrepareReuse(PooledMapping entry, long dataBytes, ulong instanceId, bool clearData, bool preFault)
     {
+        ControlBlock* hdr = (ControlBlock*)entry.Mapping.Header;
+        byte* data = entry.Mapping.Data;
         byte backendNamespace = hdr->BackendArea[0];
-        new Span<byte>(hdr, (int)Layout.ControlBytes).Clear();
+        new Span<byte>(hdr, (int)Layout.ControlBytes).Clear();         // also TagEnd, the tag snapshot and the committed sizes: the previous buffer's tags are unreachable
         hdr->BackendArea[0] = backendNamespace;
         hdr->InstanceId = instanceId;
         WriteCreatorIdentity(hdr);
         if (clearData)
         {
-            for (long offset = 0; offset < dataBytes; offset += ClearChunkBytes)
+            if (entry.TagReserveBytes != 0)
             {
-                new Span<byte>(data + offset, (int)Math.Min(ClearChunkBytes, dataBytes - offset)).Clear();
+                ClearTagMemory(entry.Mapping.Section, dataBytes, entry.TagTableCommitted, entry.TagRingCommitted);   // this process's own record of the commits
             }
+
+            ClearRegion(data, dataBytes);
         }
 
         if (preFault)
         {
             PreFault(data, dataBytes, write: true);
+        }
+    }
+
+    /// <summary>Zeroes the committed tag memory of a section (the committed sizes this process recorded for it, bounded by the reserve).</summary>
+    private static void ClearTagMemory(SafeSectionHandle section, long dataBytes, long tableCommitted, ReadOnlySpan<long> ringCommitted)
+    {
+        var views = new TagViews(section, dataBytes, writable: true);
+        try
+        {
+            if (tableCommitted > 0 && tableCommitted <= TagFormat.TableReserveBytes)
+            {
+                ClearRegion(views.Table(tableCommitted).Address, tableCommitted);
+            }
+
+            for (int ring = 0; ring < TagFormat.RingClasses; ring++)
+            {
+                if (ringCommitted[ring] > 0 && ringCommitted[ring] <= TagFormat.RingBytes(ring))
+                {
+                    ClearRegion(views.Ring(ring).Address, ringCommitted[ring]);
+                }
+            }
+        }
+        finally
+        {
+            views.Dispose();
+        }
+    }
+
+    private static void ClearRegion(byte* start, long bytes)
+    {
+        for (long offset = 0; offset < bytes; offset += ClearChunkBytes)
+        {
+            new Span<byte>(start + offset, (int)Math.Min(ClearChunkBytes, bytes - offset)).Clear();
         }
     }
 
@@ -336,6 +430,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     {
         Layout.EnsureInitialized();
         SafeSectionHandle? alias = null;
+        TagMode tagMode;
         long dataBytes;
         long capacity;
         ulong creatorBase;
@@ -387,6 +482,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
                         $"'{name}' is a section kept by a RingBufferPool, not a buffer name; open the buffer by the name it was created with.", Kernel.ERROR_FILE_NOT_FOUND);
                 }
 
+                tagMode = (TagMode)h->TagMode;                         // validated above; loaded once
                 dataBytes = h->DataBytes;
                 capacity = h->Capacity;
                 creatorBase = h->CreatorBase;
@@ -443,9 +539,9 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
 
             backend = SignalBackend.Create(backendId, sectionId, (ControlBlock*)mapping.Header, isCreator: false, globalNamespace: false);
             PooledMapping? parkable = pooled && options.Pool is not null
-                ? new PooledMapping(mapping, backend, dataBytes, sectionId, sectionName: null, global: false, isCreator: false)
+                ? new PooledMapping(mapping, backend, dataBytes, tagMode == TagMode.CrossProcess ? TagFormat.ReserveBytes : 0, sectionId, sectionName: null, global: false, isCreator: false)
                 : null;
-            return new RingBuffer<T>(mapping, backend, options, name, isWriter: false, capacity, instanceId, creatorBase, options.Pool, parkable, alias);
+            return new RingBuffer<T>(mapping, backend, options, name, isWriter: false, capacity, instanceId, creatorBase, tagMode, options.Pool, parkable, alias);
         }
         catch
         {
@@ -474,7 +570,8 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         try
         {
             if (!WaitForInit(h, options.InitializationTimeout, expectedInstance)
-                || h->Magic != Layout.Magic || h->SectionId != sectionId || h->InstanceId != expectedInstance || h->DataBytes != parked.DataBytes)
+                || h->Magic != Layout.Magic || h->SectionId != sectionId || h->InstanceId != expectedInstance || h->DataBytes != parked.DataBytes
+                || h->TagReserveBytes != parked.TagReserveBytes)
             {
                 pool.Return(parked);
                 return null;
@@ -488,6 +585,13 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
             throw;
         }
 
+        TagMode tagMode = (TagMode)h->TagMode;
+        if (tagMode is not (TagMode.None or TagMode.InProcess or TagMode.CrossProcess) || (tagMode == TagMode.CrossProcess) != (parked.TagReserveBytes != 0))
+        {
+            pool.Return(parked);
+            throw new RingBufferLayoutException($"The tag mode {(int)tagMode} does not match the section's tag reserve of {parked.TagReserveBytes} bytes.");
+        }
+
         try
         {
             if (options.PreFault)
@@ -496,7 +600,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
             }
 
             parked.Mapping.AttachSection(section);
-            var buffer = new RingBuffer<T>(parked.Mapping, parked.Backend, options, name, isWriter: false, h->Capacity, h->InstanceId, h->CreatorBase, pool, parked, alias);
+            var buffer = new RingBuffer<T>(parked.Mapping, parked.Backend, options, name, isWriter: false, h->Capacity, h->InstanceId, h->CreatorBase, tagMode, pool, parked, alias);
             pool.CountRevived();
             return buffer;
         }
@@ -649,6 +753,14 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         if (h->DataOffset != Layout.DataOffset)
         {
             throw new RingBufferLayoutException($"DataOffset is {h->DataOffset}, expected {Layout.DataOffset}.");
+        }
+
+        int tagMode = h->TagMode;
+        long tagReserve = h->TagReserveBytes;
+        if (tagMode is not ((int)TagMode.None or (int)TagMode.InProcess or (int)TagMode.CrossProcess)
+            || tagReserve != (tagMode == (int)TagMode.CrossProcess ? TagFormat.ReserveBytes : 0))
+        {
+            throw new RingBufferLayoutException($"The tag mode {tagMode} does not match the tag reserve of {tagReserve} bytes.");
         }
 
         if (h->ElementSize != (uint)sizeof(T))
@@ -812,6 +924,12 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         }
     }
 
+    /// <summary>
+    /// Whether the buffer carries tags, and who can read them (<see cref="RingBufferOptions.Tags"/> of the creator). An opener of a
+    /// <see cref="TagMode.InProcess"/> buffer sees the mode, but its readers see no tags.
+    /// </summary>
+    public TagMode Tags => _tagMode;
+
     /// <summary>Number of readers currently marked active.</summary>
     public int ActiveReaderCount
     {
@@ -844,6 +962,11 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
     internal long Mask => _mask;
 
     internal uint LivenessCheckIntervalMs => _livenessMs;
+
+    internal RingBufferOptions Options => _options;
+
+    /// <summary>The mapped parts of the tag reserve (cross-process tags), or <see langword="null"/>.</summary>
+    internal TagViews? TagViews => _tagViews;
 
     /// <summary>The pooled mapping this buffer returns on release, or <see langword="null"/> when it is not pooled.</summary>
     internal PooledMapping? Pooled => _pooled;
@@ -954,6 +1077,12 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         }
 
         _alias?.Dispose();                                          // a pooled buffer's name goes away with its last holder, as a direct section's name does
+        _tagViews?.Dispose();                                       // nothing uses them any more: the writer is closed and every reader of this buffer is gone
+        if (_pooled is not null && _tagWriter?.Shared is SharedTagLog shared)
+        {
+            _pooled.AddTagCommitted(shared.RingCommitted, shared.TableCommitted);   // the committed tag memory stays with the section
+        }
+
         if (_pooled is not null && !finalizing && !_closedWithBucket)
         {
             _pool!.Return(_pooled);                                 // creator: idle until reused; opener: parked (views and events kept, handle closed)

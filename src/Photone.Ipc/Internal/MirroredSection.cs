@@ -6,7 +6,8 @@ namespace Photone.Ipc.Internal;
 /// One placeholder of <c>G + 2D</c> bytes carrying three views of one pagefile-backed section:
 /// <c>[Header (section 0..G)][Data (section G..G+D)][Mirror (section G..G+D again)]</c>, so <c>Mirror == Data + D</c>
 /// and a span starting anywhere in <c>Data</c> may run up to <c>D</c> bytes past its end without copying.
-/// This is the ONLY code in the library that maps or unmaps memory (DESIGN §3.2–§3.5).
+/// A buffer with cross-process tags has a tag reserve after the data (section <c>G + D..</c>, DESIGN §16.2), which this class does not map:
+/// <see cref="SectionView"/> maps parts of it on demand. This file is the ONLY code in the library that maps or unmaps memory (DESIGN §3.2–§3.5).
 /// The handle is the placeholder base; releasing it unmaps the three views (which frees the VA outright, verified) and closes the section.
 /// A pooled opener mapping may keep its views without a section handle while it is parked (<see cref="DetachSection"/>, DESIGN §15).
 /// </summary>
@@ -119,17 +120,29 @@ internal sealed unsafe class MirroredSection : SafeHandle
     // ------------------------------------------------------------------ sections
 
     /// <summary>
-    /// Creates a new pagefile-backed section of <c>G + dataBytes</c> bytes (<c>PAGE_READWRITE | SEC_COMMIT</c>).
+    /// Creates a new pagefile-backed section of <c>G + dataBytes + tagReserveBytes</c> bytes. Without a tag reserve the whole section is committed
+    /// (<c>PAGE_READWRITE | SEC_COMMIT</c>). With one it is only reserved (<c>SEC_RESERVE</c>, DESIGN §16.2), which costs neither memory nor commit charge:
+    /// <see cref="Create"/> commits the control view and the data, and the writer commits tag memory as it needs it (<see cref="SectionView.Commit"/>).
     /// </summary>
     /// <param name="dataBytes">Data region size; a positive multiple of 64 KiB.</param>
+    /// <param name="tagReserveBytes">Size of the tag reserve after the data (a multiple of 64 KiB), or 0.</param>
     /// <param name="sectionName">Already-normalised object name, or <see langword="null"/> for an anonymous section.</param>
     /// <exception cref="RingBufferAlreadyExistsException">An object with that name already exists.</exception>
-    public static SafeSectionHandle CreateSection(long dataBytes, string? sectionName)
+    public static SafeSectionHandle CreateSection(long dataBytes, long tagReserveBytes, string? sectionName)
     {
         Kernel.EnsurePlatform();
         ValidateDataBytes(dataBytes);
-        return CreateSectionCore(Layout.HeaderViewBytes + (ulong)dataBytes, sectionName);
+        if (tagReserveBytes < 0 || tagReserveBytes % Layout.HeaderViewBytes != 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(tagReserveBytes), tagReserveBytes, "tagReserveBytes must be a non-negative multiple of 65536.");
+        }
+
+        return CreateSectionCore(Layout.HeaderViewBytes + (ulong)dataBytes + (ulong)tagReserveBytes, sectionName, reserveOnly: tagReserveBytes != 0);
     }
+
+    /// <summary>Creates a new, committed section of <c>G + dataBytes</c> bytes without a tag reserve.</summary>
+    /// <exception cref="RingBufferAlreadyExistsException">An object with that name already exists.</exception>
+    public static SafeSectionHandle CreateSection(long dataBytes, string? sectionName) => CreateSection(dataBytes, 0, sectionName);
 
     /// <summary>
     /// Creates the 64 KiB named section that holds a pooled buffer's <see cref="AliasBlock"/> (only its first page is ever touched; its size lets
@@ -140,12 +153,13 @@ internal sealed unsafe class MirroredSection : SafeHandle
     {
         Kernel.EnsurePlatform();
         ArgumentException.ThrowIfNullOrEmpty(sectionName);
-        return CreateSectionCore(Layout.HeaderViewBytes, sectionName);
+        return CreateSectionCore(Layout.HeaderViewBytes, sectionName, reserveOnly: false);
     }
 
-    private static SafeSectionHandle CreateSectionCore(ulong size, string? sectionName)
+    private static SafeSectionHandle CreateSectionCore(ulong size, string? sectionName, bool reserveOnly)
     {
-        SafeSectionHandle section = Kernel.CreateFileMapping(Kernel.INVALID_HANDLE_VALUE, null, Kernel.PAGE_READWRITE, (uint)(size >> 32), (uint)size, sectionName);
+        uint protect = reserveOnly ? Kernel.PAGE_READWRITE | Kernel.SEC_RESERVE : Kernel.PAGE_READWRITE;
+        SafeSectionHandle section = Kernel.CreateFileMapping(Kernel.INVALID_HANDLE_VALUE, null, protect, (uint)(size >> 32), (uint)size, sectionName);
         int err = Kernel.LastError();                                  // read even on success (183 = opened existing)
         if (section.IsInvalid)
         {
@@ -197,6 +211,11 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <summary>
     /// Maps only the first 64 KiB of the section (no placeholder) so an opener can read the control block before committing to a full mapping.
     /// Release with <see cref="UnmapPeek"/>.
+    /// <para>
+    /// The view is committed first. A section with a tag reserve is created reserved (DESIGN §16.2), and an opener that finds its name before the creator
+    /// has committed the control view would otherwise fault on its first load. Committing is idempotent and a no-op on a committed section, and it
+    /// preserves whatever the creator has stored.
+    /// </para>
     /// </summary>
     /// <exception cref="RingBufferLayoutException">The section is smaller than 64 KiB.</exception>
     public static byte* MapHeaderPeek(SafeSectionHandle section)
@@ -212,6 +231,13 @@ internal sealed unsafe class MirroredSection : SafeHandle
             }
 
             throw Kernel.Fail("MapViewOfFile3", err, "header peek");
+        }
+
+        if (Kernel.VirtualAlloc(p, Layout.HeaderViewBytes, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null)
+        {
+            err = Kernel.LastError();
+            Kernel.UnmapViewOfFile(p);
+            throw Kernel.Fail("VirtualAlloc", err, "header peek commit");
         }
 
         return (byte*)p;
@@ -236,9 +262,10 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <param name="section">Section of at least <c>G + dataBytes</c> bytes; ownership transfers to the result (also on failure).</param>
     /// <param name="dataBytes">Data region size; a positive multiple of 64 KiB.</param>
     /// <param name="candidates">64 KiB-aligned base addresses to try first; may be empty.</param>
+    /// <param name="commit">The section was created reserved (it has a tag reserve): commit the control view and the data before touching them.</param>
     /// <exception cref="RingBufferLayoutException">The mirror does not alias the data region.</exception>
-    public static MirroredSection Create(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates)
-        => Map(section, dataBytes, candidates, selfTest: true);
+    public static MirroredSection Create(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates, bool commit = false)
+        => Map(section, dataBytes, candidates, selfTest: true, commit);
 
     /// <summary>
     /// Opener side: reserves the placeholder (trying <paramref name="candidates"/> — normally the creator's base — then a system-chosen address)
@@ -249,9 +276,9 @@ internal sealed unsafe class MirroredSection : SafeHandle
     /// <param name="candidates">64 KiB-aligned base addresses to try first; may be empty.</param>
     /// <exception cref="RingBufferLayoutException">The section is smaller than the header claims.</exception>
     public static MirroredSection Open(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates)
-        => Map(section, dataBytes, candidates, selfTest: false);
+        => Map(section, dataBytes, candidates, selfTest: false, commit: false);
 
-    private static MirroredSection Map(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates, bool selfTest)
+    private static MirroredSection Map(SafeSectionHandle section, long dataBytes, ReadOnlySpan<ulong> candidates, bool selfTest, bool commit)
     {
         ArgumentNullException.ThrowIfNull(section);
         try
@@ -356,6 +383,20 @@ internal sealed unsafe class MirroredSection : SafeHandle
                 throw Kernel.Fail("MapViewOfFile3", err, i switch { 0 => "header view", 1 => "data view", _ => "mirror view" });
             }
 
+            // 4. a reserved section: commit the control view and the data (the mirror shows the same pages) before anything touches them
+            if (commit)
+            {
+                if (Kernel.VirtualAlloc(basePtr, g, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null
+                    || Kernel.VirtualAlloc(basePtr + g, d, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null)
+                {
+                    int err = Kernel.LastError();
+                    Unwind(pieces, isView);                                 // all three are views by now
+                    throw Kernel.Fail("VirtualAlloc", err, err is Kernel.ERROR_COMMITMENT_LIMIT or Kernel.ERROR_NOT_ENOUGH_MEMORY
+                        ? $"committing the {dataBytes}-byte data region exceeds the system commit limit"
+                        : "commit of the control view and the data");
+                }
+            }
+
             var result = new MirroredSection(section, d, basePtr, atRequested);
             if (selfTest)
             {
@@ -446,4 +487,82 @@ internal sealed unsafe class MirroredSection : SafeHandle
         Interlocked.Exchange(ref _section, null)?.Dispose();
         return ok;
     }
+}
+
+/// <summary>
+/// A plain view of <c>[offset, offset + bytes)</c> of a section, outside any placeholder: a piece of the tag reserve (DESIGN §16.2), mapped on demand by the
+/// writer (read/write) and by readers (read-only). A view of a reserved region may be larger than what is committed; only committed pages may be touched.
+/// Releasing it unmaps the view (the section lives on through the buffer's own views and handles). Hold a reference with
+/// <see cref="SafeHandle.DangerousAddRef"/> while reading from another thread than the one that may dispose it.
+/// </summary>
+internal sealed unsafe class SectionView : SafeHandle
+{
+    private SectionView(void* address, long offset, long bytes)
+        : base(invalidHandleValue: 0, ownsHandle: true)
+    {
+        SetHandle((nint)address);
+        Offset = offset;
+        Bytes = bytes;
+    }
+
+    /// <inheritdoc/>
+    public override bool IsInvalid => handle == 0;
+
+    /// <summary>First byte of the view.</summary>
+    public byte* Address => (byte*)handle;
+
+    /// <summary>Section offset of <see cref="Address"/>.</summary>
+    public long Offset { get; }
+
+    /// <summary>Size of the view.</summary>
+    public long Bytes { get; }
+
+    /// <summary>Maps <c>[offset, offset + bytes)</c> of <paramref name="section"/>.</summary>
+    /// <exception cref="RingBufferLayoutException">The section is smaller than the view (a corrupt or foreign tag reserve).</exception>
+    public static SectionView Map(SafeSectionHandle section, long offset, long bytes, bool writable)
+    {
+        ArgumentNullException.ThrowIfNull(section);
+        if (offset < 0 || offset % Layout.HeaderViewBytes != 0 || bytes <= 0 || bytes % Layout.HeaderViewBytes != 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bytes), bytes, $"A section view needs a 64 KiB-aligned offset and size (offset {offset}).");
+        }
+
+        void* p = Kernel.MapViewOfFile3(section, 0, null, (ulong)offset, (nuint)bytes, 0, writable ? Kernel.PAGE_READWRITE : Kernel.PAGE_READONLY, null, 0);
+        int err = Kernel.LastError();
+        if (p == null)
+        {
+            if (err == Kernel.ERROR_ACCESS_DENIED)
+            {
+                throw new RingBufferLayoutException($"The section is smaller than its tag reserve claims (a view of {bytes} bytes at offset {offset}).", err);
+            }
+
+            throw Kernel.Fail("MapViewOfFile3", err, $"tag view of {bytes} bytes at offset {offset}");
+        }
+
+        return new SectionView(p, offset, bytes);
+    }
+
+    /// <summary>
+    /// Commits <c>[start, start + bytes)</c> of the view (rounded out to pages). Idempotent. The commit belongs to the section: every view in every process
+    /// sees the pages, and they stay committed for the section's life (a view of a section cannot decommit).
+    /// </summary>
+    /// <exception cref="PhotoneIpcException">The system commit limit is reached.</exception>
+    public void Commit(long start, long bytes)
+    {
+        if (start < 0 || bytes <= 0 || start + bytes > Bytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bytes), bytes, $"The commit [{start}, {start + bytes}) lies outside the view of {Bytes} bytes.");
+        }
+
+        if (Kernel.VirtualAlloc(Address + start, (nuint)bytes, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null)
+        {
+            int err = Kernel.LastError();
+            throw Kernel.Fail("VirtualAlloc", err, err is Kernel.ERROR_COMMITMENT_LIMIT or Kernel.ERROR_NOT_ENOUGH_MEMORY
+                ? $"committing {bytes} bytes of tag memory exceeds the system commit limit"
+                : $"commit of {bytes} bytes of tag memory");
+        }
+    }
+
+    /// <inheritdoc/>
+    protected override bool ReleaseHandle() => Kernel.UnmapViewOfFile((void*)handle);
 }

@@ -35,7 +35,10 @@ public sealed class LayoutTests
             [nameof(ControlBlock.InstanceId)] = 88,
             [nameof(ControlBlock.ReservationBytes)] = 96,
             [nameof(ControlBlock.SectionId)] = 104,
+            [nameof(ControlBlock.TagMode)] = 112,
+            [nameof(ControlBlock.TagReserveBytes)] = 120,
             [nameof(ControlBlock.WriteCursor)] = 128,
+            [nameof(ControlBlock.TagEnd)] = 136,
             [nameof(ControlBlock.ReserveEnd)] = 256,
             [nameof(ControlBlock.WriterState)] = 264,
             [nameof(ControlBlock.WriterPid)] = 268,
@@ -53,6 +56,15 @@ public sealed class LayoutTests
             [nameof(ControlBlock.LastEvictedPid)] = 472,
             [nameof(ControlBlock.Slots)] = 512,
             [nameof(ControlBlock.BackendArea)] = 2560,
+            [nameof(ControlBlock.TagVersion)] = 2688,
+            [nameof(ControlBlock.TagSnapshotEnd)] = 2696,
+            [nameof(ControlBlock.TagSnapshotW)] = 2704,
+            [nameof(ControlBlock.TagStateUsed)] = 2712,
+            [nameof(ControlBlock.TagStateCount)] = 2716,
+            [nameof(ControlBlock.TagSnapshotRing)] = 2720,
+            [nameof(ControlBlock.TagSnapshotRingStart)] = 2728,
+            [nameof(ControlBlock.TagTableCommitted)] = 2736,
+            [nameof(ControlBlock.TagRingCommitted)] = 2752,
         };
 
         foreach ((string name, int offset) in expected)
@@ -85,8 +97,9 @@ public sealed class LayoutTests
             int end = start + FieldSize(f);
             Assert.False(Overlaps(start, end, 192, 256), $"{f.Name} overlaps line 3");
             Assert.False(Overlaps(start, end, 320, 384), $"{f.Name} overlaps line 5");
-            // and nothing else shares the write cursor's line
-            if (f.Name != nameof(ControlBlock.WriteCursor))
+            // and nothing else shares the write cursor's line, except TagEnd: stored by the same writer right before WriteCursor (on commits with tags)
+            // and loaded by readers right after it, so it adds no traffic of its own to the line (DESIGN §16.2)
+            if (f.Name is not nameof(ControlBlock.WriteCursor) and not nameof(ControlBlock.TagEnd))
             {
                 Assert.False(Overlaps(start, end, 128, 192), $"{f.Name} shares line 2 with WriteCursor");
             }

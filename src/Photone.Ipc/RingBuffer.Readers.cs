@@ -90,7 +90,32 @@ public sealed unsafe partial class RingBuffer<T>
                 RingReader<T>? reader = null;
                 try
                 {
-                    reader = new RingReader<T>(this, i, active, w2, options);
+                    long start = w2;
+                    TagReader? tags = null;
+                    if (_tagWriter is not null)
+                    {
+                        // (e) the tag snapshot, taken with the cursor published: the last persistent tag per key, and where this reader's tags start;
+                        // the start cursor is w2, or the snapshot's newer write cursor (a monotone bump). The writer's own readers take the tag
+                        // objects (DESIGN §16.5), readers of an opened buffer the records in shared memory (§16.6).
+                        tags = LocalTagReader.Join(_tagWriter.Local, w2, out start);
+                    }
+                    else if (_tagViews is not null)
+                    {
+                        tags = SharedTagReader.Join(_hdr, _tagViews, _options.TagSerializer, w2, out start);
+                    }
+
+                    // (f) publish the start cursor with a full fence, then look for a writer waiting on this reader. Its scan may have seen the
+                    // provisional cursor of (a), which a commit since then can leave below its target, while (d) and the bump of (e) store more
+                    // without waking it; a slow tag join may also have held it back.
+                    // Fenced store then flag load pairs with the writer's flag store then cursor scan (Dekker), as in Advance.
+                    Interlocked.Exchange(ref s.ReadCursor, start);
+                    if (Volatile.Read(ref Hdr.WriterWaiting) != 0 && start >= Volatile.Read(ref Hdr.WriterWaitFor)
+                        && Interlocked.Exchange(ref Hdr.WriterWaiting, 0) == 1)
+                    {
+                        _backend.WakeWriter();
+                    }
+
+                    reader = new RingReader<T>(this, i, active, start, options, tags);
                     handedOver = true;                                                      // from here on the reader releases the reference (Dispose / finalizer)
                     reader.ResolveWriterProcess();
                     return reader;
@@ -99,9 +124,7 @@ public sealed unsafe partial class RingBuffer<T>
                 {
                     if (reader is null)
                     {
-                        // constructor failed: give the slot back (CreateReader gives the local ref back)
-                        Interlocked.CompareExchange(ref s.Word, SlotWord.Make(SlotState.Free, seq, 0), active);
-                        Interlocked.And(ref Hdr.ActiveMask, ~(1UL << i));
+                        ReleaseFailedClaim(i, active);                                     // CreateReader gives the local ref back
                     }
                     else
                     {
@@ -119,6 +142,31 @@ public sealed unsafe partial class RingBuffer<T>
         }
 
         throw new TooManyReadersException($"All {Layout.MaxReaders} reader slots are active.");
+    }
+
+    /// <summary>
+    /// A claim that failed after its slot became Active (a malformed tag snapshot, the reader's constructor): gives the slot back the way a disposed reader
+    /// does. The identity fields are zeroed before the slot is freed, so a sweeper never reads them behind the next claim, and a writer blocked on the slot
+    /// is woken to scan again without it.
+    /// </summary>
+    private void ReleaseFailedClaim(int i, long active)
+    {
+        ref ReaderSlot s = ref Slot(i);
+        Interlocked.And(ref Hdr.WaitersMask, ~(1UL << i));
+        s.WaitFor = long.MaxValue;
+        _backend.OnSlotReleased(i, (ReaderSlot*)Unsafe.AsPointer(ref s));
+        s.ProcessStartTime = 0;
+        s.ClaimTick = 0;
+        if (Interlocked.CompareExchange(ref s.Word, SlotWord.Make(SlotState.Free, SlotWord.Seq(active), 0), active) == active)
+        {
+            Interlocked.And(ref Hdr.ActiveMask, ~(1UL << i));
+            Interlocked.Increment(ref Hdr.ReaderGeneration);
+        }
+
+        if (Volatile.Read(ref Hdr.WriterWaiting) != 0 && Interlocked.Exchange(ref Hdr.WriterWaiting, 0) == 1)
+        {
+            _backend.WakeWriter();
+        }
     }
 
     // ------------------------------------------------------------------ eviction (DESIGN §5.7)

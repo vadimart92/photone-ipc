@@ -44,7 +44,11 @@ internal static unsafe partial class Kernel
     public const uint MEM_RESERVE = 0x00002000;
     public const uint MEM_RESERVE_PLACEHOLDER = 0x00040000;
     public const uint PAGE_NOACCESS = 0x01;
+    public const uint PAGE_READONLY = 0x02;
     public const uint PAGE_READWRITE = 0x04;
+
+    // VirtualAlloc
+    public const uint MEM_COMMIT = 0x00001000;
 
     // MapViewOfFile3 flags (separate group: MEM_REPLACE_PLACEHOLDER shares its value with VirtualFree's MEM_DECOMMIT)
     public const uint MEM_REPLACE_PLACEHOLDER = 0x00004000;
@@ -57,6 +61,7 @@ internal static unsafe partial class Kernel
     public const uint FILE_MAP_WRITE = 0x0002;
     public const uint FILE_MAP_READ = 0x0004;
     public const uint FILE_MAP_ALL_ACCESS = 0x000F001F;
+    public const uint SEC_RESERVE = 0x04000000;
     public const uint SYNCHRONIZE = 0x00100000;
     public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     public const uint PROCESS_DUP_HANDLE = 0x0040;
@@ -95,6 +100,10 @@ internal static unsafe partial class Kernel
     [LibraryImport(Kernel32, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool VirtualFree(void* address, nuint size, uint freeType);
+
+    /// <summary>Only to commit pages of a view of a <c>SEC_RESERVE</c> section (DESIGN §16.2): the commit belongs to the section, every view sees it.</summary>
+    [LibraryImport(Kernel32, SetLastError = true)]
+    public static partial void* VirtualAlloc(void* address, nuint size, uint allocationType, uint protect);
 
     [LibraryImport(Kernel32, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

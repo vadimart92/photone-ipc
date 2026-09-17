@@ -198,6 +198,12 @@ public sealed unsafe partial class RingBuffer<T>
             throw new InvalidOperationException("The bucket is no longer outstanding (the writer was disposed).");
         }
 
+        if (_tagWork)
+        {
+            EndWriteWithTags(count);                                // DESIGN §16.4: tags before the write cursor, the snapshots after it, Dispose kept out
+            return;
+        }
+
         _w += count;
         _e = _w;                                                    // shrink the reservation: next bucket starts at W + count (no holes)
         Interlocked.Exchange(ref Hdr.WriteCursor, _w);              // RELEASE of all bucket data stores + STORE-LOAD fence (Dekker) in one op
@@ -488,6 +494,8 @@ public sealed unsafe partial class RingBuffer<T>
     /// <see cref="GetBucket"/> (it then throws <see cref="ObjectDisposedException"/>). Idempotent.
     /// A <see cref="GetBucket"/> on another thread that is past its wait either published its reservation before the load of <c>_outstanding</c> here
     /// (the bucket is dropped here), or sees <c>_closed</c> and throws without handing out a span (<see cref="SlowGetBucket"/>).
+    /// A commit with tags running on another thread (it may be mapping or committing tag memory) is let finish first: it completes, or it sees
+    /// <c>_disposed</c> and gives up, and only then is the bucket dropped here (DESIGN §16.4).
     /// </summary>
     private void CloseWriter()
     {
@@ -496,9 +504,20 @@ public sealed unsafe partial class RingBuffer<T>
             return;
         }
 
+        while (Volatile.Read(ref _committing) != 0)                // after the fenced _disposed store (Dekker pair with EndWriteWithTags)
+        {
+            Thread.Sleep(1);
+        }
+
         if (_outstanding)
         {
             _closedWithBucket = true;                               // its span may still be in use on another thread: the mapping is never pooled (ReleaseNative)
+            if (_tagWork)
+            {
+                _tagWriter!.ClearPending(keepSticky: false);        // the bucket's tags go with it, and so do tags waiting for an element
+                _tagWork = false;
+            }
+
             EndWrite(0);
         }
 

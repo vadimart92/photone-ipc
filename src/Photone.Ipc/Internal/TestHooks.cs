@@ -29,4 +29,10 @@ internal static class TestHooks
     /// whether the writer was closed meanwhile; the argument is the buffer.
     /// </summary>
     public static Action<object>? AfterReservationPublished { get; set; }
+
+    /// <summary>Runs in a commit with tags once their memory is prepared, just before they are published; the argument is the committing buffer.</summary>
+    public static Action<object>? BeforeTagAppend { get; set; }
+
+    /// <summary>Runs in a commit with tags after its write cursor is published, just before the tag snapshots; the argument is the committing buffer.</summary>
+    public static Action<object>? BeforeTagSnapshot { get; set; }
 }

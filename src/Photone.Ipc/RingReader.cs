@@ -44,8 +44,14 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
     private SpinPolicy _idleSpin;       // the waiter thread waiting for the next request
     private Counters _counters;
 
-    internal RingReader(RingBuffer<T> owner, int slot, long word, long cursor, ReaderOptions options)
+    internal RingReader(RingBuffer<T> owner, int slot, long word, long cursor, ReaderOptions options, TagReader? tags = null)
     {
+        _tags = tags;
+        _tagEnd = tags is null ? &owner.Header->TagEnd : tags.EndPointer;
+        _tagLoadedW = tags is null ? long.MaxValue : cursor;
+        _tagNextOffset = tags?.NextOffset ?? long.MaxValue;
+        _tagPosition = tags?.Position ?? 0;
+        _tagThreshold = Math.Min(_tagLoadedW, _tagNextOffset);
         _owner = owner;
         _hdr = owner.Header;
         _data = owner.Data;
@@ -173,8 +179,10 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
     /// <summary>
     /// Returns a window of exactly <paramref name="count"/> elements starting at <see cref="ReadCursor"/>, or <see langword="false"/> if fewer are
     /// published. <c>count == 0</c> ⇒ <see langword="true"/> with an empty chunk. Never blocks. The chunk stays valid until <see cref="Advance"/> moves past it.
+    /// <see cref="Chunk{T}.Tags"/> holds the tags attached to the chunk's elements.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="count"/> exceeds the capacity.</exception>
+    /// <exception cref="RingBufferLayoutException">A tag record in shared memory is malformed.</exception>
     public bool TryRead(int count, out Chunk<T> chunk)
     {
         ThrowIfDisposed();
@@ -193,7 +201,22 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
             }
         }
 
-        chunk = new Chunk<T>(new ReadOnlySpan<T>(_data + Offset(_r), count), _r);
+        TagReader? tags = null;
+        long end = _r + count;
+        if (_tagThreshold < end)                                    // never without tags
+        {
+            if (_tagNextOffset >= end && Volatile.Read(ref *_tagEnd) == _tagPosition)
+            {
+                _tagLoadedW = _wc;                                  // nothing published since the last load and nothing queued here: the common case of sparse tags
+                _tagThreshold = Math.Min(_wc, _tagNextOffset);
+            }
+            else
+            {
+                tags = TagsForRead(end);                            // load what was published; the chunk's tags, if any
+            }
+        }
+
+        chunk = new Chunk<T>(new ReadOnlySpan<T>(_data + Offset(_r), count), _r, tags);
         return true;
     }
 
@@ -219,6 +242,11 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         if (Volatile.Read(ref MySlot.Word) != _word)                  // one L1 load of our own line, BEFORE the cursor store: a slot we no longer own is never written
         {
             ThrowEvicted();
+        }
+
+        if (_tagThreshold < _r + count)
+        {
+            TagsForAdvance(_r + count);                             // BEFORE the cursor store (DESIGN §16.4); never without tags
         }
 
         long old = _r;

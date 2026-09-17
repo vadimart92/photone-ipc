@@ -33,6 +33,21 @@ public sealed class RingBufferOptions
     /// </summary>
     public RingBufferPool? Pool { get; init; }
 
+    /// <summary>
+    /// Creator only: whether the buffer carries stream tags, and who can read them. <see cref="TagMode.None"/> (default): no tags.
+    /// <see cref="TagMode.InProcess"/>: tag objects for the readers of the writer's own <see cref="RingBuffer{T}"/>, never serialized.
+    /// <see cref="TagMode.CrossProcess"/>: also serialized with <see cref="TagSerializer"/> for readers in every process (it must be set). Tag memory grows
+    /// with the tags that readers have not read past yet; there is no capacity to choose. See <see cref="Bucket{T}.AddTag{TTag}"/>.
+    /// </summary>
+    public TagMode Tags { get; init; }
+
+    /// <summary>
+    /// How this process turns tags into bytes and back: the writer of a <see cref="TagMode.CrossProcess"/> buffer serializes with it, and readers of a buffer
+    /// opened from another process deserialize with it. <see langword="null"/> (default): such readers deliver every tag as an <see cref="UnknownTag"/>.
+    /// Typically <c>new JsonTagSerializer().Register&lt;MyTag&gt;()</c>. Not used with <see cref="TagMode.InProcess"/>.
+    /// </summary>
+    public ITagSerializer? TagSerializer { get; init; }
+
     internal static readonly RingBufferOptions Default = new();
 }
 

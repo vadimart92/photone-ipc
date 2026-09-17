@@ -177,7 +177,7 @@ public sealed class RingBufferPool : IDisposable
         }
     }
 
-    /// <summary>Sum of the data-region sizes of the mappings currently held idle.</summary>
+    /// <summary>Sum of the data-region sizes and the committed tag memory of the mappings currently held idle.</summary>
     public long IdleBytes
     {
         get
@@ -251,10 +251,11 @@ public sealed class RingBufferPool : IDisposable
     // ------------------------------------------------------------------ used by RingBuffer<T>
 
     /// <summary>
-    /// Takes the most recently returned idle creator section of <paramref name="dataBytes"/> that nobody else holds open, with its <c>InitState</c>
-    /// left at 0 for the caller to re-initialise; <see langword="null"/> when there is none (the caller maps a new section).
+    /// Takes the most recently returned idle creator section with a data region of <paramref name="dataBytes"/> and a tag reserve of <paramref name="tagReserveBytes"/>
+    /// that nobody else holds open, with its <c>InitState</c> left at 0 for the caller to re-initialise; <see langword="null"/> when there is none (the caller
+    /// maps a new section).
     /// </summary>
-    internal PooledMapping? RentForCreate(long dataBytes, bool global, ulong? preferredBase)
+    internal PooledMapping? RentForCreate(long dataBytes, long tagReserveBytes, bool global, ulong? preferredBase)
     {
         lock (_gate)
         {
@@ -264,7 +265,8 @@ public sealed class RingBufferPool : IDisposable
                 for (int i = _idle.Count - 1; i >= 0 && candidates < MaxReuseCandidates; i--)        // newest first: its pages are the warmest
                 {
                     PooledMapping e = _idle[i];
-                    if (!e.IsCreator || e.DataBytes != dataBytes || e.Global != global || (preferredBase is ulong b && b != 0 && e.Mapping.BaseAddress != b))
+                    if (!e.IsCreator || e.DataBytes != dataBytes || e.TagReserveBytes != tagReserveBytes || e.Global != global
+                        || (preferredBase is ulong b && b != 0 && e.Mapping.BaseAddress != b))
                     {
                         continue;
                     }
@@ -273,7 +275,7 @@ public sealed class RingBufferPool : IDisposable
                     if (TryClaim(e))
                     {
                         _idle.RemoveAt(i);
-                        _idleBytes -= e.DataBytes;
+                        _idleBytes -= e.PooledBytes;
                         _reused++;
                         e.MarkInUse();
                         return e;
@@ -299,7 +301,7 @@ public sealed class RingBufferPool : IDisposable
                 if (!e.IsCreator && e.SectionId == sectionId)
                 {
                     _idle.RemoveAt(i);
-                    _idleBytes -= e.DataBytes;
+                    _idleBytes -= e.PooledBytes;
                     e.MarkInUse();
                     return e;
                 }
@@ -326,7 +328,7 @@ public sealed class RingBufferPool : IDisposable
         List<PooledMapping>? release = null;
         lock (_gate)
         {
-            if (_disposed || _idleTimeoutTicks == 0 || entry.DataBytes > MaxIdleBytes)
+            if (_disposed || _idleTimeoutTicks == 0 || entry.PooledBytes > MaxIdleBytes)
             {
                 release = [entry];
                 _released++;
@@ -335,7 +337,7 @@ public sealed class RingBufferPool : IDisposable
             {
                 entry.IdleSince = Stopwatch.GetTimestamp();
                 _idle.Add(entry);
-                _idleBytes += entry.DataBytes;
+                _idleBytes += entry.PooledBytes;
                 while (_idleBytes > MaxIdleBytes)
                 {
                     (release ??= []).Add(RemoveOldest_NoLock());
@@ -435,7 +437,7 @@ public sealed class RingBufferPool : IDisposable
     {
         PooledMapping e = _idle[0];
         _idle.RemoveAt(0);
-        _idleBytes -= e.DataBytes;
+        _idleBytes -= e.PooledBytes;
         _released++;
         return e;
     }

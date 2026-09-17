@@ -8,13 +8,15 @@ namespace Photone.Ipc.Internal;
 /// </summary>
 internal sealed class PooledMapping
 {
+    private readonly long[] _tagRingCommitted = new long[TagFormat.RingClasses];
     private int _idle;                                              // 1 while the pool holds the mapping
 
-    public PooledMapping(MirroredSection mapping, SignalBackend backend, long dataBytes, ulong sectionId, string? sectionName, bool global, bool isCreator)
+    public PooledMapping(MirroredSection mapping, SignalBackend backend, long dataBytes, long tagReserveBytes, ulong sectionId, string? sectionName, bool global, bool isCreator)
     {
         Mapping = mapping;
         Backend = backend;
         DataBytes = dataBytes;
+        TagReserveBytes = tagReserveBytes;
         SectionId = sectionId;
         SectionName = sectionName;
         Global = global;
@@ -27,8 +29,50 @@ internal sealed class PooledMapping
     /// <summary>The 33 events, named from <see cref="SectionId"/>.</summary>
     public SignalBackend Backend { get; }
 
-    /// <summary>Size of the data region (the pool's size class).</summary>
+    /// <summary>Size of the data region (the pool's size class, with <see cref="TagReserveBytes"/>).</summary>
     public long DataBytes { get; }
+
+    /// <summary>Size of the tag reserve after the data: <see cref="TagFormat.ReserveBytes"/> for a section made for cross-process tags, otherwise 0.</summary>
+    public long TagReserveBytes { get; }
+
+    /// <summary>
+    /// Bytes committed in every ring of the tag reserve by the buffers that used this section as creators, in this process: the union of what each one
+    /// committed, since pages stay committed for the section's life (DESIGN §16.2). Kept here rather than read from the shared control block, which other
+    /// processes can write.
+    /// </summary>
+    public ReadOnlySpan<long> TagRingCommitted => _tagRingCommitted;
+
+    /// <summary>Bytes of the table region committed, as <see cref="TagRingCommitted"/>.</summary>
+    public long TagTableCommitted { get; private set; }
+
+    /// <summary>The committed tag memory: <see cref="TagTableCommitted"/> and every ring.</summary>
+    public long TagBytes
+    {
+        get
+        {
+            long bytes = TagTableCommitted;
+            foreach (long ring in _tagRingCommitted)
+            {
+                bytes += ring;
+            }
+
+            return bytes;
+        }
+    }
+
+    /// <summary>What the mapping counts against <see cref="RingBufferPool.IdleBytes"/>: the data region and the committed tag memory.</summary>
+    public long PooledBytes => DataBytes + TagBytes;
+
+    /// <summary>Adds what a creator's writer committed (before the mapping goes back to the pool; the value must not change while it is idle).</summary>
+    public void AddTagCommitted(ReadOnlySpan<long> rings, long table)
+    {
+        for (int i = 0; i < _tagRingCommitted.Length && i < rings.Length; i++)
+        {
+            _tagRingCommitted[i] = Math.Max(_tagRingCommitted[i], rings[i]);
+        }
+
+        TagTableCommitted = Math.Max(TagTableCommitted, table);
+    }
 
     /// <summary><c>ControlBlock.SectionId</c>: constant for the section's life.</summary>
     public ulong SectionId { get; }
