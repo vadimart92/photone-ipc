@@ -32,7 +32,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   Internal/SpinPolicy.cs  adaptive spin budget (DESIGN §14)
   Internal/PooledMapping.cs     one mapping + its events as the pool hands it out and takes it back (DESIGN §15)
   Internal/Capacity.cs, AddressHint.cs, ProcessLiveness.cs, SpinClock.cs, Counters.cs, TestHooks.cs
-tests/Photone.Ipc.Tests/       328 xunit.v3 tests (unit, stress, and 25 cross-process tests via TestChild)
+tests/Photone.Ipc.Tests/       330 xunit.v3 tests (unit, stress, and 25 cross-process tests via TestChild)
 tests/Photone.Ipc.TestChild/   child-process verbs: reader, spin-reader, step-reader, writer [--crash], echo, crash-reader,
                                claim-and-die, slow-init, hold-name, join-storm, map-region, pool-reader-loop
 bench/Photone.Ipc.Benchmarks/  BenchmarkDotNet hot path, `--quick`, `--compare` (named pipe / TCP), `--latency` (paced delivery latency + CPU),
@@ -69,7 +69,7 @@ InitializationTimeout, PreferredBaseAddress, PreFault, Pool }`, `ReaderOptions {
 ## Verification
 
 - `dotnet build Photone.Ipc.slnx -c Release`: 0 warnings, 0 errors (`TreatWarningsAsErrors`, `AnalysisLevel=latest`).
-- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 328/328, three consecutive runs, ~30 s each.
+- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 330/330, three consecutive runs, ~30 s each.
   Process-counter tests (handle count, virtual size) run in the non-parallel collection; 300 pooled create/open/reuse/revive cycles leave 0 handles behind.
 - Samples run cross-process at the same virtual address; killing the writer ends the reader with `WriterTerminated` after draining.
 - Zero allocations on every hot path (asserted by tests and by BenchmarkDotNet's `MemoryDiagnoser`).

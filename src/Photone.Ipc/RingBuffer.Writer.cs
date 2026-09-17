@@ -47,13 +47,13 @@ public sealed unsafe partial class RingBuffer<T>
     /// <param name="count">Elements to reserve; <c>1 &lt;= count &lt;= Capacity</c>.</param>
     /// <exception cref="InvalidOperationException">Not the writer, the writer is closed, or a bucket is outstanding.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="count"/> is 0 or exceeds <see cref="Capacity"/>.</exception>
-    /// <exception cref="ObjectDisposedException">The buffer was disposed.</exception>
+    /// <exception cref="ObjectDisposedException">The buffer was disposed, also by another thread while the call waits (the way to abort a blocked writer).</exception>
     public Bucket<T> GetBucket(int count)
     {
         CheckWriter(count);
         if (_capacity - (_e - _min) < count)             // cached view insufficient (invariant: _min <= true min, so this only under-estimates)
         {
-            SlowGetBucket(count);
+            SlowGetBucket(count);                        // on return the reservation is published and paired with a concurrent Dispose
         }
 
         return Reserve(count);
@@ -130,9 +130,12 @@ public sealed unsafe partial class RingBuffer<T>
     private nint Offset(long cursor) => (nint)((cursor & _mask) * sizeof(T));
 
     /// <summary>
-    /// Slow path of <see cref="GetBucket"/>. Holds a local reference for its whole duration so that <see cref="Dispose"/> from another
-    /// thread (the supported way to abort a blocked writer) cannot unmap the control block under the scan/wait loops; the blocked
-    /// call then ends with <see cref="ObjectDisposedException"/> instead of an access violation.
+    /// Slow path of <see cref="GetBucket"/>. The scan and the wait hold a local reference, so <see cref="Dispose"/> from another thread (the supported
+    /// way to abort a blocked writer) cannot unmap the control block under them; the blocked call then ends with <see cref="ObjectDisposedException"/>
+    /// instead of an access violation. The reservation that follows touches no shared memory and runs without the reference, but a Dispose that lands
+    /// after the wait must not miss it (it would release the mapping, or pool it, under the bucket). So the reservation is published behind a full fence
+    /// before <c>_closed</c> is loaded, the reverse of <see cref="CloseWriter"/>'s order (Dekker, DESIGN §5.3): either the closing thread finds it and drops
+    /// the bucket (the mapping is then never pooled), or this call sees <c>_closed</c> and throws without handing out a span.
     /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void SlowGetBucket(int count)
@@ -156,6 +159,26 @@ public sealed unsafe partial class RingBuffer<T>
             TestHooks.SlowGetBucketLeaving?.Invoke();
             ReleaseLocalRef();
         }
+
+        TestHooks.AfterSpaceWait?.Invoke(this);
+        _outstanding = true;                                        // publish the reservation ...
+        Interlocked.MemoryBarrier();                                // ... [full fence] before _closed is loaded
+        TestHooks.AfterReservationPublished?.Invoke(this);
+        if (Volatile.Read(ref _closed) != 0)                        // on the writer, _closed is only ever set by Dispose (or the finalizer)
+        {
+            AbandonReservation();
+        }
+    }                                                               // the caller's Reserve stores _outstanding = true again and hands out the bucket
+
+    /// <summary>
+    /// A <see cref="Dispose"/> on another thread closed the writer after a <see cref="GetBucket"/> finished waiting, before the bucket was handed out. Nothing
+    /// here touches shared memory: the mapping may already be released, or back in the pool.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void AbandonReservation()
+    {
+        _outstanding = false;                                       // CloseWriter may be dropping the reservation meanwhile; it stores the same value
+        throw new ObjectDisposedException(GetType().FullName);
     }
 
     // ------------------------------------------------------------------ Commit
@@ -463,10 +486,12 @@ public sealed unsafe partial class RingBuffer<T>
     /// <summary>
     /// Drops the outstanding bucket, publishes <c>Closed</c>, wakes every reader (DESIGN §5.8) and a writer thread blocked in
     /// <see cref="GetBucket"/> (it then throws <see cref="ObjectDisposedException"/>). Idempotent.
+    /// A <see cref="GetBucket"/> on another thread that is past its wait either published its reservation before the load of <c>_outstanding</c> here
+    /// (the bucket is dropped here), or sees <c>_closed</c> and throws without handing out a span (<see cref="SlowGetBucket"/>).
     /// </summary>
     private void CloseWriter()
     {
-        if (Interlocked.Exchange(ref _closed, 1) != 0)
+        if (Interlocked.Exchange(ref _closed, 1) != 0)              // [full fence] before _outstanding is loaded (Dekker pair with SlowGetBucket)
         {
             return;
         }

@@ -178,6 +178,103 @@ public sealed unsafe class PoolTests
     }
 
     [Fact]
+    public void Create_DisposeBetweenTheSpaceWaitAndTheReservation_GetBucketThrows_TheNextBufferReusesTheSection()
+    {
+        using var pool = new RingBufferPool(s_keepForever);
+        RingBuffer<long> writer = RingBuffer<long>.Create(1 << 12, options: With(pool));
+        ulong firstBase = writer.BaseAddress;
+        DisposeDuringGetBucket(writer, hook => TestHooks.AfterSpaceWait = hook, (bucketAddress, failure) =>
+        {
+            Assert.Equal(1, pool.IdleCount);                                                  // Dispose found no reservation: the section went back to the pool
+            using RingBuffer<long> next = RingBuffer<long>.Create(1 << 12, options: With(pool));
+            Assert.Equal(firstBase, next.BaseAddress);                                        // ... and the next buffer took it
+            nint views = (nint)next.Data;
+            Assert.False(
+                bucketAddress >= views && bucketAddress < views + (nint)(2 * next.DataBytes),
+                $"GetBucket returned a bucket at 0x{bucketAddress:X} inside the section the pool gave to the next buffer (data view at 0x{views:X}).");
+            Assert.IsType<ObjectDisposedException>(failure);
+        });
+    }
+
+    [Fact]
+    public void Create_DisposeAfterTheReservationWasPublished_ReleasesTheSectionInsteadOfPoolingIt_GetBucketThrows()
+    {
+        using var pool = new RingBufferPool(s_keepForever);
+        RingBuffer<long> writer = RingBuffer<long>.Create(1 << 12, options: With(pool));
+        ulong firstBase = writer.BaseAddress;
+        DisposeDuringGetBucket(writer, hook => TestHooks.AfterReservationPublished = hook, (bucketAddress, failure) =>
+        {
+            Assert.IsType<ObjectDisposedException>(failure);                                  // the call still saw the disposal: no bucket
+            Assert.Equal(nint.Zero, bucketAddress);
+            Assert.Equal(0, pool.IdleCount);                                                  // Dispose found the reservation: released, never pooled
+            Assert.Equal(TestKernel.MEM_FREE, TestKernel.QueryState(firstBase, out _));
+            RingBuffer<long>.Create(1 << 12, options: With(pool)).Dispose();
+            Assert.Equal(0, pool.ReusedCount);
+        });
+    }
+
+    /// <summary>
+    /// Fills the ring behind a reader, blocks <c>GetBucket(1)</c> on another thread and ends its wait by disposing the reader. The hook that
+    /// <paramref name="setHook"/> installs disposes <paramref name="writer"/> on a third thread and waits for that to complete. <paramref name="whileHeld"/>
+    /// gets the address of the bucket <c>GetBucket</c> returned (0 if it threw) and the exception, while the bucket is still held. The bucket is never
+    /// stored through, committed or disposed: its memory may belong to another buffer by then.
+    /// </summary>
+    private static void DisposeDuringGetBucket(RingBuffer<long> writer, Action<Action<object>?> setHook, Action<nint, Exception?> whileHeld)
+    {
+        RingReader<long> reader = writer.CreateReader();                                    // never advances: the ring fills up
+        RingTestUtil.WriteSequence(writer, writer.Capacity, 1000);
+        using var returned = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        nint bucketAddress = 0;
+        Exception? failure = null;
+        bool disposed = false;
+        var blocked = new Thread(() =>
+        {
+            try
+            {
+                Bucket<long> bucket = writer.GetBucket(1);
+                fixed (long* p = bucket.Span)
+                {
+                    bucketAddress = (nint)p;
+                }
+
+                returned.Set();
+                release.Wait(RingTestUtil.Long);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+                returned.Set();
+            }
+        })
+        { IsBackground = true };
+        setHook(buffer =>
+        {
+            if (buffer == writer)                                                             // buffers of tests running in parallel pass through
+            {
+                var disposer = new Thread(writer.Dispose) { IsBackground = true };
+                disposer.Start();
+                disposed = disposer.Join(RingTestUtil.Short);
+            }
+        });
+        try
+        {
+            blocked.Start();
+            RingTestUtil.WaitUntil(() => RingTestUtil.WriterIsWaiting(writer), "writer blocked");
+            reader.Dispose();                                                                 // frees the ring and wakes the writer: its wait succeeds
+            Assert.True(returned.Wait(RingTestUtil.Short), "GetBucket did not return");
+            Assert.True(disposed, "Dispose on another thread did not complete");
+            whileHeld(bucketAddress, failure);
+        }
+        finally
+        {
+            setHook(null);
+            release.Set();
+            blocked.Join(RingTestUtil.Short);
+        }
+    }
+
+    [Fact]
     public void CreateReader_RacingDispose_ReturnsTheMappingOnce()
     {
         using var pool = new RingBufferPool(s_keepForever);
