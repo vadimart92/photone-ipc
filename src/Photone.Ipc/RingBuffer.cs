@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using Windows.Win32.Foundation;
+using Windows.Win32.System.Threading;
 using Microsoft.Win32.SafeHandles;
 using Photone.Ipc.Internal;
 using Photone.Ipc.Signaling;
@@ -501,7 +503,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
                 if (pooled && alias is null && name is not null)
                 {
                     throw new RingBufferNotFoundException(
-                        $"'{name}' is a section kept by a RingBufferPool, not a buffer name; open the buffer by the name it was created with.", Kernel.ERROR_FILE_NOT_FOUND);
+                        $"'{name}' is a section kept by a RingBufferPool, not a buffer name; open the buffer by the name it was created with.", (int)WIN32_ERROR.ERROR_FILE_NOT_FOUND);
                 }
 
                 tagMode = (TagMode)h->TagMode;                         // validated above; loaded once
@@ -666,7 +668,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
         string message = name is null
             ? "The buffer no longer exists: its pooled section has been released or reused."
             : $"The buffer '{name}' no longer exists: its pooled section has been released or reused.";
-        return inner is null ? new RingBufferNotFoundException(message, Kernel.ERROR_FILE_NOT_FOUND) : new RingBufferNotFoundException(message, inner);
+        return inner is null ? new RingBufferNotFoundException(message, (int)WIN32_ERROR.ERROR_FILE_NOT_FOUND) : new RingBufferNotFoundException(message, inner);
     }
 
     /// <summary>Touches every page of the data view and of the mirror view once (writes for the creator, reads for openers).</summary>
@@ -860,7 +862,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
 
     private nint DuplicateSectionHandleCore(int targetProcessId)
     {
-        SafeProcessHandle target = Kernel.OpenProcess(Kernel.PROCESS_DUP_HANDLE, false, (uint)targetProcessId);
+        SafeProcessHandle target = Kernel.OpenProcess(PROCESS_ACCESS_RIGHTS.PROCESS_DUP_HANDLE, false, (uint)targetProcessId);
         int err = Kernel.LastError();
         if (target.IsInvalid)
         {
@@ -875,7 +877,7 @@ public sealed unsafe partial class RingBuffer<T> : IDisposable where T : unmanag
             try
             {
                 section.DangerousAddRef(ref added);
-                if (!Kernel.DuplicateHandle(Kernel.GetCurrentProcess(), section.DangerousGetHandle(), target.DangerousGetHandle(), out nint dup, 0, false, Kernel.DUPLICATE_SAME_ACCESS))
+                if (!Kernel.DuplicateHandle(Kernel.GetCurrentProcess(), section.DangerousGetHandle(), target.DangerousGetHandle(), out nint dup, 0, false, DUPLICATE_HANDLE_OPTIONS.DUPLICATE_SAME_ACCESS))
                 {
                     throw Kernel.Fail("DuplicateHandle", Kernel.LastError(), "section");
                 }

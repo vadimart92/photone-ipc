@@ -103,10 +103,6 @@ internal static class Layout
         Check((byte*)&cb.TagSnapshotRingStart - p, TagSnapshotOffset + 40, nameof(ControlBlock.TagSnapshotRingStart));
         Check((byte*)&cb.TagTableCommitted - p, TagSnapshotOffset + 48, nameof(ControlBlock.TagTableCommitted));
         Check((byte*)cb.TagRingCommitted - p, TagRingCommittedOffset, nameof(ControlBlock.TagRingCommitted));   // fixed buffer: the expression is already the element pointer
-        if (TagRingCommittedOffset + (8 * TagFormat.RingClasses) > ControlBytes)
-        {
-            throw new InvalidOperationException("ControlBlock.TagRingCommitted does not fit in the control block.");
-        }
 
         ReaderSlot rs = default;
         byte* q = (byte*)&rs;

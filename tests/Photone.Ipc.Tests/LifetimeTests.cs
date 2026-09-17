@@ -1,3 +1,4 @@
+using Windows.Win32.Foundation;
 using Photone.Ipc.Internal;
 
 namespace Photone.Ipc.Tests;
@@ -50,14 +51,14 @@ public sealed class LifetimeTests
         string name = TestNames.Unique();
         using RingBuffer<int> buffer = RingBuffer<int>.Create(100, name);
         RingBufferAlreadyExistsException ex = Assert.Throws<RingBufferAlreadyExistsException>(() => RingBuffer<int>.Create(100, name));
-        Assert.Equal(Kernel.ERROR_ALREADY_EXISTS, ex.NativeErrorCode);
+        Assert.Equal((int)WIN32_ERROR.ERROR_ALREADY_EXISTS, ex.NativeErrorCode);
     }
 
     [Fact]
     public void Open_MissingName_ThrowsNotFound()
     {
         RingBufferNotFoundException ex = Assert.Throws<RingBufferNotFoundException>(() => RingBuffer<int>.Open(TestNames.Unique()));
-        Assert.Equal(Kernel.ERROR_FILE_NOT_FOUND, ex.NativeErrorCode);
+        Assert.Equal((int)WIN32_ERROR.ERROR_FILE_NOT_FOUND, ex.NativeErrorCode);
     }
 
     [Fact]

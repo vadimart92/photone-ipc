@@ -28,53 +28,6 @@ namespace Photone.Ipc.Internal;
 /// </summary>
 internal static unsafe class Kernel
 {
-    // ---- allocation, free and protection flags: separate metadata enums, so a VirtualFree flag cannot be passed to VirtualAlloc2 by mistake
-    //      (MEM_REPLACE_PLACEHOLDER and MEM_DECOMMIT share the value 0x4000; RESEARCH note 24) ----
-    public const VIRTUAL_ALLOCATION_TYPE MEM_COMMIT = VIRTUAL_ALLOCATION_TYPE.MEM_COMMIT;
-    public const VIRTUAL_ALLOCATION_TYPE MEM_RESERVE = VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE;
-    public const VIRTUAL_ALLOCATION_TYPE MEM_RESERVE_PLACEHOLDER = VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE_PLACEHOLDER;
-    public const VIRTUAL_ALLOCATION_TYPE MEM_REPLACE_PLACEHOLDER = VIRTUAL_ALLOCATION_TYPE.MEM_REPLACE_PLACEHOLDER;
-    public const VIRTUAL_FREE_TYPE MEM_RELEASE = VIRTUAL_FREE_TYPE.MEM_RELEASE;
-
-    /// <summary>The metadata declares this flag only for <c>UnmapViewOfFileEx</c>; <c>VirtualFree</c> takes the same bit to split or keep a placeholder.</summary>
-    public const VIRTUAL_FREE_TYPE MEM_PRESERVE_PLACEHOLDER = (VIRTUAL_FREE_TYPE)UNMAP_VIEW_OF_FILE_FLAGS.MEM_PRESERVE_PLACEHOLDER;
-
-    public const PAGE_PROTECTION_FLAGS PAGE_NOACCESS = PAGE_PROTECTION_FLAGS.PAGE_NOACCESS;
-    public const PAGE_PROTECTION_FLAGS PAGE_READONLY = PAGE_PROTECTION_FLAGS.PAGE_READONLY;
-    public const PAGE_PROTECTION_FLAGS PAGE_READWRITE = PAGE_PROTECTION_FLAGS.PAGE_READWRITE;
-    public const PAGE_PROTECTION_FLAGS SEC_RESERVE = PAGE_PROTECTION_FLAGS.SEC_RESERVE;
-
-    // ---- sections, processes ----
-    public const FILE_MAP FILE_MAP_READ = FILE_MAP.FILE_MAP_READ;
-    public const FILE_MAP FILE_MAP_WRITE = FILE_MAP.FILE_MAP_WRITE;
-    public const PROCESS_ACCESS_RIGHTS SYNCHRONIZE = PROCESS_ACCESS_RIGHTS.PROCESS_SYNCHRONIZE;
-    public const PROCESS_ACCESS_RIGHTS PROCESS_QUERY_LIMITED_INFORMATION = PROCESS_ACCESS_RIGHTS.PROCESS_QUERY_LIMITED_INFORMATION;
-    public const PROCESS_ACCESS_RIGHTS PROCESS_DUP_HANDLE = PROCESS_ACCESS_RIGHTS.PROCESS_DUP_HANDLE;
-    public const DUPLICATE_HANDLE_OPTIONS DUPLICATE_SAME_ACCESS = DUPLICATE_HANDLE_OPTIONS.DUPLICATE_SAME_ACCESS;
-
-    // ---- waits: numbers, not an enum, because a multiple-object wait answers with WAIT_OBJECT_0 + the index that woke it ----
-    public const uint WAIT_OBJECT_0 = (uint)WAIT_EVENT.WAIT_OBJECT_0;
-    public const uint WAIT_ABANDONED = (uint)WAIT_EVENT.WAIT_ABANDONED;
-    public const uint WAIT_TIMEOUT = (uint)WAIT_EVENT.WAIT_TIMEOUT;
-    public const uint WAIT_FAILED = (uint)WAIT_EVENT.WAIT_FAILED;
-    public const uint INFINITE = Win32.INFINITE;
-
-    // ---- errors ----
-    public const int ERROR_FILE_NOT_FOUND = (int)WIN32_ERROR.ERROR_FILE_NOT_FOUND;
-    public const int ERROR_ACCESS_DENIED = (int)WIN32_ERROR.ERROR_ACCESS_DENIED;
-    public const int ERROR_INVALID_HANDLE = (int)WIN32_ERROR.ERROR_INVALID_HANDLE;
-    public const int ERROR_NOT_ENOUGH_MEMORY = (int)WIN32_ERROR.ERROR_NOT_ENOUGH_MEMORY;
-    public const int ERROR_INVALID_PARAMETER = (int)WIN32_ERROR.ERROR_INVALID_PARAMETER;
-    public const int ERROR_ALREADY_EXISTS = (int)WIN32_ERROR.ERROR_ALREADY_EXISTS;
-    public const int ERROR_INVALID_ADDRESS = (int)WIN32_ERROR.ERROR_INVALID_ADDRESS;
-    public const int ERROR_MAPPED_ALIGNMENT = (int)WIN32_ERROR.ERROR_MAPPED_ALIGNMENT;
-    public const int ERROR_COMMITMENT_LIMIT = (int)WIN32_ERROR.ERROR_COMMITMENT_LIMIT;
-
-    public static readonly int STATUS_INFO_LENGTH_MISMATCH = NTSTATUS.STATUS_INFO_LENGTH_MISMATCH;
-    public static readonly int STATUS_BUFFER_TOO_SMALL = NTSTATUS.STATUS_BUFFER_TOO_SMALL;
-
-    public static readonly nint INVALID_HANDLE_VALUE = -1;
-
     /// <summary>Expected allocation granularity; every view and the data region are multiples of it.</summary>
     public const uint ExpectedAllocationGranularity = 65536;
 
@@ -110,7 +63,7 @@ internal static unsafe class Kernel
 
     public static bool UnmapViewOfFile(void* baseAddress) => Win32.UnmapViewOfFile((MEMORY_MAPPED_VIEW_ADDRESS)baseAddress);
 
-    /// <summary>Create-or-open: on an existing name the call succeeds and the last error is <see cref="ERROR_ALREADY_EXISTS"/>.</summary>
+    /// <summary>Create-or-open: on an existing name the call succeeds and the last error is <see cref="WIN32_ERROR.ERROR_ALREADY_EXISTS"/>.</summary>
     public static SafeSectionHandle CreateFileMapping(nint file, SECURITY_ATTRIBUTES* securityAttributes, PAGE_PROTECTION_FLAGS protect, uint maxSizeHigh, uint maxSizeLow, string? name)
     {
         fixed (char* n = name)
@@ -161,7 +114,7 @@ internal static unsafe class Kernel
 
     // ------------------------------------------------------------------ signaling (raw handles: no AddRef/Release per call)
 
-    /// <summary>Create-or-open: on an existing name the call succeeds and the last error is <see cref="ERROR_ALREADY_EXISTS"/>.</summary>
+    /// <summary>Create-or-open: on an existing name the call succeeds and the last error is <see cref="WIN32_ERROR.ERROR_ALREADY_EXISTS"/>.</summary>
     public static SafeWaitHandle CreateEvent(SECURITY_ATTRIBUTES* securityAttributes, bool manualReset, bool initialState, string? name)
     {
         fixed (char* n = name)

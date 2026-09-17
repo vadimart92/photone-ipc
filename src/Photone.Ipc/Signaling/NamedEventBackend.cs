@@ -1,4 +1,5 @@
 using System.Globalization;
+using Windows.Win32.Foundation;
 using Microsoft.Win32.SafeHandles;
 using Photone.Ipc.Internal;
 
@@ -47,13 +48,13 @@ internal sealed unsafe class NamedEventBackend : SignalBackend
                     throw Kernel.Fail("CreateEventW", err, name);
                 }
 
-                if (isCreator && err == Kernel.ERROR_ALREADY_EXISTS)
+                if (isCreator && err == (int)WIN32_ERROR.ERROR_ALREADY_EXISTS)
                 {
                     // Cannot happen with a fresh random SectionId; if it does, make sure no stale set survives.
                     Kernel.ResetEvent(h.DangerousGetHandle());
                 }
 
-                if (!isCreator && err != Kernel.ERROR_ALREADY_EXISTS)
+                if (!isCreator && err != (int)WIN32_ERROR.ERROR_ALREADY_EXISTS)
                 {
                     createdAny = true;
                 }
@@ -112,9 +113,9 @@ internal sealed unsafe class NamedEventBackend : SignalBackend
         uint rc = Kernel.WaitForMultipleObjects(n, h, false, timeoutMs);
         return rc switch
         {
-            Kernel.WAIT_OBJECT_0 => WaitOutcome.Signaled,
-            Kernel.WAIT_OBJECT_0 + 1 => WaitOutcome.ProcessExited,
-            Kernel.WAIT_TIMEOUT => WaitOutcome.Timeout,
+            (uint)WAIT_EVENT.WAIT_OBJECT_0 => WaitOutcome.Signaled,
+            (uint)WAIT_EVENT.WAIT_OBJECT_0 + 1 => WaitOutcome.ProcessExited,
+            (uint)WAIT_EVENT.WAIT_TIMEOUT => WaitOutcome.Timeout,
             _ => WaitOutcome.Failed,
         };
     }
@@ -141,18 +142,18 @@ internal sealed unsafe class NamedEventBackend : SignalBackend
         }
 
         uint rc = Kernel.WaitForMultipleObjects((uint)(1 + processes.Length), h, false, timeoutMs);
-        if (rc == Kernel.WAIT_OBJECT_0)
+        if (rc == (uint)WAIT_EVENT.WAIT_OBJECT_0)
         {
             return WaitOutcome.Signaled;
         }
 
-        if (rc > Kernel.WAIT_OBJECT_0 && rc < Kernel.WAIT_OBJECT_0 + 1 + (uint)processes.Length)
+        if (rc > (uint)WAIT_EVENT.WAIT_OBJECT_0 && rc < (uint)WAIT_EVENT.WAIT_OBJECT_0 + 1 + (uint)processes.Length)
         {
-            exitedIndex = (int)(rc - Kernel.WAIT_OBJECT_0 - 1);
+            exitedIndex = (int)(rc - (uint)WAIT_EVENT.WAIT_OBJECT_0 - 1);
             return WaitOutcome.ProcessExited;
         }
 
-        return rc == Kernel.WAIT_TIMEOUT ? WaitOutcome.Timeout : WaitOutcome.Failed;
+        return rc == (uint)WAIT_EVENT.WAIT_TIMEOUT ? WaitOutcome.Timeout : WaitOutcome.Failed;
     }
 
     /// <inheritdoc/>

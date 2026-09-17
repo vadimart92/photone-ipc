@@ -1,5 +1,5 @@
-using System.Diagnostics;
 using System.Globalization;
+using Windows.Win32.System.Memory;
 using Photone.Ipc.Internal;
 
 namespace Photone.Ipc.TestChild;
@@ -567,7 +567,7 @@ internal static unsafe class Program
         if (occupy && creatorBase != 0)
         {
             // Pre-reserve the creator's range so Open must fall back to a system-chosen address.
-            void* blocker = Kernel.VirtualAlloc2(0, (void*)creatorBase, 65536, Kernel.MEM_RESERVE, Kernel.PAGE_NOACCESS, null, 0);
+            void* blocker = Kernel.VirtualAlloc2(0, (void*)creatorBase, 65536, VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE, PAGE_PROTECTION_FLAGS.PAGE_NOACCESS, null, 0);
             if (blocker == null)
             {
                 throw new InvalidOperationException("could not occupy the creator's range: " + Kernel.LastError());

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using Windows.Win32.Foundation;
 using Microsoft.Win32.SafeHandles;
 using Photone.Ipc.Internal;
 using Photone.Ipc.Signaling;
@@ -142,7 +143,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         _nextLivenessProbe = now + _livenessTicks;
         if (_writerProc != 0)
         {
-            if (Kernel.WaitForSingleObject(_writerProc, 0) == Kernel.WAIT_OBJECT_0)
+            if (Kernel.WaitForSingleObject(_writerProc, 0) == (uint)WAIT_EVENT.WAIT_OBJECT_0)
             {
                 _writerExited = true;
             }
@@ -425,7 +426,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
                     return false;
                 }
 
-                if ((i & 65535) == 0 && _writerProc != 0 && Kernel.WaitForSingleObject(_writerProc, 0) == Kernel.WAIT_OBJECT_0)
+                if ((i & 65535) == 0 && _writerProc != 0 && Kernel.WaitForSingleObject(_writerProc, 0) == (uint)WAIT_EVENT.WAIT_OBJECT_0)
                 {
                     _writerExited = true;
                     return false;

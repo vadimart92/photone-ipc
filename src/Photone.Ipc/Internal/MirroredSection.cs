@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Windows.Win32.Foundation;
 using Windows.Win32.System.Memory;
 
 namespace Photone.Ipc.Internal;
@@ -159,24 +160,24 @@ internal sealed unsafe class MirroredSection : SafeHandle
 
     private static SafeSectionHandle CreateSectionCore(ulong size, string? sectionName, bool reserveOnly)
     {
-        PAGE_PROTECTION_FLAGS protect = reserveOnly ? Kernel.PAGE_READWRITE | Kernel.SEC_RESERVE : Kernel.PAGE_READWRITE;
-        SafeSectionHandle section = Kernel.CreateFileMapping(Kernel.INVALID_HANDLE_VALUE, null, protect, (uint)(size >> 32), (uint)size, sectionName);
+        PAGE_PROTECTION_FLAGS protect = reserveOnly ? PAGE_PROTECTION_FLAGS.PAGE_READWRITE | PAGE_PROTECTION_FLAGS.SEC_RESERVE : PAGE_PROTECTION_FLAGS.PAGE_READWRITE;
+        SafeSectionHandle section = Kernel.CreateFileMapping(-1, null, protect, (uint)(size >> 32), (uint)size, sectionName);
         int err = Kernel.LastError();                                  // read even on success (183 = opened existing)
         if (section.IsInvalid)
         {
             section.Dispose();
             string? detail = err switch
             {
-                Kernel.ERROR_ACCESS_DENIED when sectionName is not null && sectionName.StartsWith(GlobalPrefix, StringComparison.Ordinal)
+                (int)WIN32_ERROR.ERROR_ACCESS_DENIED when sectionName is not null && sectionName.StartsWith(GlobalPrefix, StringComparison.Ordinal)
                     => "creating a Global\\ section requires SeCreateGlobalPrivilege",
-                Kernel.ERROR_COMMITMENT_LIMIT or Kernel.ERROR_NOT_ENOUGH_MEMORY
+                (int)WIN32_ERROR.ERROR_COMMITMENT_LIMIT or (int)WIN32_ERROR.ERROR_NOT_ENOUGH_MEMORY
                     => $"the section ({size} bytes) exceeds the system commit limit",
                 _ => null,
             };
             throw Kernel.Fail("CreateFileMappingW", err, detail);
         }
 
-        if (err == Kernel.ERROR_ALREADY_EXISTS)
+        if (err == (int)WIN32_ERROR.ERROR_ALREADY_EXISTS)
         {
             section.Dispose();
             throw new RingBufferAlreadyExistsException($"A section named '{sectionName}' already exists.", err);
@@ -191,12 +192,12 @@ internal sealed unsafe class MirroredSection : SafeHandle
     {
         Kernel.EnsurePlatform();
         ArgumentException.ThrowIfNullOrEmpty(sectionName);
-        SafeSectionHandle section = Kernel.OpenFileMapping(Kernel.FILE_MAP_READ | Kernel.FILE_MAP_WRITE, false, sectionName);
+        SafeSectionHandle section = Kernel.OpenFileMapping(FILE_MAP.FILE_MAP_READ | FILE_MAP.FILE_MAP_WRITE, false, sectionName);
         int err = Kernel.LastError();
         if (section.IsInvalid)
         {
             section.Dispose();
-            if (err == Kernel.ERROR_FILE_NOT_FOUND)
+            if (err == (int)WIN32_ERROR.ERROR_FILE_NOT_FOUND)
             {
                 throw new RingBufferNotFoundException($"No section named '{sectionName}' exists.", err);
             }
@@ -222,11 +223,11 @@ internal sealed unsafe class MirroredSection : SafeHandle
     public static byte* MapHeaderPeek(SafeSectionHandle section)
     {
         ArgumentNullException.ThrowIfNull(section);
-        void* p = Kernel.MapViewOfFile3(section, 0, null, 0, Layout.HeaderViewBytes, 0, Kernel.PAGE_READWRITE, null, 0);
+        void* p = Kernel.MapViewOfFile3(section, 0, null, 0, Layout.HeaderViewBytes, 0, PAGE_PROTECTION_FLAGS.PAGE_READWRITE, null, 0);
         int err = Kernel.LastError();
         if (p == null)
         {
-            if (err == Kernel.ERROR_ACCESS_DENIED)
+            if (err == (int)WIN32_ERROR.ERROR_ACCESS_DENIED)
             {
                 throw new RingBufferLayoutException("The section is smaller than the 64 KiB header (or the handle lacks write access).", err);
             }
@@ -234,7 +235,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
             throw Kernel.Fail("MapViewOfFile3", err, "header peek");
         }
 
-        if (Kernel.VirtualAlloc(p, Layout.HeaderViewBytes, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null)
+        if (Kernel.VirtualAlloc(p, Layout.HeaderViewBytes, VIRTUAL_ALLOCATION_TYPE.MEM_COMMIT, PAGE_PROTECTION_FLAGS.PAGE_READWRITE) == null)
         {
             err = Kernel.LastError();
             Kernel.UnmapViewOfFile(p);
@@ -309,7 +310,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
             bool atRequested = false;
             foreach (ulong c in candidates)
             {
-                basePtr = (byte*)Kernel.VirtualAlloc2(0, (void*)c, total, Kernel.MEM_RESERVE | Kernel.MEM_RESERVE_PLACEHOLDER, Kernel.PAGE_NOACCESS, null, 0);
+                basePtr = (byte*)Kernel.VirtualAlloc2(0, (void*)c, total, VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE | VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE_PLACEHOLDER, PAGE_PROTECTION_FLAGS.PAGE_NOACCESS, null, 0);
                 if (basePtr != null)
                 {
                     atRequested = true;
@@ -319,7 +320,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
 
             if (basePtr == null)
             {
-                basePtr = (byte*)Kernel.VirtualAlloc2(0, null, total, Kernel.MEM_RESERVE | Kernel.MEM_RESERVE_PLACEHOLDER, Kernel.PAGE_NOACCESS, null, 0);
+                basePtr = (byte*)Kernel.VirtualAlloc2(0, null, total, VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE | VIRTUAL_ALLOCATION_TYPE.MEM_RESERVE_PLACEHOLDER, PAGE_PROTECTION_FLAGS.PAGE_NOACCESS, null, 0);
                 if (basePtr == null)
                 {
                     throw Kernel.Fail("VirtualAlloc2", Kernel.LastError(), $"placeholder of {total} bytes");
@@ -327,18 +328,18 @@ internal sealed unsafe class MirroredSection : SafeHandle
             }
 
             // 2. split into [base, base+G) [base+G, base+G+D) [base+G+D, base+G+2D)
-            if (!Kernel.VirtualFree(basePtr, g, Kernel.MEM_RELEASE | Kernel.MEM_PRESERVE_PLACEHOLDER))
+            if (!Kernel.VirtualFree(basePtr, g, VIRTUAL_FREE_TYPE.MEM_RELEASE | (VIRTUAL_FREE_TYPE)UNMAP_VIEW_OF_FILE_FLAGS.MEM_PRESERVE_PLACEHOLDER))
             {
                 int err = Kernel.LastError();
-                Kernel.VirtualFree(basePtr, 0, Kernel.MEM_RELEASE);                    // unsplit: one call frees everything
+                Kernel.VirtualFree(basePtr, 0, VIRTUAL_FREE_TYPE.MEM_RELEASE);                    // unsplit: one call frees everything
                 throw Kernel.Fail("VirtualFree", err, "split 1 (MEM_PRESERVE_PLACEHOLDER)");
             }
 
-            if (!Kernel.VirtualFree(basePtr + g, d, Kernel.MEM_RELEASE | Kernel.MEM_PRESERVE_PLACEHOLDER))
+            if (!Kernel.VirtualFree(basePtr + g, d, VIRTUAL_FREE_TYPE.MEM_RELEASE | (VIRTUAL_FREE_TYPE)UNMAP_VIEW_OF_FILE_FLAGS.MEM_PRESERVE_PLACEHOLDER))
             {
                 int err = Kernel.LastError();
-                Kernel.VirtualFree(basePtr, 0, Kernel.MEM_RELEASE);
-                Kernel.VirtualFree(basePtr + g, 0, Kernel.MEM_RELEASE);
+                Kernel.VirtualFree(basePtr, 0, VIRTUAL_FREE_TYPE.MEM_RELEASE);
+                Kernel.VirtualFree(basePtr + g, 0, VIRTUAL_FREE_TYPE.MEM_RELEASE);
                 throw Kernel.Fail("VirtualFree", err, "split 2 (MEM_PRESERVE_PLACEHOLDER)");
             }
 
@@ -360,7 +361,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
 
             for (int i = 0; i < 3; i++)
             {
-                void* v = Kernel.MapViewOfFile3(section, 0, pieces[i], offsets[i], sizes[i], Kernel.MEM_REPLACE_PLACEHOLDER, Kernel.PAGE_READWRITE, null, 0);
+                void* v = Kernel.MapViewOfFile3(section, 0, pieces[i], offsets[i], sizes[i], VIRTUAL_ALLOCATION_TYPE.MEM_REPLACE_PLACEHOLDER, PAGE_PROTECTION_FLAGS.PAGE_READWRITE, null, 0);
                 int err = Kernel.LastError();
                 if (v == pieces[i])
                 {
@@ -372,11 +373,11 @@ internal sealed unsafe class MirroredSection : SafeHandle
                 {
                     // Cannot happen with MEM_REPLACE_PLACEHOLDER (the view lands exactly on the piece); be defensive.
                     Kernel.UnmapViewOfFile(v);
-                    err = Kernel.ERROR_INVALID_ADDRESS;
+                    err = (int)WIN32_ERROR.ERROR_INVALID_ADDRESS;
                 }
 
                 Unwind(pieces, isView);
-                if (err == Kernel.ERROR_ACCESS_DENIED && i > 0)
+                if (err == (int)WIN32_ERROR.ERROR_ACCESS_DENIED && i > 0)
                 {
                     throw new RingBufferLayoutException($"The section is smaller than the header claims (data region of {dataBytes} bytes at offset {g}).", err);
                 }
@@ -387,12 +388,12 @@ internal sealed unsafe class MirroredSection : SafeHandle
             // 4. a reserved section: commit the control view and the data (the mirror shows the same pages) before anything touches them
             if (commit)
             {
-                if (Kernel.VirtualAlloc(basePtr, g, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null
-                    || Kernel.VirtualAlloc(basePtr + g, d, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null)
+                if (Kernel.VirtualAlloc(basePtr, g, VIRTUAL_ALLOCATION_TYPE.MEM_COMMIT, PAGE_PROTECTION_FLAGS.PAGE_READWRITE) == null
+                    || Kernel.VirtualAlloc(basePtr + g, d, VIRTUAL_ALLOCATION_TYPE.MEM_COMMIT, PAGE_PROTECTION_FLAGS.PAGE_READWRITE) == null)
                 {
                     int err = Kernel.LastError();
                     Unwind(pieces, isView);                                 // all three are views by now
-                    throw Kernel.Fail("VirtualAlloc", err, err is Kernel.ERROR_COMMITMENT_LIMIT or Kernel.ERROR_NOT_ENOUGH_MEMORY
+                    throw Kernel.Fail("VirtualAlloc", err, err is (int)WIN32_ERROR.ERROR_COMMITMENT_LIMIT or (int)WIN32_ERROR.ERROR_NOT_ENOUGH_MEMORY
                         ? $"committing the {dataBytes}-byte data region exceeds the system commit limit"
                         : "commit of the control view and the data");
                 }
@@ -431,7 +432,7 @@ internal sealed unsafe class MirroredSection : SafeHandle
             }
             else
             {
-                Kernel.VirtualFree(pieces[i], 0, Kernel.MEM_RELEASE);
+                Kernel.VirtualFree(pieces[i], 0, VIRTUAL_FREE_TYPE.MEM_RELEASE);
             }
         }
     }
@@ -528,11 +529,11 @@ internal sealed unsafe class SectionView : SafeHandle
             throw new ArgumentOutOfRangeException(nameof(bytes), bytes, $"A section view needs a 64 KiB-aligned offset and size (offset {offset}).");
         }
 
-        void* p = Kernel.MapViewOfFile3(section, 0, null, (ulong)offset, (nuint)bytes, 0, writable ? Kernel.PAGE_READWRITE : Kernel.PAGE_READONLY, null, 0);
+        void* p = Kernel.MapViewOfFile3(section, 0, null, (ulong)offset, (nuint)bytes, 0, writable ? PAGE_PROTECTION_FLAGS.PAGE_READWRITE : PAGE_PROTECTION_FLAGS.PAGE_READONLY, null, 0);
         int err = Kernel.LastError();
         if (p == null)
         {
-            if (err == Kernel.ERROR_ACCESS_DENIED)
+            if (err == (int)WIN32_ERROR.ERROR_ACCESS_DENIED)
             {
                 throw new RingBufferLayoutException($"The section is smaller than its tag reserve claims (a view of {bytes} bytes at offset {offset}).", err);
             }
@@ -555,10 +556,10 @@ internal sealed unsafe class SectionView : SafeHandle
             throw new ArgumentOutOfRangeException(nameof(bytes), bytes, $"The commit [{start}, {start + bytes}) lies outside the view of {Bytes} bytes.");
         }
 
-        if (Kernel.VirtualAlloc(Address + start, (nuint)bytes, Kernel.MEM_COMMIT, Kernel.PAGE_READWRITE) == null)
+        if (Kernel.VirtualAlloc(Address + start, (nuint)bytes, VIRTUAL_ALLOCATION_TYPE.MEM_COMMIT, PAGE_PROTECTION_FLAGS.PAGE_READWRITE) == null)
         {
             int err = Kernel.LastError();
-            throw Kernel.Fail("VirtualAlloc", err, err is Kernel.ERROR_COMMITMENT_LIMIT or Kernel.ERROR_NOT_ENOUGH_MEMORY
+            throw Kernel.Fail("VirtualAlloc", err, err is (int)WIN32_ERROR.ERROR_COMMITMENT_LIMIT or (int)WIN32_ERROR.ERROR_NOT_ENOUGH_MEMORY
                 ? $"committing {bytes} bytes of tag memory exceeds the system commit limit"
                 : $"commit of {bytes} bytes of tag memory");
         }

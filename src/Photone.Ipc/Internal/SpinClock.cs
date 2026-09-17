@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Windows.Win32;
 
 namespace Photone.Ipc.Internal;
 
@@ -58,12 +59,12 @@ internal struct SpinClock
         return ticks >= long.MaxValue - now ? long.MaxValue : now + ticks;
     }
 
-    /// <summary>Milliseconds remaining until <paramref name="deadline"/> (rounded up), or <see cref="Kernel.INFINITE"/> for an infinite deadline.</summary>
+    /// <summary>Milliseconds remaining until <paramref name="deadline"/> (rounded up), or <see cref="Windows.Win32.PInvoke.INFINITE"/> for an infinite deadline.</summary>
     public static uint RemainingMs(long deadline)
     {
         if (deadline == long.MaxValue)
         {
-            return Kernel.INFINITE;
+            return PInvoke.INFINITE;
         }
 
         long remaining = deadline - Stopwatch.GetTimestamp();
@@ -73,6 +74,6 @@ internal struct SpinClock
         }
 
         double ms = remaining * 1000.0 / Stopwatch.Frequency;
-        return ms >= Kernel.INFINITE - 1 ? Kernel.INFINITE - 1 : (uint)Math.Ceiling(ms);
+        return ms >= PInvoke.INFINITE - 1 ? PInvoke.INFINITE - 1 : (uint)Math.Ceiling(ms);
     }
 }

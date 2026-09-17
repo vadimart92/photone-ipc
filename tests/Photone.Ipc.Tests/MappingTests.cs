@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using Windows.Win32.System.Memory;
 using Photone.Ipc.Internal;
 
 namespace Photone.Ipc.Tests;
@@ -330,7 +331,7 @@ public sealed unsafe class MappingTests
     {
         // a raw 4 KiB section: the 64 KiB header peek cannot be mapped
         string name = TestNames.UniqueSection();
-        SafeSectionHandle raw = Kernel.CreateFileMapping(Kernel.INVALID_HANDLE_VALUE, null, Kernel.PAGE_READWRITE, 0, 4096, name);
+        SafeSectionHandle raw = Kernel.CreateFileMapping(-1, null, PAGE_PROTECTION_FLAGS.PAGE_READWRITE, 0, 4096, name);
         Assert.False(raw.IsInvalid);
         try
         {

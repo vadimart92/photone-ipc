@@ -1,5 +1,7 @@
 using Microsoft.Win32.SafeHandles;
 using Windows.Wdk.System.SystemInformation;
+using Windows.Win32.Foundation;
+using Windows.Win32.System.Threading;
 using Windows.Win32.System.WindowsProgramming;
 
 namespace Photone.Ipc.Internal;
@@ -58,12 +60,12 @@ internal static class ProcessLiveness
             return OpenResult.Dead;
         }
 
-        SafeProcessHandle h = Kernel.OpenProcess(Kernel.SYNCHRONIZE | Kernel.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+        SafeProcessHandle h = Kernel.OpenProcess(PROCESS_ACCESS_RIGHTS.PROCESS_SYNCHRONIZE | PROCESS_ACCESS_RIGHTS.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
         int err = Kernel.LastError();
         if (h.IsInvalid)
         {
             h.Dispose();
-            if (err == Kernel.ERROR_INVALID_PARAMETER)
+            if (err == (int)WIN32_ERROR.ERROR_INVALID_PARAMETER)
             {
                 return OpenResult.Dead;
             }
@@ -84,7 +86,7 @@ internal static class ProcessLiveness
             return OpenResult.Dead;
         }
 
-        if (Kernel.WaitForSingleObject(h.DangerousGetHandle(), 0) == Kernel.WAIT_OBJECT_0)
+        if (Kernel.WaitForSingleObject(h.DangerousGetHandle(), 0) == (uint)WAIT_EVENT.WAIT_OBJECT_0)
         {
             h.Dispose();
             return OpenResult.Dead;
@@ -120,11 +122,11 @@ internal static class ProcessLiveness
             return false;
         }
 
-        SafeProcessHandle h = Kernel.OpenProcess(Kernel.SYNCHRONIZE | Kernel.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+        SafeProcessHandle h = Kernel.OpenProcess(PROCESS_ACCESS_RIGHTS.PROCESS_SYNCHRONIZE | PROCESS_ACCESS_RIGHTS.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
         int err = Kernel.LastError();
         bool invalid = h.IsInvalid;
         h.Dispose();
-        return !(invalid && err == Kernel.ERROR_INVALID_PARAMETER);
+        return !(invalid && err == (int)WIN32_ERROR.ERROR_INVALID_PARAMETER);
     }
 
     /// <summary>
@@ -134,7 +136,7 @@ internal static class ProcessLiveness
     private static bool TryGetCreationTime(int pid, out long creation)
     {
         creation = 0;
-        SafeProcessHandle h = Kernel.OpenProcess(Kernel.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+        SafeProcessHandle h = Kernel.OpenProcess(PROCESS_ACCESS_RIGHTS.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
         try
         {
             if (!h.IsInvalid && Kernel.GetProcessTimes(h.DangerousGetHandle(), out creation, out _, out _, out _))
@@ -167,7 +169,7 @@ internal static class ProcessLiveness
             try
             {
                 int status = Kernel.NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS.SystemProcessInformation, buffer, size, out uint needed);
-                if (status == Kernel.STATUS_INFO_LENGTH_MISMATCH || status == Kernel.STATUS_BUFFER_TOO_SMALL)
+                if (status == NTSTATUS.STATUS_INFO_LENGTH_MISMATCH || status == NTSTATUS.STATUS_BUFFER_TOO_SMALL)
                 {
                     size = Math.Max(needed + 64 * 1024, size * 2);
                     continue;

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using Windows.Win32.Foundation;
 using Microsoft.Win32.SafeHandles;
 using Photone.Ipc.Internal;
 using Photone.Ipc.Signaling;
@@ -455,7 +456,7 @@ public sealed unsafe partial class RingBuffer<T>
     {
         for (int k = 0; k < _laggardCount; k++)
         {
-            if (Kernel.WaitForSingleObject(_laggardHandles[k], 0) == Kernel.WAIT_OBJECT_0)
+            if (Kernel.WaitForSingleObject(_laggardHandles[k], 0) == (uint)WAIT_EVENT.WAIT_OBJECT_0)
             {
                 Evict(_laggardSlot[k], _laggardWord[k], EvictReason.Dead);
             }
