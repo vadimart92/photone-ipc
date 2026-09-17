@@ -7,7 +7,7 @@ namespace Photone.Ipc.TestChild;
 /// <summary>
 /// Cross-process test helper. Every verb prints a readiness line on stdout as soon as it is ready and never sleeps (except <c>slow-init</c>).
 /// Element type is always <see cref="long"/>; the deterministic stream stores the absolute cursor in every element (<c>data[c] == c</c>).
-/// Verbs (DESIGN §9): reader | echo | writer | crash-reader | claim-and-die | slow-init | hold-name | spin-reader, plus Stage A's map-region.
+/// Verbs (DESIGN §9): reader | echo | writer | crash-reader | claim-and-die | slow-init | hold-name | spin-reader | pool-reader-loop (§15), plus Stage A's map-region.
 /// </summary>
 internal static unsafe class Program
 {
@@ -34,6 +34,7 @@ internal static unsafe class Program
                 "claim-and-die" => ClaimAndDie(args),
                 "slow-init" => SlowInit(args),
                 "hold-name" => HoldName(args),
+                "pool-reader-loop" => PoolReaderLoop(),
                 _ => Unknown(args[0]),
             };
         }
@@ -382,6 +383,70 @@ internal static unsafe class Program
         buffer.Dispose();
         Print("released");
         return 0;
+    }
+
+    /// <summary>
+    /// <c>pool-reader-loop</c>: keeps one <see cref="RingBufferPool"/> (no expiry), prints "looping", then obeys stdin: "open &lt;name&gt; &lt;count&gt;" opens
+    /// the buffer with the pool, creates a reader, prints "ready base=0x.. revived=n", consumes count elements verifying data[c] == c, disposes the reader
+    /// and the buffer (the mapping is parked) and prints "done ok idle=n" or "done mismatch at=c"; "exit" disposes the pool and exits.
+    /// </summary>
+    private static int PoolReaderLoop()
+    {
+        using var pool = new RingBufferPool(new RingBufferPoolOptions { IdleTimeout = Timeout.InfiniteTimeSpan });
+        Print("looping");
+        while (true)
+        {
+            string? line = Console.In.ReadLine();
+            if (line is null || line == "exit")
+            {
+                Print("exiting");
+                return 0;
+            }
+
+            string[] parts = line.Split(' ');
+            if (parts.Length != 3 || parts[0] != "open")
+            {
+                Print("error unknown command " + line);
+                return 3;
+            }
+
+            long count = long.Parse(parts[2], CultureInfo.InvariantCulture);
+            long mismatchAt = -1;
+            using (RingBuffer<long> buffer = RingBuffer<long>.Open(parts[1], new RingBufferOptions { Pool = pool }))
+            using (RingReader<long> reader = buffer.CreateReader())
+            {
+                Print(Inv($"ready base=0x{buffer.BaseAddress:X} revived={pool.RevivedCount} cursor={reader.ReadCursor}"));
+                long remaining = count;
+                while (remaining > 0 && mismatchAt < 0)
+                {
+                    int n = (int)Math.Min(remaining, 4096);
+                    if (!reader.WaitSync(n))
+                    {
+                        Print(Inv($"eof status={reader.Status} available={reader.Available} remaining={remaining}"));
+                        return 3;
+                    }
+
+                    reader.TryRead(n, out Chunk<long> chunk);
+                    for (int j = 0; j < chunk.Length; j++)
+                    {
+                        if (chunk.Span[j] != chunk.Cursor + j)
+                        {
+                            mismatchAt = chunk.Cursor + j;
+                            break;
+                        }
+                    }
+
+                    reader.Advance(n);
+                    remaining -= n;
+                }
+            }
+
+            Print(mismatchAt >= 0 ? Inv($"done mismatch at={mismatchAt}") : Inv($"done ok idle={pool.IdleCount}"));
+            if (mismatchAt >= 0)
+            {
+                return 4;
+            }
+        }
     }
 
     // ------------------------------------------------------------------ Stage A: map-region

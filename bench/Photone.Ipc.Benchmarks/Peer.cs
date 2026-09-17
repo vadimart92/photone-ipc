@@ -24,6 +24,7 @@ internal static class Peer
                 "tcp-echo" => Transports.TcpEcho(args),
                 "pipe-drain" => Transports.PipeDrain(args),
                 "tcp-drain" => Transports.TcpDrain(args),
+                "lifecycle-open" => Lifecycle.PeerOpenLoop(args),
                 _ => throw new ArgumentException("unknown peer verb " + args[0]),
             };
         }

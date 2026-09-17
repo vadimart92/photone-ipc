@@ -52,11 +52,56 @@ Semantics in one table:
 | `Advance(k)` | `k <= what TryRead/Available observed`; frees space for the writer; may be less than the last chunk |
 | `RingBuffer.Dispose()` (writer) | commits `0` for an outstanding bucket, publishes *Closed*, wakes every reader; readers keep draining |
 | `RingReader.Dispose()` | releases the slot, wakes a blocked writer, completes a pending `Wait` with `ObjectDisposedException` |
+| `RingBufferOptions.Pool` | `Create`/`Open` take the shared memory from a `RingBufferPool` and give it back on release (see below) |
 
-Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true }`,
-`ReaderOptions { SpinTime = 20 µs, MaxSpinTime = null, AsyncSpinTime = 5 µs, AllowSynchronousContinuations = true }`. The spin budget adapts between
+Options: `RingBufferOptions { SpinTime = 20 µs, MaxSpinTime = null, LivenessCheckInterval = 10 ms, InitializationTimeout = 5 s, PreferredBaseAddress, PreFault = true, Pool = null }`,
+`ReaderOptions { SpinTime = 20 µs, MaxSpinTime = null, AsyncSpinTime = 5 µs, AllowSynchronousContinuations = true }`,
+`RingBufferPoolOptions { IdleTimeout = 30 s, MaxIdleBytes, ClearOnReuse = false }`. The spin budget adapts between
 zero and `MaxSpinTime` (default: `SpinTime`) from the gaps actually observed; `Timeout.InfiniteTimeSpan` never touches the kernel (one busy core
 per waiting side); `TimeSpan.Zero` blocks immediately. See "Waiting: latency versus CPU".
+
+### Many buffers: `RingBufferPool`
+
+Every new buffer creates a section, maps it and pre-faults every page, and every release unmaps and frees it again; the process that opens the
+buffer does the same on its side. That is about 0.4 ms per side for a 64 KiB ring and 60 ms for 64 MiB. A process that creates or opens buffers
+one after another can keep those mappings instead:
+
+```csharp
+// writer process
+var options = new RingBufferOptions { Pool = RingBufferPool.Shared };   // or new RingBufferPool(new RingBufferPoolOptions { IdleTimeout = ... })
+foreach (string channel in channels)
+{
+    using var buffer = RingBuffer<float>.Create(1 << 20, channel, options);   // from the second one on: reuses a released section of this size
+    Stream(buffer);
+}                                                                               // released: the section goes back to the pool
+
+// reader process: a pool on Open too, so that the next buffer in a reused section adopts the mapping this process already has
+using var opened = RingBuffer<float>.Open(channel, new RingBufferOptions { Pool = RingBufferPool.Shared });
+using var reader = opened.CreateReader();
+```
+
+* A section is reused only once no other process holds it: readers elsewhere finish draining the old buffer undisturbed, and new buffers get
+  other sections meanwhile. The check is the kernel's system-wide handle count of the section, paired with a handshake in `Open` so that a late
+  opener and the pool can never miss each other (DESIGN §15.3).
+* Reuse needs the same data size (`Capacity * sizeof(T)`, any `T`) and namespace. Reuse keeps the address range, the views, the resident pages and
+  the 33 events. The buffer's name lives in a small alias object, so names behave as before.
+* Mappings unused for `IdleTimeout` (default 30 s) are released by a timer that runs only while something is idle; `MaxIdleBytes`, `Trim()`
+  and `Dispose()` release them earlier. `ClearOnReuse` zeroes a reused data region (otherwise the previous buffer's bytes are still in the
+  shared pages, although no reader can see them through the API).
+* A pool is for buffers that serve the same trust domain: a process that mapped an earlier buffer can keep a view of the section (a parked
+  mapping does), and would see the next buffer in it. Don't share a pool between parties that must not see each other's data.
+* Only disposed buffers return their mapping. A buffer released by its finalizer, or a writer disposed while a bucket is still outstanding,
+  releases it instead.
+
+| data size | creator `Create` | creator `Dispose` | peer `Open` + `CreateReader` | peer release |
+|---|---|---|---|---|
+| 64 KiB | 308 µs → **35 µs** | 113 µs → **31 µs** | 241 µs → **44 µs** | 68 µs → **8 µs** |
+| 1 MiB | 1.0 ms → **41 µs** | 293 µs → **31 µs** | 864 µs → **54 µs** | 143 µs → **10 µs** |
+| 16 MiB | 12.1 ms → **96 µs** | 2.9 ms → **32 µs** | 11.0 ms → **137 µs** | 1.1 ms → **10 µs** |
+| 64 MiB | 49.3 ms → **265 µs** | 12.0 ms → **33 µs** | 43.8 ms → **321 µs** | 5.6 ms → **11 µs** |
+
+(no pool → pool; `Photone.Ipc.Benchmarks.exe --lifecycle`, p50, pre-fault on, the peer is a second process that opens each buffer by name, joins
+as a reader, reads one element and releases it. What remains with a pool is the alias object and one pass over the already-resident pages.)
 
 ## How cross-process zero-copy works
 
@@ -293,7 +338,7 @@ Reading it:
 
 ```
 dotnet build E:\GitHub\photone-ipc\Photone.Ipc.slnx -c Release
-dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 289 tests, ~30 s
+dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 328 tests, ~30 s
 
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]
@@ -303,6 +348,9 @@ E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.I
 
 # the same cross-process measurements next to a named pipe and a TCP loopback socket, plus light-workload and protocol-only rows (~2.5 min)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --compare [--cores 2,4]
+
+# create / open / release costs without and with a RingBufferPool, in-process and with a peer process (~10 s)
+E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --lifecycle
 
 # BenchmarkDotNet microbenchmarks (a few minutes)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --filter '*'
