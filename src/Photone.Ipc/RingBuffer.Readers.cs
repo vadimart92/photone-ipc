@@ -1,0 +1,176 @@
+using System.Runtime.CompilerServices;
+using Photone.Ipc.Internal;
+
+namespace Photone.Ipc;
+
+/// <summary>Values of <c>ReaderSlot.EvictReason</c>.</summary>
+internal static class EvictReason
+{
+    public const int None = 0;
+    public const int Dead = 1;
+    public const int StuckClaim = 2;
+    public const int Lag = 3;   // reserved
+}
+
+public sealed unsafe partial class RingBuffer<T>
+{
+    // ------------------------------------------------------------------ CreateReader (DESIGN §5.6)
+
+    /// <summary>
+    /// Creates an independent reader starting at the current head (it sees only later commits). Usable from any process and role.
+    /// A reader is a single-consumer object. After a sweep of dead/stuck slots, <see cref="TooManyReadersException"/> if all 32 slots are active.
+    /// </summary>
+    public RingReader<T> CreateReader(ReaderOptions? options = null)
+    {
+        ThrowIfDisposed();
+        options ??= ReaderOptions.Default;
+        int pid = Environment.ProcessId;
+        long st = ProcessLiveness.OwnStartTime;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            for (int i = 0; i < Layout.MaxReaders; i++)
+            {
+                ref ReaderSlot s = ref Slot(i);
+                long w = Volatile.Read(ref s.Word);
+                if (SlotWord.State(w) != SlotState.Free)
+                {
+                    continue;
+                }
+
+                uint seq = (SlotWord.Seq(w) + 1) & 0x3FFF_FFFF;
+                long claimed = SlotWord.Make(SlotState.Claimed, seq, pid);
+                if (Interlocked.CompareExchange(ref s.Word, claimed, w) != w)
+                {
+                    continue;                                                               // lost the race; next slot
+                }
+
+                s.ProcessStartTime = st;
+                s.ClaimTick = Kernel.GetTickCount64();
+                s.WaitFor = long.MaxValue;
+                s.Flags = _atCreatorAddress ? 1 : 0;
+                s.EvictReason = EvictReason.None;
+                s.WaiterThreadId = 0;
+                s.BackendWord = 0;
+                _backend.OnSlotClaimed(i, (ReaderSlot*)Unsafe.AsPointer(ref s));              // NamedEvent: ResetEvent — discards a stale set from a previous owner
+                TestHooks.AfterClaim?.Invoke();
+                s.ReadCursor = Volatile.Read(ref Hdr.WriteCursor);                          // (a) provisional start = head
+                long active = SlotWord.Make(SlotState.Active, seq, pid);
+                if (Interlocked.CompareExchange(ref s.Word, active, claimed) != claimed)     // (b) publish [full fence]; fails only if a sweeper reclaimed a stuck claim
+                {
+                    throw new ReaderEvictedException(i, "The slot claim was reclaimed by a sweeper before the reader became active.");
+                }
+
+                long w2 = Volatile.Read(ref Hdr.WriteCursor);                               // (c) re-read AFTER the fence
+                Volatile.Write(ref s.ReadCursor, w2);                                       // (d) adopt the newest head (monotone bump)
+                Interlocked.Or(ref Hdr.ActiveMask, 1UL << i);
+                Interlocked.Increment(ref Hdr.ReaderGeneration);
+                Interlocked.Increment(ref _localRefs);
+                RingReader<T>? reader = null;
+                try
+                {
+                    reader = new RingReader<T>(this, i, active, w2, options);
+                    reader.ResolveWriterProcess();
+                    return reader;
+                }
+                catch
+                {
+                    if (reader is null)
+                    {
+                        // constructor failed: give the slot and the local ref back
+                        Interlocked.CompareExchange(ref s.Word, SlotWord.Make(SlotState.Free, seq, 0), active);
+                        Interlocked.And(ref Hdr.ActiveMask, ~(1UL << i));
+                        ReleaseLocalRef();
+                    }
+                    else
+                    {
+                        reader.Dispose();
+                    }
+
+                    throw;
+                }
+            }
+
+            if (attempt == 0)
+            {
+                SweepDeadSlots();
+            }
+        }
+
+        throw new TooManyReadersException($"All {Layout.MaxReaders} reader slots are active.");
+    }
+
+    // ------------------------------------------------------------------ eviction (DESIGN §5.7)
+
+    /// <summary>
+    /// Evicts slots whose owner process is provably dead (Active, or Claimed = crashed between the two claim CASes). Any process may run it.
+    /// A claim held by a live process is never reclaimed, however old: the claimant's remaining claim-time stores (ResetEvent, the
+    /// provisional cursor) would otherwise land in a slot that already belongs to somebody else.
+    /// </summary>
+    internal int SweepDeadSlots()
+    {
+        int evicted = 0;
+        for (int i = 0; i < Layout.MaxReaders; i++)
+        {
+            ref ReaderSlot s = ref Slot(i);
+            long w = Volatile.Read(ref s.Word);
+            switch (SlotWord.State(w))
+            {
+                case SlotState.Claimed:
+                {
+                    // Identity fields are zeroed before a slot is freed, so a value seen here belongs to this claimant or is still 0.
+                    long st = Volatile.Read(ref s.ProcessStartTime);
+                    bool dead = st == 0 ? !ProcessLiveness.ProcessExists(SlotWord.Pid(w)) : !ProcessLiveness.IsAlive(SlotWord.Pid(w), st);
+                    if (dead && Evict(i, w, EvictReason.StuckClaim))
+                    {
+                        evicted++;
+                    }
+
+                    break;
+                }
+
+                case SlotState.Active:
+                    if (!ProcessLiveness.IsAlive(SlotWord.Pid(w), Volatile.Read(ref s.ProcessStartTime)) && Evict(i, w, EvictReason.Dead))
+                    {
+                        evicted++;
+                    }
+
+                    break;
+
+                default:
+                    break;                                                                  // Free, or a Dead tombstone (v1 never leaves one)
+            }
+        }
+
+        return evicted;
+    }
+
+    /// <summary>
+    /// ABA-proof eviction: CAS the full expected word to Dead, clear the masks, then Free the slot (v1 evicts only dead owners).
+    /// Returns <see langword="false"/> if the slot changed under us (released or re-claimed): the new owner is never touched.
+    /// </summary>
+    internal bool Evict(int i, long expectedWord, int reason)
+    {
+        ref ReaderSlot s = ref Slot(i);
+        long dead = SlotWord.Make(SlotState.Dead, SlotWord.Seq(expectedWord), SlotWord.Pid(expectedWord));
+        if (Interlocked.CompareExchange(ref s.Word, dead, expectedWord) != expectedWord)
+        {
+            return false;
+        }
+
+        s.EvictReason = reason;
+        Hdr.LastEvictedPid = SlotWord.Pid(expectedWord);
+        ulong bit = 1UL << i;
+        Interlocked.And(ref Hdr.WaitersMask, ~bit);
+        Interlocked.And(ref Hdr.ActiveMask, ~bit);
+        Interlocked.Increment(ref Hdr.EvictedReaders);
+        Interlocked.Increment(ref Hdr.ReaderGeneration);
+        _counters.Evictions++;
+        s.ProcessStartTime = 0;                                     // never let a sweeper see the dead owner's identity behind the next claim
+        s.ClaimTick = 0;
+        s.WaitFor = long.MaxValue;
+        Interlocked.Exchange(ref s.Word, SlotWord.Make(SlotState.Free, SlotWord.Seq(expectedWord), 0));
+        // A cached laggard handle for this slot (writer only) is closed by the next RefreshLaggards / ReleaseNative, never here:
+        // the writer thread may be waiting on it right now.
+        return true;
+    }
+}

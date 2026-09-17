@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/"><Project Path="src/Photone.Ipc/Photone.Ipc.csproj" /></Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj" />
+    <Project Path="tests/Photone.Ipc.TestChild/Photone.Ipc.TestChild.csproj" />
+  </Folder>
+  <Folder Name="/bench/"><Project Path="bench/Photone.Ipc.Benchmarks/Photone.Ipc.Benchmarks.csproj" /></Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/Photone.Ipc.Samples.Writer/Photone.Ipc.Samples.Writer.csproj" />
+    <Project Path="samples/Photone.Ipc.Samples.Reader/Photone.Ipc.Samples.Reader.csproj" />
+  </Folder>
+</Solution>
