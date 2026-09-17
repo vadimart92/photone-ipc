@@ -1,4 +1,6 @@
 using Microsoft.Win32.SafeHandles;
+using Windows.Wdk.System.SystemInformation;
+using Windows.Win32.System.WindowsProgramming;
 
 namespace Photone.Ipc.Internal;
 
@@ -148,6 +150,13 @@ internal static class ProcessLiveness
         return TryGetCreationTimeFromSnapshot(pid, out creation);
     }
 
+    /// <summary>
+    /// Offset of the creation time inside <c>SYSTEM_PROCESS_INFORMATION.Reserved1</c>. The Win32 metadata models the documented (redacted) struct, whose
+    /// <c>Reserved1</c> covers bytes [8, 56) of an entry: the working-set size, the fault counts, the cycle time, and then the creation, user and kernel
+    /// times. The creation time is the fourth 8-byte value, at entry offset 32 on x64. <c>NextEntryOffset</c> and <c>UniqueProcessId</c> are real fields.
+    /// </summary>
+    private const int CreateTimeInReserved1 = 24;
+
     private static unsafe bool TryGetCreationTimeFromSnapshot(int pid, out long creation)
     {
         creation = 0;
@@ -157,7 +166,7 @@ internal static class ProcessLiveness
             byte* buffer = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc(size);
             try
             {
-                int status = Kernel.NtQuerySystemInformation(Kernel.SystemProcessInformation, buffer, size, out uint needed);
+                int status = Kernel.NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS.SystemProcessInformation, buffer, size, out uint needed);
                 if (status == Kernel.STATUS_INFO_LENGTH_MISMATCH || status == Kernel.STATUS_BUFFER_TOO_SMALL)
                 {
                     size = Math.Max(needed + 64 * 1024, size * 2);
@@ -169,23 +178,22 @@ internal static class ProcessLiveness
                     return false;
                 }
 
-                // SYSTEM_PROCESS_INFORMATION (x64): NextEntryOffset @0 (u32), CreateTime @32 (i64), UniqueProcessId @80 (HANDLE).
-                byte* entry = buffer;
+                var entry = (SYSTEM_PROCESS_INFORMATION*)buffer;
                 while (true)
                 {
-                    if ((nint)(*(nint*)(entry + 80)) == pid)
+                    if ((nint)entry->UniqueProcessId.Value == pid)
                     {
-                        creation = *(long*)(entry + 32);
+                        creation = *(long*)((byte*)&entry->Reserved1 + CreateTimeInReserved1);
                         return true;
                     }
 
-                    uint next = *(uint*)entry;
+                    uint next = entry->NextEntryOffset;
                     if (next == 0)
                     {
                         return false;                               // not in the snapshot: the process is gone
                     }
 
-                    entry += next;
+                    entry = (SYSTEM_PROCESS_INFORMATION*)((byte*)entry + next);
                 }
             }
             finally
