@@ -702,9 +702,8 @@ GetBucket(n):
     if ((uint)(n - 1) >= (uint)C) throw ArgumentOutOfRangeException
     if (_outstanding) throw InvalidOperationException("one outstanding bucket")
     if (C - (_e - _min) < n)                     // cached view insufficient (invariant: _min <= true min, so this only under-estimates)
-        SlowGetBucket(n)                         // [NoInlining]: TryAddLocalRef() (else ObjectDisposedException); _min = ScanMin(); if still short: WaitForSpace(n); finally ReleaseLocalRef()
-                                                 // the local ref keeps the mapping alive when Dispose runs on another thread; CloseWriter wakes the space event (post-review #26)
-    _outstanding = true
+        SlowGetBucket(n)                         // [NoInlining] §5.3: scan and wait under a local ref, then publish _outstanding behind a full fence and re-check _closed
+    _outstanding = true                          // (Reserve, inlined; after SlowGetBucket it is already published)
     long start = _e; _e += n                     // (ReserveEnd is NOT stored: it shares a line with WriterState; post-review #27)
     return new Bucket<T>(this, new Span<T>(_data + off(start), n), start)
 
@@ -739,6 +738,20 @@ SignalReaders(m, w):
 ### 5.3 Writer: ScanMin and WaitForSpace
 
 ```
+SlowGetBucket(n):                                             // [NoInlining]
+    if (!TryAddLocalRef()) throw ObjectDisposedException      // refused once the native resources are released
+    try:
+        ObjectDisposedException.ThrowIf(_disposed != 0, this) // after the ref: Dispose may have started, but nothing is unmapped while the ref is held
+        _min = ScanMin()
+        if (C - (_e - _min) < n) WaitForSpace(n)
+    finally:
+        ReleaseLocalRef()                                     // releases the mapping if a Dispose on another thread already dropped the buffer's ref
+    _outstanding = true                                       // the reservation, published ...
+    Interlocked.MemoryBarrier()                               // ... [full fence] before _closed is loaded (Dekker pair with CloseWriter, see below)
+    if (Volatile.Read(ref _closed) != 0)                      // a Dispose on another thread got here first
+        { _outstanding = false; throw ObjectDisposedException }   // [NoInlining] AbandonReservation: touches no shared memory
+                                                              // back in GetBucket, Reserve hands out the bucket (§5.1)
+
 ScanMin():                                                    // slow path only; 32 acquire loads
     long min = long.MaxValue
     for i in 0..31:
@@ -778,6 +791,16 @@ WaitForSpace(n):
     }
 ```
 The laggard set is recomputed on every iteration, so a reader that becomes the sole blocker after the episode started (judge 2's deadlock) is always covered. Reader-crash wake latency is the kernel's process-signal latency (< 1 ms) when a handle is available and one `LivenessCheckInterval` when it is not.
+
+**Dispose from another thread** is the way to abort a writer blocked here (post-review #26). The local reference keeps the mapping valid under the scan and the wait; `CloseWriter` wakes the space event, both wait phases see `_disposed`, and the call throws `ObjectDisposedException`. The reference ends with the wait: the reservation that follows touches no shared memory, but the bucket it returns outlives the call, so a disposal must not miss it. If one did, `CloseWriter` would find no bucket, `_closedWithBucket` would stay false, and the last `ReleaseLocalRef` would unmap the section, or return it to the pool, where the next `Create` can take it, while the caller fills a span into it: an access violation, or writes into another buffer's shared memory. Dekker pair: `SlowGetBucket` stores `_outstanding` and passes a full fence before it loads `_closed`; `CloseWriter` stores `_closed` with `Interlocked.Exchange` before it loads `_outstanding` (§5.8). Either `CloseWriter` sees the reservation, drops it with `EndWrite(0)` and sets `_closedWithBucket` (the mapping is released, never pooled, as for any bucket outstanding at `Dispose`: a late store faults), or the call sees `_closed` and throws `ObjectDisposedException` without handing out a span. When both happen the call throws and the mapping is still released; the concurrent stores of `_outstanding = false` store the same value. `CloseWriter` does not wait for the call. Tests: `Create_DisposeBetweenTheSpaceWaitAndTheReservation_GetBucketThrows_TheNextBufferReusesTheSection` and `Create_DisposeAfterTheReservationWasPublished_ReleasesTheSectionInsteadOfPoolingIt_GetBucketThrows` (`TestHooks.AfterSpaceWait` / `AfterReservationPublished` dispose on another thread at exactly those two points).
+
+**The fast path** (`GetBucket` without a wait, and `TryGetBucket`) is unchanged: `CheckWriter` loads `_closed` before `Reserve` stores `_outstanding`, so a `Dispose` on another thread that lands between the two can still miss the reservation, and a preemption there makes that window arbitrarily long. Such a call races a writer that is not blocked, which is not the supported way to abort one. Covering it costs on every bucket or on every `Dispose`:
+
+* the slow path's order without the fence (store `_outstanding`, then load `_closed`) leaves only a store-buffer-latency window, but measured 0.3-0.9 ns more per `WriteRead_Protocol` round than this layout (one interleaved series: 18.9 / 19.1 / 21.6 ns against 18.5 / 18.6 / 20.7 ns for buckets of 256 / 4096 / 65536 floats; the unchanged code 18.2 / 18.3 / 20.4 ns);
+* the same order with the fence is exact, and adds a locked instruction per bucket;
+* the unfenced order plus `FlushProcessWriteBuffers` (`Interlocked.MemoryBarrierProcessWide`) in `CloseWriter` before its `_outstanding` load is exact too, for 1.1 µs (idle process) to 6.5 µs (three busy threads) and an interprocessor interrupt to every core that runs a thread of the process, on every writer `Dispose`.
+
+`SlowGetBucket` stays `void`, and the bucket is built by the inlined `Reserve` in `GetBucket` on both paths: in the same series, the unfenced order with `SlowGetBucket` returning the bucket (a struct return path in `GetBucket`) measured 20.0 / 20.2 / 21.9 ns, 0.3-1.2 ns more than the order alone, although the fast path executed the same instructions.
 
 ### 5.4 Reader: TryRead / Available / Advance
 
@@ -968,12 +991,13 @@ Every kernel wait of the reader includes `_writerProc`, so a writer crash wakes 
 ### 5.8 Writer close
 
 ```
-CloseWriter():                                                  // from RingBuffer.Dispose (writer role); idempotent
-    if (Interlocked.Exchange(ref _closed, 1) != 0) return
-    if (_outstanding) EndWrite(0)                               // drop the open bucket
+CloseWriter():                                                  // from RingBuffer.Dispose (writer role) or the finalizer; idempotent
+    if (Interlocked.Exchange(ref _closed, 1) != 0) return       // [full fence] before _outstanding is loaded: Dekker pair with SlowGetBucket (§5.3)
+    if (_outstanding) { _closedWithBucket = true; EndWrite(0) } // drop the open bucket; its span may still be in use on another thread: never pooled (§15.2)
     Volatile.Write(ref Hdr.WriterState, Closed)
     Interlocked.MemoryBarrier()
     _backend.WakeAllReaders()                                   // 32 SetEvents, once, regardless of masks
+    _backend.WakeWriter()                                       // a GetBucket blocked on another thread wakes, sees _disposed and throws (post-review #26)
 ```
 A reader that published its bit after the barrier sees `Closed` on its re-check; one that published before is woken by the broadcast.
 
@@ -1469,7 +1493,7 @@ Release (`ReleaseNative`, once the buffer and every reader it created are dispos
 * a writer closed with a bucket outstanding: another thread may still be storing into the bucket's span (unsupported), and such a store must fault on unmapped memory rather than land in the buffer the pool hands the section to next;
 * a disposed pool.
 
-Without a pool, a call racing `Dispose` at worst faults on unmapped memory. With a pool, a section released too early can belong to another buffer a moment later, possibly one shared with other processes. So every call that can run on one thread while `Dispose` runs on another holds a local reference for as long as it touches the section: `GetBucket`'s slow path (as before), `CreateReader` (the reference it takes first becomes the reader's) and `DuplicateSectionHandleTo` (a duplicate made after a reuse would silently reach the other buffer). Each `PooledMapping` also carries an idle flag: a second `Return` of the same mapping throws instead of listing it twice.
+Without a pool, a call racing `Dispose` at worst faults on unmapped memory. With a pool, a section released too early can belong to another buffer a moment later, possibly one shared with other processes. So every call that can run on one thread while `Dispose` runs on another holds a local reference for as long as it touches the section: `GetBucket`'s slow path while it scans and waits (as before), `CreateReader` (the reference it takes first becomes the reader's) and `DuplicateSectionHandleTo` (a duplicate made after a reuse would silently reach the other buffer). A reference does not cover what a call hands out: the bucket `GetBucket` reserves after its wait outlives both the reference and the call, and a disposal that missed the reservation would return the section to the pool under it, so the next `Create` could take the section while the caller still fills a span into it. The reservation is paired with `CloseWriter` instead (Dekker, §5.3): the disposal finds it, and the mapping is released as for any bucket outstanding at `Dispose` (above), or the call throws `ObjectDisposedException`. (A `GetBucket` that did not wait is not covered: it races a writer that is not blocked, and covering it costs on every bucket or every `Dispose`, §5.3.) Each `PooledMapping` also carries an idle flag: a second `Return` of the same mapping throws instead of listing it twice.
 
 ### 15.3 The reuse check
 

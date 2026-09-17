@@ -189,39 +189,60 @@ Append-only log. Each entry: what the design says, what was done instead, and wh
 41. **Benchmarks:** `--latency` (paced delivery latency and reader CPU from cycle counts); `TieredCompilationQuickJitForLoops=false` in the
     benchmark project, so measurement loops never hit an on-stack-replacement compile inside a measured window.
 
+## Dispose racing the reservation after a wait (found while reviewing the stream-tags work)
+
+42. **The reservation that follows `GetBucket`'s wait is paired with `CloseWriter` (Dekker) instead of being left to the local reference.**
+    DESIGN §5.1/§5.3 (and deviation 26) had `SlowGetBucket` release its local reference in its `finally`, before `Reserve`. A `Dispose` on another
+    thread that landed in between found no outstanding bucket (`_closedWithBucket` stayed false) and released the mapping, or returned it to
+    `RingBufferOptions.Pool`, where the next `Create` could reuse it, while the writer thread went on to return a bucket over unmapped memory (access
+    violation) or over the other buffer's shared memory (silent corruption, possibly visible to other processes). Now `SlowGetBucket` ends by storing
+    `_outstanding`, passing `Interlocked.MemoryBarrier()` and loading `_closed`, the reverse of `CloseWriter`'s fenced `_closed` store and
+    `_outstanding` load: `CloseWriter` finds the reservation (drops it, `_closedWithBucket`: released, not pooled), or the call throws
+    `ObjectDisposedException` without handing out a span. The reference is still dropped before the reservation (which touches no shared memory), and
+    `CloseWriter` does not wait for the call. Buffer-scoped test hooks `TestHooks.AfterSpaceWait` / `AfterReservationPublished`; tests
+    `Create_DisposeBetweenTheSpaceWaitAndTheReservation_GetBucketThrows_TheNextBufferReusesTheSection` (before the fix: the bucket lies in the next
+    buffer's data view) and `Create_DisposeAfterTheReservationWasPublished_ReleasesTheSectionInsteadOfPoolingIt_GetBucketThrows`.
+    The fast path (`GetBucket` without a wait, `TryGetBucket`) is unchanged, and so is its race with a `Dispose` of a writer that is not blocked
+    (DESIGN §5.3). BenchmarkDotNet `WriteRead_Protocol`, one series in the order base, a, b, c, c, b, a, base (two runs each, 256 / 4096 / 65536
+    floats): unchanged code 18.2 / 18.3 / 20.4 ns; (a) (b) plus `SlowGetBucket` returning the bucket 20.0 / 20.2 / 21.9 ns; (b) the fast path
+    storing `_outstanding` before loading `_closed` (without a fence) 18.9 / 19.1 / 21.6 ns; (c) this change 18.5 / 18.6 / 20.7 ns. With (c), the
+    Tier1 code of `GetBucket` is identical to the unchanged code's (`DOTNET_JitDisasm`). A second series (base, c, c, base, base, c; three runs
+    each) measured 18.6 / 18.5 / 20.2 ns for the unchanged code and 19.0 / 19.0 / 20.7 ns for (c), whose last run gave 18.2 / 18.7 / 20.3 ns: with
+    the same machine code, the difference can only come from code placement (the larger `SlowGetBucket` moves later JIT allocations).
+
 ## Stream tags (see DESIGN §16)
 
-42. **Layout version 4; a section with cross-process tags is reserved, not committed** (DESIGN §3.3: one `PAGE_READWRITE | SEC_COMMIT` section of
+43. **Layout version 4; a section with cross-process tags is reserved, not committed** (DESIGN §3.3: one `PAGE_READWRITE | SEC_COMMIT` section of
     64 KiB + D). With `TagMode.CrossProcess` the section continues after the data with a tag reserve of about 34 GiB and is created `SEC_RESERVE`; the
     creator commits the control view and the data right after mapping them, and the writer commits tag memory as it needs it. `DataOffset` stays 64 KiB and
     the three views are unchanged; tag views are mapped separately, on demand. Buffers without tags, or with in-process tags, keep the committed
     64 KiB + D section. (Version 3 was the first revision of the tags, never released: a fixed tag area between the control view and the data.)
 
-43. **An opener's header peek commits its view** (DESIGN §3.4 maps the peek and reads `InitState`). A reserved section's control page may still be
+44. **An opener's header peek commits its view** (DESIGN §3.4 maps the peek and reads `InitState`). A reserved section's control page may still be
     uncommitted when an opener finds the name, and a load would fault; `MapHeaderPeek` calls `VirtualAlloc(MEM_COMMIT)` on the 64 KiB view first
     (idempotent, a no-op on committed sections, the creator's stores are kept).
 
-44. **Line 2 holds `TagEnd` next to `WriteCursor`** (DESIGN §4.1: nothing else on the write cursor's line). Stored by the writer immediately before the write
+45. **Line 2 holds `TagEnd` next to `WriteCursor`** (DESIGN §4.1: nothing else on the write cursor's line). Stored by the writer immediately before the write
     cursor, only on commits that carry tags, and loaded by readers immediately after it; `LayoutTests` allows exactly this field.
 
-45. **The requested tag API, adjusted** (DESIGN §16.1): `ITag.IsPersistent` is `static virtual` with a default of `false` (a `static abstract` member would make
+46. **The requested tag API, adjusted** (DESIGN §16.1): `ITag.IsPersistent` is `static virtual` with a default of `false` (a `static abstract` member would make
     `ReadOnlyMemory<ITag>` illegal, CS8920); `Offset` has a setter and is set by `AddTag` (`bucket.AddTag(tag, index)`, `buffer.AddTag(tag)`);
     `ReadLastTagValues` returns `ReadOnlySpan<ITag>` (no allocation, the key is in each tag); a chunk's tags are the tags of its own elements
     (`StartOffset <= Offset < StartOffset + Length`, not every tag at or after the start); `StartOffset` is added to `Chunk` and `Bucket`; tags are enabled
     by `RingBufferOptions.Tags` (`TagMode`), and readers of the writer's own buffer receive the tag instances instead of copies.
 
-46. **Join step (f): the start cursor is published with a full fence and a waiting writer is woken** (DESIGN §5.6 ended with the plain store of (d), and
+47. **Join step (f): the start cursor is published with a full fence and a waiting writer is woken** (DESIGN §5.6 ended with the plain store of (d), and
     the earlier review refuted the need for a wake). A provisional cursor that a later commit left behind, or a slow tag join, can make a joiner the reader
     a blocked writer waits for; see REVIEW-NOTES T4. (Kept after tags stopped waiting for tag space: the space wait alone can need it.)
 
-47. **Dispose waits for a commit with tags** (DESIGN §5.8 dropped an outstanding bucket right away). `CloseWriter` loads `_committing` after the fenced
+48. **Dispose waits for a commit with tags** (DESIGN §5.8 dropped an outstanding bucket right away). `CloseWriter` loads `_committing` after the fenced
     `_disposed` store and waits while a commit with tags runs, so the two never run `EndWrite` at once (REVIEW-NOTES T1). Such a commit no longer waits
     for readers, but it may map and commit tag memory.
 
-48. **A claim that fails after its slot became Active releases the slot like a disposed reader** (DESIGN §5.6 only freed the word and the mask). A
+49. **A claim that fails after its slot became Active releases the slot like a disposed reader** (DESIGN §5.6 only freed the word and the mask). A
     malformed tag snapshot makes `CreateReader` throw after the claim; `ReleaseFailedClaim` zeroes the identity fields before freeing the slot (a sweeper
     must never read them behind the next claim), bumps the generation and wakes a writer blocked on the slot (REVIEW-NOTES R8).
 
-49. **The writer also evicts dead readers before its shared tag memory grows** (DESIGN §5.7: eviction happens when the writer blocks for space, and in
+50. **The writer also evicts dead readers before its shared tag memory grows** (DESIGN §5.7: eviction happens when the writer blocks for space, and in
     a claim that finds no free slot). A dead reader's cursor keeps every later tag record reserved, and dense tags can make the log grow long before the
     data ring fills; a sweep before moving to a larger ring, at most once per liveness interval, evicts it (REVIEW-NOTES R1).

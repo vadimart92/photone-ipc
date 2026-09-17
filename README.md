@@ -422,7 +422,7 @@ Reading it:
 
 ```
 dotnet build E:\GitHub\photone-ipc\Photone.Ipc.slnx -c Release
-dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 395 tests, ~35 s
+dotnet test  --project E:\GitHub\photone-ipc\tests\Photone.Ipc.Tests\Photone.Ipc.Tests.csproj -c Release     # 397 tests, ~35 s
 
 # quick Stopwatch harness (latency + throughput, in-process and cross-process; ~7 s)
 E:\GitHub\photone-ipc\bench\Photone.Ipc.Benchmarks\bin\Release\net10.0\Photone.Ipc.Benchmarks.exe --quick [--cores 2,4]

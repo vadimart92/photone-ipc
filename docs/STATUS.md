@@ -14,7 +14,7 @@ Photone.Ipc.slnx, global.json, Directory.Build.props, Directory.Packages.props, 
 docs/
   DESIGN.md              final design (12 sections + post-review section 13 + adaptive waiting section 14 + buffer pool section 15 + stream tags section 16); the pseudo-code matches the code
   RESEARCH.md            the four research reports (Win32 mapping, sync protocol, .NET specifics, vmcircbuffer)
-  DEVIATIONS.md          49 numbered deviations from DESIGN.md with reasons (stage A/B/C, post-review, adaptive waiting, stream tags)
+  DEVIATIONS.md          50 numbered deviations from DESIGN.md with reasons (stage A/B/C, post-review, adaptive waiting, the reservation race, stream tags)
   REVIEW-NOTES.md        31 review findings: 22 fixed, 9 refuted/deferred, each with the reason; stream-tags reviews: 7 and 10 findings, all fixed
   SIGNALING-PROBE.md     measured cross-process wake costs (spin / Event / NtEvent / SignalObjectAndWait / NtAlert), phase-2 status
   STATUS.md              this file
@@ -43,7 +43,7 @@ src/Photone.Ipc/         the library (zero package dependencies, AOT-compatible,
   Internal/SpinPolicy.cs  adaptive spin budget (DESIGN §14)
   Internal/PooledMapping.cs     one mapping + its events as the pool hands it out and takes it back (DESIGN §15)
   Internal/Capacity.cs, AddressHint.cs, ProcessLiveness.cs, SpinClock.cs, Counters.cs, TestHooks.cs
-tests/Photone.Ipc.Tests/       395 xunit.v3 tests (unit, stress, and 28 cross-process tests via TestChild)
+tests/Photone.Ipc.Tests/       397 xunit.v3 tests (unit, stress, and 28 cross-process tests via TestChild)
 tests/Photone.Ipc.TestChild/   child-process verbs: reader, spin-reader, step-reader, writer [--crash], echo, crash-reader,
                                claim-and-die, slow-init, hold-name, join-storm, map-region, pool-reader-loop, tag-writer, tag-reader
                                (TagPlan.cs: the deterministic tag plan and oracle shared with the tag tests)
@@ -85,7 +85,7 @@ Stream tags (DESIGN §16): `RingBufferOptions { Tags = TagMode.None | InProcess 
 ## Verification
 
 - `dotnet build Photone.Ipc.slnx -c Release`: 0 warnings, 0 errors (`TreatWarningsAsErrors`, `AnalysisLevel=latest`).
-- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 395/395, ~35 s.
+- `dotnet test --project tests/Photone.Ipc.Tests/Photone.Ipc.Tests.csproj -c Release`: 397/397, repeated runs, ~35 s.
   Process-counter tests (handle count, virtual size) run in the non-parallel collection; 300 pooled create/open/reuse/revive cycles leave 0 handles behind.
 - Samples run cross-process at the same virtual address; killing the writer ends the reader with `WriterTerminated` after draining.
 - Zero allocations on every hot path (asserted by tests and by BenchmarkDotNet's `MemoryDiagnoser`).

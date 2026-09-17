@@ -63,7 +63,8 @@ extra compares and a 16-byte tag view in every chunk): `TryRead` and `Advance` n
 which `Chunk.Tags` is computed on access.
 
 Deliberately not changed: the deadlock detector treats a reader parked with a timeout or a cancellation longer than 1 s as stuck (documented). Out of scope
-and reported separately: the same class of race as T1 exists, much narrower, between a blocked `GetBucket` that stops waiting and `Dispose` (pre-existing).
+and reported separately: the same class of race as T1 exists, much narrower, between a blocked `GetBucket` that stops waiting and `Dispose` (pre-existing;
+fixed separately in PR #3, DEVIATIONS 42).
 
 # Review notes: stream tags without a capacity (2026-09-17, second round)
 

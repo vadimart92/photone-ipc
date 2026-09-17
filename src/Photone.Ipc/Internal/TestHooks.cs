@@ -18,6 +18,18 @@ internal static class TestHooks
     /// <summary>Runs in the writer when the slow path of <c>GetBucket</c> leaves (also by an exception), just before it drops its local reference.</summary>
     public static Action? SlowGetBucketLeaving { get; set; }
 
+    /// <summary>
+    /// Runs in the writer when a <c>GetBucket</c> that took the slow path has found space and dropped its local reference, just before it publishes its
+    /// reservation; the argument is the buffer.
+    /// </summary>
+    public static Action<object>? AfterSpaceWait { get; set; }
+
+    /// <summary>
+    /// Runs in the writer when a <c>GetBucket</c> that took the slow path has published its reservation behind a full fence, just before it checks
+    /// whether the writer was closed meanwhile; the argument is the buffer.
+    /// </summary>
+    public static Action<object>? AfterReservationPublished { get; set; }
+
     /// <summary>Runs in a commit with tags once their memory is prepared, just before they are published; the argument is the committing buffer.</summary>
     public static Action<object>? BeforeTagAppend { get; set; }
 
