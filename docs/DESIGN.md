@@ -485,7 +485,7 @@ VA in every process (one placeholder of G + 2D):
 
 One section/one placeholder: one name or handle to hand over, one atomic reservation (same-address succeeds or fails as a unit), section-relative offsets identical in every process, one teardown. Readers map everything `PAGE_READWRITE` (they must write their slot line anyway; read-only data views are a later hardening).
 
-Naming: `Create(name)`: `null` ⇒ `Local\photone.{Guid:N}`; name starting with `Local\` or `Global\` ⇒ verbatim; otherwise `Local\photone.{name}`. `Global\` creation needs `SeCreateGlobalPrivilege` (ERROR_ACCESS_DENIED is reported with that hint). Kernel events are named from `InstanceId`, never from the user name (§6.2).
+Naming: `Create(name)`: `null` ⇒ `Local\photone.{Guid:N}`; name starting with `Local\` or `Global\` ⇒ verbatim; otherwise `Local\photone.{name}`. `Global\` creation needs `SeCreateGlobalPrivilege` (ERROR_ACCESS_DENIED is reported with that hint). Kernel events are named from `SectionId`, never from the user name (§6.2). With a `RingBufferPool` the name belongs to a small alias section instead of the ring (§15.4).
 
 ### 3.3 Create-and-map (creator) — `RingBuffer<T>.Create`
 
@@ -493,14 +493,14 @@ Naming: `Create(name)`: `null` ⇒ `Local\photone.{Guid:N}`; name starting with 
 guards: Windows >= 10.0.17134, 64-bit process
 G = SYSTEM_INFO.dwAllocationGranularity (throw PhotoneIpcException if != 65536); page = dwPageSize
 (C, D) = Capacity.Choose(minCapacity, sizeof(T))                        // §7
-sectionName = Normalize(name); instanceId = random non-zero u64 (RandomNumberGenerator.Fill)
+sectionName = Normalize(name); instanceId, sectionId = two random non-zero u64 (RandomNumberGenerator.Fill)     // with options.Pool: §15.2
 total = G + 2D
 
  1. section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, (uint)((G+D) >> 32), (uint)(G+D), sectionName)
     err = GetLastPInvokeError()                                          // read even on success
     invalid  -> PhotoneIpcException(err)  (5 on Global\ -> message mentions SeCreateGlobalPrivilege; 1455/8 -> commit limit)
     err == 183 -> section.Dispose(); throw RingBufferAlreadyExistsException
- 2. mapping = MirroredSection.Create(section, D, candidates: AddressHint.Candidates(instanceId, total, options.PreferredBaseAddress))
+ 2. mapping = MirroredSection.Create(section, D, candidates: AddressHint.Candidates(sectionId, total, options.PreferredBaseAddress))
     // = VirtualAlloc2 placeholder at each candidate (487 => next), then null; split at G and G+D; three MapViewOfFile3; assert mirror == data + D
  3. creator self-test (only the creator, before anybody can see InitState == 1):
       data[0] = 0xA5; assert mirror[0] == 0xA5; data[D-1] = 0x5A; assert mirror[D-1] == 0x5A; data[0] = 0; data[D-1] = 0
@@ -510,12 +510,12 @@ total = G + 2D
  5. header init (section is zero; plain stores unless noted):
       hdr.CreatorStartTime = GetProcessTimes(GetCurrentProcess()).creation        // FIRST
       Volatile.Write(ref hdr.CreatorPid, Environment.ProcessId)                  // SECOND (openers use Pid != 0 && StartTime != 0 to check liveness)
-      Magic, Version = 1, ControlBytes = 4096, ElementSize = sizeof(T), MaxReaders = 32, Capacity = C, DataBytes = D, DataOffset = G,
+      Magic, Version = 2, ControlBytes = 4096, ElementSize = sizeof(T), MaxReaders = 32, Capacity = C, DataBytes = D, DataOffset = G,
       TypeHash = Fnv1a32(typeof(T).FullName), SignalBackendId = SignalBackendId.NamedEvent, LayoutFlags = 0,
-      CreatorBase = base, InstanceId, ReservationBytes = total,
+      CreatorBase = base, InstanceId, ReservationBytes = total, SectionId,
       WriteCursor = 0, ReserveEnd = 0, WriterState = Active, WriterPid = pid, WriterStartTime = creatorStart, WriterEpoch = 1,
       WriterWaiting = 0, WriterWaitFor = 0, masks = 0, ReaderGeneration = 0, EvictedReaders = 0, all slots zero (Free, seq 0, pid 0)
- 6. backend = SignalBackend.Create(SignalBackendId.NamedEvent, instanceId, hdr)   // creates the 33 events (§6.2)
+ 6. backend = SignalBackend.Create(SignalBackendId.NamedEvent, sectionId, hdr)    // creates the 33 events (§6.2)
  7. Interlocked.MemoryBarrier(); Volatile.Write(ref hdr.InitState, 1)             // release: everything above becomes visible
  8. keep `section` open for the buffer's lifetime (the name dies with the last handle, not the last view)
 
@@ -537,16 +537,17 @@ Unwind on any failure after step 2: mapping.Dispose() (§3.5), backend?.Dispose(
         if now >= deadline: throw RingBufferInitializationException("timeout")
         spin 1 µs for the first 1 ms, then Thread.Yield(), then Thread.Sleep(1) after 10 ms (cold path)
  4. validate (all after the acquire load of InitState), else RingBufferLayoutException with a precise message:
-      Magic == PHOTONE1, Version == 1, ControlBytes == 4096, MaxReaders == 32, DataOffset == 65536,
+      Magic == PHOTONE1, Version == 2, ControlBytes == 4096, MaxReaders == 32, DataOffset == 65536,
       ElementSize == sizeof(T), Capacity power of two, DataBytes == Capacity * ElementSize, DataBytes % 65536 == 0,
       TypeHash == 0 || TypeHash == Fnv1a32(typeof(T).FullName), SignalBackendId known to this library, InstanceId != 0
-    copy D, C, CreatorBase, InstanceId, SignalBackendId
+    copy D, C, CreatorBase, InstanceId, SectionId, SignalBackendId
+    (Magic == PHOTLINK instead: the name is a pooled buffer's alias; resolve it first, §15.4)
  5. UnmapViewOfFile(peek)
  6. mapping = MirroredSection.Open(section, D, candidates: [CreatorBase, null])
     IsMappedAtCreatorAddress = (base == CreatorBase)                  // 487 on the first candidate => range occupied here
     ERROR_ACCESS_DENIED from MapViewOfFile3 of view 1/2 => RingBufferLayoutException("section smaller than the header claims"), unwind
     assert mirror == data + D (placement is deterministic; NO content compare — a live writer may store into data[0] between two loads)
- 7. backend = SignalBackend.Create(hdr.SignalBackendId, InstanceId, hdr)  // opens the existing events (create-or-open, 183 expected)
+ 7. backend = SignalBackend.Create(hdr.SignalBackendId, SectionId, hdr)   // opens the existing events (create-or-open, 183 expected)
  8. IsWriter = false. No header writes.
 ```
 
@@ -586,7 +587,7 @@ The 16 TiB window `[0x4000_0000_0000, 0x5000_0000_0000)` is far from heaps/DLLs/
 
 ## 4. Shared-memory layout (`Internal\Layout.cs`)
 
-Constants: `Magic = 0x31454E4F544F4850` ("PHOTONE1" LE), `Version = 1`, `ControlBytes = 4096`, `HeaderViewBytes = 65536`, `DataOffset = 65536`, `MaxReaders = 32`, `SlotBase = 512`, `SlotBytes = 64`, `BackendAreaOffset = 2560`, `BackendAreaBytes = 128`.
+Constants: `Magic = 0x31454E4F544F4850` ("PHOTONE1" LE), `Version = 2`, `ControlBytes = 4096`, `HeaderViewBytes = 65536`, `DataOffset = 65536`, `MaxReaders = 32`, `SlotBase = 512`, `SlotBytes = 64`, `BackendAreaOffset = 2560`, `BackendAreaBytes = 128`.
 
 Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.SizeOf<ReaderSlot>() == 64`, every `Interlocked`/`Volatile` field offset `% 8 == 0`, `WriteCursor` offset `% 128 == 0`. All accesses go through `ref ControlBlock Hdr => ref Unsafe.AsRef<ControlBlock>(_hdr)` and `ref ReaderSlot SlotRef(int i) => ref Unsafe.AsRef<ReaderSlot>(_hdr + 512 + 64 * i)`.
 
@@ -595,7 +596,7 @@ Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.Siz
 | Offset | Type | Field | Line | Written by | Read by |
 |---|---|---|---|---|---|
 | 0 | u64 | `Magic` | 0 | creator once | opener once |
-| 8 | u32 | `Version` = 1 | 0 | | |
+| 8 | u32 | `Version` = 2 | 0 | | |
 | 12 | u32 | `ControlBytes` = 4096 | 0 | | |
 | 16 | u32 | `ElementSize` | 0 | | |
 | 20 | u32 | `MaxReaders` = 32 | 0 | | |
@@ -605,14 +606,15 @@ Static constructor asserts: `Unsafe.SizeOf<ControlBlock>() == 4096`, `Unsafe.Siz
 | 48 | u32 | `TypeHash` (FNV-1a 32 of UTF-16 `typeof(T).FullName`) | 0 | | |
 | 52 | i32 | `InitState` (0 initializing, 1 ready; `Volatile.Write` last) | 0 | creator | opener spin (acquire) |
 | 56 | u32 | `SignalBackendId` (1 = NamedEvent) | 0 | creator | opener |
-| 60 | u32 | `LayoutFlags` (reserved 0) | 0 | | |
+| 60 | u32 | `LayoutFlags` (bit 0 `Pooled`: the section belongs to a `RingBufferPool`, §15) | 0 | creator | opener |
 | 64 | u64 | `CreatorBase` | 1 | creator | opener |
 | 72 | i32 | `CreatorPid` (written 2nd, `Volatile.Write`) | 1 | creator | opener init spin |
 | 76 | i32 | pad | 1 | | |
 | 80 | i64 | `CreatorStartTime` (FILETIME; written 1st) | 1 | creator | opener init spin |
-| 88 | u64 | `InstanceId` (random ≠ 0; names the events) | 1 | creator | opener |
+| 88 | u64 | `InstanceId` (random ≠ 0; identifies the buffer: a pooled section gets a new one on every reuse) | 1 | creator | opener |
 | 96 | u64 | `ReservationBytes` = G + 2D | 1 | | diagnostics |
-| 104..127 | | reserved | 1 | | |
+| 104 | u64 | `SectionId` (random ≠ 0; identifies the section for its whole life; names the events) | 1 | creator | opener |
+| 112..127 | | reserved | 1 | | |
 | **128** | **i64** | **`WriteCursor` (W)** | **2** | **writer, `Interlocked.Exchange` per Commit** | **readers, `Volatile.Read` (polled)** — nothing else on this line |
 | 136..191 | | reserved (never written) | 2 | | |
 | 192..255 | | **empty** — prefetch-pair partner of line 2 | 3 | | |
@@ -1064,7 +1066,7 @@ Rules every backend must satisfy: (1) a wake issued after the waiter's flag stor
 
 ### 6.2 `NamedEventBackend` (v1, `Id = 1`)
 
-Objects: 32 auto-reset events `Local\photone.{InstanceId:x16}.r{i:D2}` and one auto-reset event `Local\photone.{InstanceId:x16}.space`, all created-or-opened with `CreateEventW(null, manualReset: false, initialState: false, name)` in `Create` (creator: 33 creates; opener: 33 opens, `ERROR_ALREADY_EXISTS` is the normal result). Handles are `SafeWaitHandle`s kept for the backend's lifetime; raw `nint`s are cached after one `DangerousAddRef` (released in `Dispose`). ~0.3 ms once per process per buffer. `Global\` sections get `Global\` events (same prefix as the section name).
+Objects: 32 auto-reset events `Local\photone.{SectionId:x16}.r{i:D2}` and one auto-reset event `Local\photone.{SectionId:x16}.space`, all created-or-opened with `CreateEventW(null, manualReset: false, initialState: false, name)` in `Create` (creator: 33 creates; opener: 33 opens, `ERROR_ALREADY_EXISTS` is the normal result). Handles are `SafeWaitHandle`s kept for the backend's lifetime; raw `nint`s are cached after one `DangerousAddRef` (released in `Dispose`). ~0.3 ms once per process per buffer. `Global\` sections get `Global\` events (same prefix as the section name). The names follow the section, not the buffer: a pooled section keeps its events for every buffer it serves (§15).
 
 ```
 OnSlotClaimed(i, s):  ResetEvent(_slot[i])                       // stale set from a previous owner cannot cause a wrong-condition wake
@@ -1399,3 +1401,111 @@ the loop exits when control returns to it, before touching `_arm` or the mapping
 
 Tests: `AdaptiveWaitTests` (policy arithmetic, learned spinning in real waits for readers and the writer, inline continuations on the waiter
 thread, zero allocation on the inline path, `Dispose` and cancellation on the waiter thread, arm handshake under random gaps).
+
+## 15. Buffer pool (`RingBufferPool.cs`, `Internal\PooledMapping.cs`)
+
+A process that creates or opens many buffers one after another pays, per buffer, for a new section (commit charge, prototype PTEs), a placeholder and three views, a page fault per page per view when pre-faulting, 33 named events, and on release for the unmaps and for freeing the pages. `RingBufferPool` keeps the mapping of a released buffer and reuses it for the next buffer of the same size; a mapping left unused for `IdleTimeout` is released. Pooling is opt-in per buffer: `RingBufferOptions.Pool`, on `Create` and on `Open`.
+
+### 15.1 What it saves
+
+`Photone.Ipc.Benchmarks.exe --lifecycle` on the dev box (p50; pre-fault on; the creator creates a buffer, a peer process opens it by name, joins as a reader, reads one element and releases it, then the creator disposes; both sides time their own calls):
+
+| data size | creator `Create` | creator `Dispose` | peer `Open` + `CreateReader` | peer release |
+|---|---|---|---|---|
+| 64 KiB | 308 µs → **35 µs** | 113 µs → **31 µs** | 241 µs → **44 µs** | 68 µs → **8 µs** |
+| 1 MiB | 1.0 ms → **41 µs** | 293 µs → **31 µs** | 864 µs → **54 µs** | 143 µs → **10 µs** |
+| 16 MiB | 12.1 ms → **96 µs** | 2.9 ms → **32 µs** | 11.0 ms → **137 µs** | 1.1 ms → **10 µs** |
+| 64 MiB | 49.3 ms → **265 µs** | 12.0 ms → **33 µs** | 43.8 ms → **321 µs** | 5.6 ms → **11 µs** |
+
+What remains with a pool: the alias section (about 19 µs to create, 14 µs to resolve), one `NtQueryObject` (about 1 µs), the header re-initialisation, and the pre-fault pass over pages that are already resident (about 4 µs per MiB per side; it keeps page faults off the hot path when the working set was trimmed while the mapping was idle, and is skipped with `PreFault = false`).
+
+### 15.2 Creator
+
+```
+Create(minCapacity, name, options { Pool = pool }):
+  (C, D) = Capacity.Choose(...); name = Normalize(name); global = name starts with Global\
+  alias = CreateFileMappingW(64 KiB, name)                  // the buffer's name: RingBufferAlreadyExistsException before anything else is acquired
+  a = MapHeaderPeek(alias); a.CreatorStartTime, then a.CreatorPid   // same offsets and order as in the control block
+  instanceId = random
+  entry = pool.RentForCreate(D, global, options.PreferredBaseAddress)   // §15.3; InitState is 0 on return
+  if entry is null:                                         // a new section under a pool-owned name
+      sectionId = random; entry = map Local|Global\photone.pool.{Guid:N} (§3.3 steps 1-4 and 6)
+  else:                                                     // reuse: same placeholder, views, resident pages and events
+      clear the control block except BackendArea[0]; the new InstanceId FIRST (a stale opener gives up on it, §15.3); creator identity again
+      if pool.ClearOnReuse: zero the data region
+      if options.PreFault: touch every page of both views again (resident pages: a pass over memory, not a fault per page)
+  WriteHeader(C, D, instanceId, entry.SectionId, base, LayoutFlags = Pooled)   // §3.3 step 5
+  alias record: Magic = PHOTLINK, Version = 1, SectionId, DataBytes, InstanceId, TargetName = the pool-owned section name
+  TestHooks.BeforeInitState; MemoryBarrier; ring.InitState = 1; alias.InitState = 1; unmap the alias view
+  failure after the mapping was obtained: it is released, never returned (it may be half-initialised); the alias is closed
+```
+
+Release (`ReleaseNative`, once the buffer and every reader it created are disposed): laggard handles closed, alias closed (the name disappears once no opener holds it either), `pool.Return(entry)`. Three cases release the mapping instead of returning it:
+
+* a release triggered by a finalizer (a buffer or reader that was never disposed): its `SafeHandle`s may already be queued for finalization in the same collection, and a pool must never keep a handle whose release is scheduled;
+* a writer closed with a bucket outstanding: another thread may still be storing into the bucket's span (unsupported), and such a store must fault on unmapped memory rather than land in the buffer the pool hands the section to next;
+* a disposed pool.
+
+Without a pool, a call racing `Dispose` at worst faults on unmapped memory. With a pool, a section released too early can belong to another buffer a moment later, possibly one shared with other processes. So every call that can run on one thread while `Dispose` runs on another holds a local reference for as long as it touches the section: `GetBucket`'s slow path (as before), `CreateReader` (the reference it takes first becomes the reader's) and `DuplicateSectionHandleTo` (a duplicate made after a reuse would silently reach the other buffer). Each `PooledMapping` also carries an idle flag: a second `Return` of the same mapping throws instead of listing it twice.
+
+### 15.3 The reuse check
+
+A pooled section may serve a new buffer only when nothing else can still observe the previous one. Every participant holds the section handle for as long as it maps the section (`MirroredSection` owns it, the header peek holds it, a duplicated handle is a handle), so the rule is: the system-wide handle count of the section is 1, the pool's own handle. `NtQueryObject(ObjectBasicInformation).HandleCount` counts the handles of all processes (about 1 µs); the handles of a terminated process are closed by the time it is signaled (measured). A view whose handle was closed is not counted: this library never leaves one, except a parked opener mapping (§15.5), which does not look at the section until it holds a handle again.
+
+```
+TryClaim(entry):                                    // under the pool lock; newest idle entries of the size first, at most 16 per Create
+  Interlocked.Exchange(ref hdr.InitState, 0)        // store, full fence
+  if HandleCount(section) == 1: return true         // load
+  Volatile.Write(ref hdr.InitState, 1)              // still held (or the query failed): the closed buffer stays exactly as it was
+  return false
+```
+
+Every opener obtains its handle with a system call (`OpenFileMappingW`, or the `DuplicateHandle` that produced the handle it was given) before it loads `InitState` and `InstanceId`. Dekker: if the pool's load missed the opener's handle, the opener's load came after the pool's store, so the opener sees `InitState == 0`, waits (§3.4 step 3) and then finds another `InstanceId`. An opener that came through an alias knows which instance it wants and reports `RingBufferNotFoundException` ("no longer exists"), without waiting for the re-initialisation to finish: the reuse stores the new `InstanceId` before its slow parts (clearing or touching a large data region), and `WaitForInit` with an expected instance returns as soon as it sees a different non-zero id; an opener with a duplicated handle is never in that position, because its handle has existed since the duplication and the claim cannot succeed. If the pool does see the opener's handle, it restores `InitState` and the opener attaches to the closed buffer, exactly as without a pool. A busy entry stays idle and is checked again by later `Create`s until it expires.
+
+### 15.4 Names: the alias section
+
+A section's kernel name cannot change, so a reused section cannot carry the next buffer's name. The buffer's name belongs to a separate 64 KiB section holding an `AliasBlock` (`Internal\Layout.cs`): `Magic` "PHOTLINK" at 0, `Version` at 8, `TargetNameLength` at 12, `SectionId` at 16, `DataBytes` at 24, `InitState` at 52, `CreatorPid` at 72, `CreatorStartTime` at 80, `InstanceId` at 88, `TargetName` (UTF-16, at most 256) at 128. `InitState`, the creator identity and `InstanceId` share the control block's offsets (asserted by `Layout.Verify`), so `Open` maps and waits for either kind of section the same way and dispatches on `Magic` afterwards:
+
+```
+OpenCore(section, name):
+  peek; WaitForInit(peek)
+  if Magic == PHOTLINK:
+      (target, expected, sectionId) = alias record; unmap; keep the alias handle for the buffer's lifetime   // as a direct section handle keeps its name alive
+      section = OpenFileMappingW(target)              // missing: RingBufferNotFoundException ("no longer exists")
+      if options.Pool: TryRevive(sectionId, expected) // §15.5
+      peek the target; WaitForInit; Magic == PHOTONE1 && InstanceId != expected: RingBufferNotFoundException
+  Validate
+  Pooled && no alias && opened by name: RingBufferNotFoundException   // a pool-owned section's own name is not a buffer name
+  map (§3.4 steps 5-7); options.Pool && Pooled: the buffer parks its mapping when released (§15.5)
+```
+
+Differences from a direct section: while the buffer lives, `Create(name)` and `Open(name)` behave the same. After the writer disposed, a late `Open(name)` attaches to the closed buffer only until its section is reused, and reports `RingBufferNotFoundException` afterwards. `Name` is the user's name; `DuplicateSectionHandleTo` duplicates the ring section.
+
+### 15.5 Opener: parking and revival
+
+An opener that passed a pool keeps its views and its 33 event handles when it releases a pooled buffer, but closes the section handle (`MirroredSection.DetachSection`): a parked mapping must not count as a holder, or the creator could never reuse the section. The pages stay mapped in this process (the views keep them alive) and are not read while parked.
+
+```
+TryRevive(pool, section /* just opened */, sectionId, expected):
+  parked = pool.TakeParked(sectionId); none: return null (map afresh)
+  WaitForInit(parked header)                           // loads through the parked views, after the handle exists (the Dekker pair of §15.3)
+  Magic != PHOTONE1 || SectionId != sectionId || InstanceId != expected || DataBytes differ: pool.Return(parked); return null
+  Validate (wrong T: pool.Return(parked), rethrow)
+  if options.PreFault: read-touch both views
+  parked.AttachSection(section); a RingBuffer over the parked views and events
+```
+
+Reading the expected random 64-bit `InstanceId` through the parked views, after opening the section that the alias (or the handle) names, shows that both are the same section. The events are named from `SectionId`, so they are still the right ones. For `Open(SafeSectionHandle)` the expected instance is the one read through that handle's peek.
+
+### 15.6 Expiry, bounds, disposal
+
+Idle entries (creator sections and parked opener mappings) are kept in return order. `IdleTimeout` (default 30 s; zero = keep nothing; infinite = until `Trim`/`Dispose`) is enforced by one `System.Threading.Timer` armed for the oldest entry's expiry and re-armed after every expiry pass. Nothing runs while the pool is empty, and a return never moves the wake-up earlier. The timer holds the pool through a weak reference and captures no execution context. `MaxIdleBytes` (data-region bytes, default unbounded) releases the longest-idle entries when a return exceeds it; an entry larger than the bound is released at once. Unmapping always happens outside the lock. `Trim()` releases every idle entry; `Dispose()` also stops pooling (later returns are released, `Create` with a disposed pool maps a new section every time); a pool that is never disposed releases its idle entries from its finalizer. `RingBufferPool.Shared` is a process-wide pool with the defaults whose `Dispose` only trims.
+
+### 15.7 Limits
+
+* Reuse needs the same `DataBytes` and namespace (`Local\` or `Global\`), and the same base address when `PreferredBaseAddress` is set; the element type may differ.
+* Readers in other processes that keep a closed buffer open keep its section from being reused (by design): new buffers get new sections meanwhile, and the idle entry expires normally.
+* Without `ClearOnReuse` a reused data region still holds the previous buffer's bytes: invisible through the API (a reader starts at the head), visible to a process that reads the raw mapping of the new buffer.
+* The pool does not isolate the users of successive buffers from each other, with or without `ClearOnReuse`: a process that mapped an earlier buffer can keep a view of the section without holding a handle (a parked opener mapping does exactly that), which the handle count cannot see, and would see the later buffers. Buffers that serve parties who must not see each other's data must not share a pool.
+* Idle memory stays committed and mostly resident; `IdleTimeout` and `MaxIdleBytes` bound it. A parked opener mapping keeps the section's pages alive in the system even after the creator's pool released its own side.
+* Only a disposed buffer returns its mapping; a finalized one does not (§15.2).

@@ -34,6 +34,7 @@ public sealed class LayoutTests
             [nameof(ControlBlock.CreatorStartTime)] = 80,
             [nameof(ControlBlock.InstanceId)] = 88,
             [nameof(ControlBlock.ReservationBytes)] = 96,
+            [nameof(ControlBlock.SectionId)] = 104,
             [nameof(ControlBlock.WriteCursor)] = 128,
             [nameof(ControlBlock.ReserveEnd)] = 256,
             [nameof(ControlBlock.WriterState)] = 264,
@@ -147,6 +148,25 @@ public sealed class LayoutTests
         Span<byte> bytes = stackalloc byte[8];
         BitConverter.TryWriteBytes(bytes, Layout.Magic);
         Assert.Equal("PHOTONE1", System.Text.Encoding.ASCII.GetString(bytes));
+        BitConverter.TryWriteBytes(bytes, AliasBlock.MagicValue);
+        Assert.Equal("PHOTLINK", System.Text.Encoding.ASCII.GetString(bytes));
+    }
+
+    [Fact]
+    public void AliasBlock_SharesTheFieldsAnOpenerReadsFirst()
+    {
+        // WaitForInit and the magic dispatch read these through a ControlBlock pointer, whichever kind of section was mapped (DESIGN §15.4)
+        foreach (string field in new[] { nameof(AliasBlock.Magic), nameof(AliasBlock.InitState), nameof(AliasBlock.CreatorPid), nameof(AliasBlock.CreatorStartTime), nameof(AliasBlock.InstanceId) })
+        {
+            int alias = typeof(AliasBlock).GetField(field)!.GetCustomAttribute<FieldOffsetAttribute>()!.Value;
+            int control = typeof(ControlBlock).GetField(field)!.GetCustomAttribute<FieldOffsetAttribute>()!.Value;
+            Assert.Equal(control, alias);
+        }
+
+        Assert.Equal(AliasBlock.TargetNameOffset, typeof(AliasBlock).GetField(nameof(AliasBlock.TargetName))!.GetCustomAttribute<FieldOffsetAttribute>()!.Value);
+        Assert.True(AliasBlock.TargetNameOffset + (2 * AliasBlock.MaxTargetNameChars) <= Unsafe.SizeOf<AliasBlock>());
+        Assert.True(Unsafe.SizeOf<AliasBlock>() <= Layout.ControlBytes);
+        Assert.True(MirroredSection.NewPoolSectionName(global: true).Length <= AliasBlock.MaxTargetNameChars);
     }
 
     private static bool Overlaps(int aStart, int aEnd, int bStart, int bEnd) => aStart < bEnd && bStart < aEnd;

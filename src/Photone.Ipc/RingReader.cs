@@ -612,7 +612,7 @@ public sealed unsafe partial class RingReader<T> : IDisposable where T : unmanag
         }
         finally
         {
-            _owner.ReaderReleased();
+            _owner.ReaderReleased(finalizing: true);
         }
     }
 

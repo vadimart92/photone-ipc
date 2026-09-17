@@ -16,6 +16,7 @@ public sealed unsafe partial class RingBuffer<T>
     private long _e;
     private long _min;
     private bool _outstanding;
+    private bool _closedWithBucket;
     private SpinPolicy _spaceSpin;
     private Counters _counters;
 
@@ -152,6 +153,7 @@ public sealed unsafe partial class RingBuffer<T>
         }
         finally
         {
+            TestHooks.SlowGetBucketLeaving?.Invoke();
             ReleaseLocalRef();
         }
     }
@@ -471,6 +473,7 @@ public sealed unsafe partial class RingBuffer<T>
 
         if (_outstanding)
         {
+            _closedWithBucket = true;                               // its span may still be in use on another thread: the mapping is never pooled (ReleaseNative)
             EndWrite(0);
         }
 

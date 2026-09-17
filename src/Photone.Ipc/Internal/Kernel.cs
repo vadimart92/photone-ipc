@@ -20,6 +20,17 @@ internal unsafe struct SYSTEM_INFO
     public ushort wProcessorRevision;
 }
 
+/// <summary>Native <c>PUBLIC_OBJECT_BASIC_INFORMATION</c> (winternl.h; 56 bytes).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct PUBLIC_OBJECT_BASIC_INFORMATION
+{
+    public uint Attributes;
+    public uint GrantedAccess;
+    public uint HandleCount;
+    public uint PointerCount;
+    public fixed uint Reserved[10];
+}
+
 /// <summary>
 /// All P/Invoke declarations, Win32 constants and small error helpers used by the library.
 /// <c>VirtualAlloc2</c> / <c>MapViewOfFile3</c> are exported by kernelbase.dll only (verified); everything else lives in kernel32.dll.
@@ -147,6 +158,12 @@ internal static unsafe partial class Kernel
     [LibraryImport("ntdll.dll")]
     public static partial int NtQuerySystemInformation(int systemInformationClass, void* systemInformation, uint systemInformationLength, out uint returnLength);
 
+    // ntdll (pool slow path only): the system-wide number of open handles to a section decides whether a pooled section may be reused
+    public const int ObjectBasicInformation = 0;
+
+    [LibraryImport("ntdll.dll")]
+    public static partial int NtQueryObject(nint handle, int objectInformationClass, void* objectInformation, uint objectInformationLength, out uint returnLength);
+
     // ---- helpers (never on a hot path) ----
 
     private static uint s_allocationGranularity;
@@ -209,6 +226,40 @@ internal static unsafe partial class Kernel
         if (!Environment.Is64BitProcess)
         {
             throw new PlatformNotSupportedException("photone-ipc requires a 64-bit process.");
+        }
+    }
+
+    /// <summary>
+    /// Number of handles open to the object behind <paramref name="handle"/> in all processes (<c>NtQueryObject(ObjectBasicInformation)</c>;
+    /// a killed process's handles are gone once it has exited). <see langword="false"/> when the query fails.
+    /// </summary>
+    public static bool TryQueryHandleCount(SafeHandle handle, out uint handleCount)
+    {
+        handleCount = 0;
+        bool added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            PUBLIC_OBJECT_BASIC_INFORMATION info;
+            int status = NtQueryObject(handle.DangerousGetHandle(), ObjectBasicInformation, &info, (uint)sizeof(PUBLIC_OBJECT_BASIC_INFORMATION), out _);
+            if (status < 0)
+            {
+                return false;
+            }
+
+            handleCount = info.HandleCount;
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (added)
+            {
+                handle.DangerousRelease();
+            }
         }
     }
 

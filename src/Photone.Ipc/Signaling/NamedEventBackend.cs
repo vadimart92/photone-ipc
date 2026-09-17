@@ -5,10 +5,11 @@ using Photone.Ipc.Internal;
 namespace Photone.Ipc.Signaling;
 
 /// <summary>
-/// v1 backend (<see cref="SignalBackendId.NamedEvent"/>): 32 auto-reset events <c>Local\photone.{InstanceId:x16}.r{i:D2}</c> (one per reader slot)
-/// and one auto-reset event <c>Local\photone.{InstanceId:x16}.space</c> for the writer, all created-or-opened with <c>CreateEventW</c>
+/// v1 backend (<see cref="SignalBackendId.NamedEvent"/>): 32 auto-reset events <c>Local\photone.{SectionId:x16}.r{i:D2}</c> (one per reader slot)
+/// and one auto-reset event <c>Local\photone.{SectionId:x16}.space</c> for the writer, all created-or-opened with <c>CreateEventW</c>
 /// (DESIGN §6.2). Auto-reset plus at most one waiter per event means a stale set is always consumed by the owner's next wait as a harmless
 /// spurious wake. The only backend-private state is byte 0 of the backend area: 1 when the objects live in <c>Global\</c>.
+/// The names follow the section, not the buffer, so a pooled section keeps its events for every buffer it serves (DESIGN §15).
 /// </summary>
 internal sealed unsafe class NamedEventBackend : SignalBackend
 {
@@ -19,8 +20,8 @@ internal sealed unsafe class NamedEventBackend : SignalBackend
     private readonly nint[] _raw = new nint[SlotCount + 1];
     private int _disposed;
 
-    /// <summary>Creates (creator) or opens (opener) the 33 events for <paramref name="instanceId"/>.</summary>
-    public NamedEventBackend(ulong instanceId, ControlBlock* hdr, bool isCreator, bool globalNamespace)
+    /// <summary>Creates (creator) or opens (opener) the 33 events for <paramref name="sectionId"/>.</summary>
+    public NamedEventBackend(ulong sectionId, ControlBlock* hdr, bool isCreator, bool globalNamespace)
     {
         if (isCreator)
         {
@@ -31,7 +32,7 @@ internal sealed unsafe class NamedEventBackend : SignalBackend
             globalNamespace = hdr->BackendArea[0] == 1;
         }
 
-        string prefix = (globalNamespace ? "Global\\photone." : "Local\\photone.") + instanceId.ToString("x16", CultureInfo.InvariantCulture);
+        string prefix = (globalNamespace ? "Global\\photone." : "Local\\photone.") + sectionId.ToString("x16", CultureInfo.InvariantCulture);
         bool createdAny = false;
         try
         {
@@ -48,7 +49,7 @@ internal sealed unsafe class NamedEventBackend : SignalBackend
 
                 if (isCreator && err == Kernel.ERROR_ALREADY_EXISTS)
                 {
-                    // Cannot happen with a fresh random InstanceId; if it does, make sure no stale set survives.
+                    // Cannot happen with a fresh random SectionId; if it does, make sure no stale set survives.
                     Kernel.ResetEvent(h.DangerousGetHandle());
                 }
 

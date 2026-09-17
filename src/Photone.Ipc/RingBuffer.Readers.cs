@@ -22,8 +22,31 @@ public sealed unsafe partial class RingBuffer<T>
     /// </summary>
     public RingReader<T> CreateReader(ReaderOptions? options = null)
     {
-        ThrowIfDisposed();
-        options ??= ReaderOptions.Default;
+        // The reader will own this local reference. Taking it before the claim means that a concurrent Dispose can no longer release the
+        // mapping under the claim (or return it to a pool, and from there to another buffer: DESIGN §15.2).
+        if (!TryAddLocalRef())
+        {
+            throw new ObjectDisposedException(GetType().FullName);
+        }
+
+        bool handedOver = false;
+        try
+        {
+            ThrowIfDisposed();
+            return ClaimReader(options ?? ReaderOptions.Default, ref handedOver);
+        }
+        finally
+        {
+            if (!handedOver)
+            {
+                ReleaseLocalRef();
+            }
+        }
+    }
+
+    /// <summary>The slot claim of <see cref="CreateReader"/>; <paramref name="handedOver"/> is set once a reader owns the caller's local reference.</summary>
+    private RingReader<T> ClaimReader(ReaderOptions options, ref bool handedOver)
+    {
         int pid = Environment.ProcessId;
         long st = ProcessLiveness.OwnStartTime;
         for (int attempt = 0; attempt < 2; attempt++)
@@ -64,11 +87,11 @@ public sealed unsafe partial class RingBuffer<T>
                 Volatile.Write(ref s.ReadCursor, w2);                                       // (d) adopt the newest head (monotone bump)
                 Interlocked.Or(ref Hdr.ActiveMask, 1UL << i);
                 Interlocked.Increment(ref Hdr.ReaderGeneration);
-                Interlocked.Increment(ref _localRefs);
                 RingReader<T>? reader = null;
                 try
                 {
                     reader = new RingReader<T>(this, i, active, w2, options);
+                    handedOver = true;                                                      // from here on the reader releases the reference (Dispose / finalizer)
                     reader.ResolveWriterProcess();
                     return reader;
                 }
@@ -76,10 +99,9 @@ public sealed unsafe partial class RingBuffer<T>
                 {
                     if (reader is null)
                     {
-                        // constructor failed: give the slot and the local ref back
+                        // constructor failed: give the slot back (CreateReader gives the local ref back)
                         Interlocked.CompareExchange(ref s.Word, SlotWord.Make(SlotState.Free, seq, 0), active);
                         Interlocked.And(ref Hdr.ActiveMask, ~(1UL << i));
-                        ReleaseLocalRef();
                     }
                     else
                     {
